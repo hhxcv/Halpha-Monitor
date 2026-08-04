@@ -1,5 +1,9 @@
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError
 
 import numpy as np
 import pandas as pd
@@ -7,6 +11,7 @@ import pandas as pd
 from halpha_monitor.monitors.binance_btc_relationship import (
     BinanceBtcRelationshipMonitor,
     BinanceBtcRelationshipSettings,
+    BinanceSpotDailyClient,
     DailySeriesResult,
     _price_series,
     analyze_pair,
@@ -54,6 +59,43 @@ class FakeProvider:
         return self.values[symbol]
 
 
+class ThrottledOpenUrl:
+    def __init__(self, retry_after: str = "120") -> None:
+        self.calls = 0
+        self.retry_after = retry_after
+
+    def __call__(self, request, timeout):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        raise HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            hdrs={"Retry-After": self.retry_after},
+            fp=io.BytesIO(b'{"code":-1003,"msg":"rate limited"}'),
+        )
+
+
+class ConcurrentThrottledOpenUrl(ThrottledOpenUrl):
+    def __init__(self) -> None:
+        super().__init__(retry_after="0")
+        self._barrier = threading.Barrier(2)
+        self._lock = threading.Lock()
+
+    def __call__(self, request, timeout):  # type: ignore[no-untyped-def]
+        with self._lock:
+            call_number = self.calls + 1
+            self.calls = call_number
+        if call_number <= 2:
+            self._barrier.wait(timeout=2)
+        raise HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            hdrs={"Retry-After": self.retry_after},
+            fp=io.BytesIO(b'{"code":-1003,"msg":"rate limited"}'),
+        )
+
+
 def test_normalize_klines_keeps_only_valid_closed_rows() -> None:
     cutoff = 200_000
     rows = [
@@ -65,6 +107,57 @@ def test_normalize_klines_keeps_only_valid_closed_rows() -> None:
     frame = normalize_klines(rows, cutoff)
 
     assert frame["close"].tolist() == [1.5, 1.6]
+
+
+def test_spot_client_honors_retry_after_and_shares_backoff_across_symbols(
+    tmp_path: Path,
+) -> None:
+    opener = ThrottledOpenUrl()
+    monotonic_now = 100.0
+    client = BinanceSpotDailyClient(
+        tmp_path,
+        attempts=3,
+        open_url=opener,
+        monotonic=lambda: monotonic_now,
+        wall_now=lambda: datetime(2026, 8, 4, tzinfo=UTC),
+        sleep=lambda _seconds: None,
+    )
+    cutoff = datetime(2026, 8, 4, tzinfo=UTC) - timedelta(milliseconds=1)
+
+    first = client.fetch("BTCUSDT", cutoff)
+    second = client.fetch("ETHUSDT", cutoff)
+
+    assert first.status == "FAILED"
+    assert second.status == "FAILED"
+    assert first.reason_code == "BTC_RELATIONSHIP_HTTP_THROTTLED"
+    assert second.reason_code == "BTC_RELATIONSHIP_HTTP_THROTTLED"
+    assert opener.calls == 1
+
+
+def test_concurrent_rate_limits_open_only_one_backoff_window(tmp_path: Path) -> None:
+    opener = ConcurrentThrottledOpenUrl()
+    clock = {"value": 100.0}
+    client = BinanceSpotDailyClient(
+        tmp_path,
+        attempts=1,
+        open_url=opener,
+        monotonic=lambda: clock["value"],
+        wall_now=lambda: datetime(2026, 8, 4, tzinfo=UTC),
+        sleep=lambda _seconds: None,
+    )
+    cutoff = datetime(2026, 8, 4, tzinfo=UTC) - timedelta(milliseconds=1)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(client.fetch, "BTCUSDT", cutoff)
+        second = executor.submit(client.fetch, "ETHUSDT", cutoff)
+        assert first.result().reason_code == "BTC_RELATIONSHIP_HTTP_THROTTLED"
+        assert second.result().reason_code == "BTC_RELATIONSHIP_HTTP_THROTTLED"
+
+    clock["value"] = 161.0
+    assert client.fetch("SOLUSDT", cutoff).reason_code == (
+        "BTC_RELATIONSHIP_HTTP_THROTTLED"
+    )
+    assert opener.calls == 3
 
 
 def test_analysis_reuses_aligned_closed_returns_for_relationship_metrics() -> None:

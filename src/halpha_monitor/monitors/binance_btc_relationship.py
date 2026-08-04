@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -158,12 +160,68 @@ class BinanceSpotDailyClient:
         *,
         timeout_seconds: float = 10,
         attempts: int = 2,
+        open_url: Callable[..., Any] = urlopen,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_now: Callable[[], datetime] = utc_now,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if timeout_seconds <= 0 or attempts < 1:
             raise ValueError("BTC_RELATIONSHIP_CLIENT_CONFIGURATION_INVALID")
         self.cache_root = cache_root.resolve()
         self.timeout_seconds = timeout_seconds
         self.attempts = attempts
+        self._open_url = open_url
+        self._monotonic = monotonic
+        self._wall_now = wall_now
+        self._sleep = sleep
+        self._throttle_lock = threading.Lock()
+        self._throttle_until = 0.0
+        self._throttle_failures = 0
+
+    def _throttle_active(self) -> bool:
+        with self._throttle_lock:
+            return self._monotonic() < self._throttle_until
+
+    def _open_throttle_backoff(self, error: HTTPError) -> None:
+        retry_after: float | None = None
+        raw_retry_after = error.headers.get("Retry-After") if error.headers else None
+        if raw_retry_after:
+            try:
+                retry_after = max(0.0, float(raw_retry_after))
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(raw_retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=UTC)
+                    retry_after = max(
+                        0.0,
+                        (retry_at.astimezone(UTC) - self._wall_now()).total_seconds(),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    retry_after = None
+        with self._throttle_lock:
+            now = self._monotonic()
+            # Several symbol workers can already be in flight when the first
+            # 429 arrives. Treat their responses as one rate-limit incident;
+            # otherwise a six-worker refresh can inflate a 60-second fallback
+            # into a multi-minute cooldown before any retry is attempted.
+            if now >= self._throttle_until:
+                self._throttle_failures += 1
+            exponential = min(
+                3600.0,
+                60.0 * (2 ** min(self._throttle_failures - 1, 6)),
+            )
+            delay = max(exponential, retry_after or 0.0)
+            self._throttle_until = max(
+                self._throttle_until,
+                now + delay,
+            )
+
+    def _record_success(self) -> None:
+        with self._throttle_lock:
+            if self._monotonic() >= self._throttle_until:
+                self._throttle_until = 0.0
+                self._throttle_failures = 0
 
     def fetch(self, symbol: str, cutoff: datetime) -> DailySeriesResult:
         cache_path = self.cache_root / f"{symbol}.csv.gz"
@@ -199,6 +257,10 @@ class BinanceSpotDailyClient:
         }
         last_reason = "BTC_RELATIONSHIP_UPSTREAM_UNAVAILABLE"
         for attempt in range(self.attempts):
+            if self._throttle_active():
+                last_reason = "BTC_RELATIONSHIP_HTTP_THROTTLED"
+                break
+            retryable = False
             try:
                 request = Request(
                     f"{BINANCE_KLINES_URL}?{urlencode(params)}",
@@ -207,7 +269,7 @@ class BinanceSpotDailyClient:
                         "User-Agent": "Halpha-Monitor/1.0",
                     },
                 )
-                with urlopen(request, timeout=self.timeout_seconds) as response:
+                with self._open_url(request, timeout=self.timeout_seconds) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 normalized = normalize_klines(payload, cutoff_ms)
                 combined = (
@@ -235,6 +297,7 @@ class BinanceSpotDailyClient:
                         reason_code="BTC_RELATIONSHIP_SOURCE_STALE",
                     )
                 _write_cache(combined, cache_path)
+                self._record_success()
                 return DailySeriesResult(
                     symbol=symbol,
                     status="FETCHED",
@@ -243,19 +306,23 @@ class BinanceSpotDailyClient:
                     acquired_at=utc_now(),
                 )
             except HTTPError as exc:
-                last_reason = (
-                    "BTC_RELATIONSHIP_HTTP_THROTTLED"
-                    if exc.code in {418, 429}
-                    else "BTC_RELATIONSHIP_UPSTREAM_HTTP_ERROR"
-                )
+                if exc.code in {418, 429}:
+                    self._open_throttle_backoff(exc)
+                    last_reason = "BTC_RELATIONSHIP_HTTP_THROTTLED"
+                    break
+                last_reason = "BTC_RELATIONSHIP_UPSTREAM_HTTP_ERROR"
+                retryable = 500 <= exc.code < 600
             except (URLError, TimeoutError):
                 last_reason = "BTC_RELATIONSHIP_UPSTREAM_UNAVAILABLE"
+                retryable = True
             except json.JSONDecodeError:
                 last_reason = "BTC_RELATIONSHIP_RESPONSE_INVALID"
+                retryable = True
             except ValueError as exc:
                 last_reason = str(exc)
-            if attempt + 1 < self.attempts:
-                time.sleep(0.5 * (2**attempt))
+            if not retryable or attempt + 1 >= self.attempts:
+                break
+            self._sleep(0.5 * (2**attempt))
 
         if current_latest_ms is not None and current_latest_ms >= cutoff_ms:
             return DailySeriesResult(

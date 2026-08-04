@@ -1,0 +1,64 @@
+from decimal import Decimal
+
+from halpha_monitor.__main__ import build_parser
+from halpha_monitor.monitors import register_builtin_monitors
+from halpha_monitor.service import MONITOR_ID_PATTERN, MonitorRegistry
+
+
+def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> None:
+    database_path = tmp_path / "monitor.sqlite3"
+    args = build_parser().parse_args(
+        [
+            "--db-path",
+            str(database_path),
+            "--assets",
+            "USDT,BTC,BTC",
+            "--smart-money-symbols",
+            "BTCUSDT,ETHUSDT,BTCUSDT",
+            "--target-fiat",
+            "2500",
+        ]
+    )
+    registry = MonitorRegistry()
+
+    register_builtin_monitors(
+        registry,
+        args=args,
+        database_path=database_path,
+    )
+
+    assert tuple(monitor.monitor_id for monitor in registry) == (
+        "binance-c2c-normalized",
+        "binance-usdm-smart-money",
+        "binance-btc-relationship",
+    )
+    c2c, smart_money, btc_relationship = registry.all()
+    assert c2c.settings.assets == ("USDT", "BTC")
+    assert c2c.settings.target_fiat == Decimal("2500")
+    assert smart_money.settings.symbols == ("BTCUSDT", "ETHUSDT")
+    assert (
+        btc_relationship.settings.cache_root
+        == tmp_path / "cache" / "btc-relationship"
+    )
+
+
+def test_builtin_monitors_conform_to_shared_view_contract(tmp_path) -> None:
+    args = build_parser().parse_args(
+        ["--db-path", str(tmp_path / "monitor.sqlite3")]
+    )
+    registry = MonitorRegistry()
+    register_builtin_monitors(
+        registry,
+        args=args,
+        database_path=args.db_path,
+    )
+
+    for monitor in registry:
+        assert MONITOR_ID_PATTERN.fullmatch(monitor.monitor_id)
+        assert monitor.display_name.strip()
+        assert monitor.description.strip()
+        assert monitor.interval_seconds >= 15
+        assert monitor.view.chart_title.strip()
+        keys = [column.key for column in monitor.view.columns]
+        assert keys
+        assert len(keys) == len(set(keys))

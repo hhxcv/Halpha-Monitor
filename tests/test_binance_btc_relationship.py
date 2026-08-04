@@ -1,0 +1,149 @@
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from halpha_monitor.monitors.binance_btc_relationship import (
+    BinanceBtcRelationshipMonitor,
+    BinanceBtcRelationshipSettings,
+    DailySeriesResult,
+    _price_series,
+    analyze_pair,
+    normalize_klines,
+)
+
+
+def price_frame(days: int, *, beta: float = 1.0) -> pd.DataFrame:
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    index = np.arange(days, dtype=float)
+    returns = 0.001 + 0.008 * np.sin(index / 11)
+    prices = 100 * np.exp(np.cumsum(returns * beta))
+    open_times = [
+        int((start + timedelta(days=offset)).timestamp() * 1000)
+        for offset in range(days)
+    ]
+    return pd.DataFrame(
+        {
+            "open_time_ms": open_times,
+            "close_time_ms": [value + 86_399_999 for value in open_times],
+            "close": prices,
+        }
+    )
+
+
+def result(symbol: str, frame: pd.DataFrame) -> DailySeriesResult:
+    latest = datetime.fromtimestamp(
+        int(frame["close_time_ms"].max()) / 1000,
+        tz=UTC,
+    )
+    return DailySeriesResult(
+        symbol=symbol,
+        status="FETCHED",
+        frame=frame,
+        latest_close_at=latest,
+        acquired_at=latest,
+    )
+
+
+class FakeProvider:
+    def __init__(self, values: dict[str, DailySeriesResult]) -> None:
+        self.values = values
+
+    def fetch(self, symbol: str, cutoff: datetime) -> DailySeriesResult:
+        return self.values[symbol]
+
+
+def test_normalize_klines_keeps_only_valid_closed_rows() -> None:
+    cutoff = 200_000
+    rows = [
+        [0, "1", "2", "0.5", "1.5", "10", 99_999, "0", 1, "0", "0", "0"],
+        [100_000, "1", "2", "0.5", "1.6", "10", 199_999, "0", 1, "0", "0", "0"],
+        [200_000, "1", "2", "0.5", "1.7", "10", 299_999, "0", 1, "0", "0", "0"],
+    ]
+
+    frame = normalize_klines(rows, cutoff)
+
+    assert frame["close"].tolist() == [1.5, 1.6]
+
+
+def test_analysis_reuses_aligned_closed_returns_for_relationship_metrics() -> None:
+    btc = _price_series(price_frame(500, beta=1.0))
+    asset = _price_series(price_frame(500, beta=1.5))
+
+    analysis = analyze_pair(asset, btc)
+
+    assert analysis["status"] == "ANALYZED"
+    assert analysis["n_obs"] == 365
+    assert analysis["pearson"] > 0.999
+    assert 1.49 < analysis["beta"] < 1.51
+    assert analysis["r_squared"] > 0.999
+
+
+def test_monitor_keeps_insufficient_asset_metrics_empty_without_substitution(
+    tmp_path: Path,
+) -> None:
+    btc = price_frame(500, beta=1.0)
+    eth = price_frame(500, beta=1.3)
+    new = price_frame(30, beta=0.7)
+    provider = FakeProvider(
+        {
+            "BTCUSDT": result("BTCUSDT", btc),
+            "ETHUSDT": result("ETHUSDT", eth),
+            "NEWUSDT": result("NEWUSDT", new),
+        }
+    )
+    monitor = BinanceBtcRelationshipMonitor(
+        BinanceBtcRelationshipSettings(
+            cache_root=tmp_path,
+            symbols=("BTCUSDT", "ETHUSDT", "NEWUSDT"),
+            workers=2,
+        ),
+        provider,
+    )
+
+    batch = monitor.collect()
+
+    by_symbol = {sample.entity_key: sample for sample in batch.samples}
+    assert batch.issues == ()
+    assert by_symbol["ETHUSDT"].payload["pearson"] is not None
+    assert by_symbol["NEWUSDT"].value_text == ""
+    assert by_symbol["NEWUSDT"].payload["pearson"] is None
+    assert by_symbol["NEWUSDT"].payload["data_state"].startswith("样本不足")
+    assert "指标保持为空" in by_symbol["NEWUSDT"].payload["missing_reasons"]["pearson"]
+
+
+def test_monitor_marks_failed_asset_missing_but_preserves_other_valid_rows(
+    tmp_path: Path,
+) -> None:
+    btc = price_frame(500, beta=1.0)
+    eth = price_frame(500, beta=1.3)
+    missing = DailySeriesResult(
+        symbol="MISSUSDT",
+        status="FAILED",
+        frame=pd.DataFrame(),
+        latest_close_at=None,
+        acquired_at=None,
+        reason_code="BTC_RELATIONSHIP_UPSTREAM_UNAVAILABLE",
+    )
+    monitor = BinanceBtcRelationshipMonitor(
+        BinanceBtcRelationshipSettings(
+            cache_root=tmp_path,
+            symbols=("BTCUSDT", "ETHUSDT", "MISSUSDT"),
+            workers=2,
+        ),
+        FakeProvider(
+            {
+                "BTCUSDT": result("BTCUSDT", btc),
+                "ETHUSDT": result("ETHUSDT", eth),
+                "MISSUSDT": missing,
+            }
+        ),
+    )
+
+    batch = monitor.collect()
+
+    by_symbol = {sample.entity_key: sample for sample in batch.samples}
+    assert by_symbol["ETHUSDT"].payload["data_state"].startswith("可用")
+    assert by_symbol["MISSUSDT"].payload["pearson"] is None
+    assert batch.issues[0].scope == "MISSUSDT"

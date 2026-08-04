@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop Halpha Monitor"
+  short_description: "Build and validate the standalone monitor"
+  default_prompt: "Use $develop-halpha-monitor to implement and validate a focused Halpha Monitor change."

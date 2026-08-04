@@ -1,5 +1,7 @@
 # Halpha Monitor
 
+稳定的价值取向、独立边界、第三方复用顺序和个人项目复杂度约束见 [项目原则](docs/PROJECT-PRINCIPLES.md)；AI 开发入口见 [AGENTS.md](AGENTS.md)。
+
 这是一个独立的本地公开市场监控服务，不属于 Halpha App/Executor 产品运行时，也不取得账户、凭据或交易能力。“只读”指不会改变交易所或产品事实；页面允许修改本服务自己的 C2C 采集金额和支付方式。
 
 当前显式注册三个监控：

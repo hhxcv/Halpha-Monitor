@@ -16,6 +16,7 @@
 ## Work baseline
 
 - Preserve unrelated work and obtain explicit authority for commit, push, release, or external state changes.
+- The local-privacy and network-egress boundary is owned by `docs/PROJECT-PRINCIPLES.md`. Before commit or push, run `python .githooks/check_local_privacy.py --all`; never bypass the repository hooks or publish a rejected revision.
 - Make the smallest reversible change that produces a user-visible or operationally verifiable result; remove temporary and unused paths before handoff.
 - Keep external facts source- and time-aware, represent unknown or stale states honestly, isolate partial failures, and bound retries, threads, caches, retention, and shutdown.
 - Keep CI short, deterministic, and network-free. Run broader public-source, startup, restart, UI, and long-running checks locally when the change warrants them.

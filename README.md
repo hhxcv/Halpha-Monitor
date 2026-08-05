@@ -4,6 +4,18 @@
 
 这是一个独立的本地公开市场监控服务，不属于 Halpha App/Executor 产品运行时，也不取得账户、凭据或交易能力。“只读”指不会改变交易所或产品事实；页面允许修改本服务自己的 C2C 采集金额和支付方式。
 
+## 本地隐私门禁
+
+首次克隆后启用仓库自带的提交与推送门禁，并可随时扫描全部受 Git 管理或可能进入 Git 的文件：
+
+```powershell
+git config --local core.hooksPath .githooks
+python .githooks/check_local_privacy.py --self-test
+python .githooks/check_local_privacy.py --all
+```
+
+门禁命中时只显示类别与位置，不回显内容；不得使用 `--no-verify` 绕过。服务只为公开市场采集访问已声明来源，不包含遥测、错误自动上报或本地数据上传。
+
 当前显式注册三个监控：
 
 - Binance C2C 核算：比较公开 C2C 广告和现货一档；
@@ -41,7 +53,18 @@ python -m venv .venv
   --assets USDT,USDC,BTC,ETH,BNB,SOL
 ```
 
-默认数据库为 `%LOCALAPPDATA%\Halpha\monitor\monitor.sqlite3`，可用 `--db-path` 覆盖。默认保留 90 天，可用 `--retention-days` 调整。
+数据库路径按 `--db-path`、`HALPHA_MONITOR_DB_PATH` 环境变量、`%LOCALAPPDATA%\Halpha\monitor\monitor.sqlite3` 的优先级选择。为避免可增长数据占用系统盘，可把用户级环境变量指向 Git 仓库外的非系统盘目录；实际路径只保存在本机，不写入仓库：
+
+```powershell
+$databasePath = Read-Host "请输入仓库外数据库绝对路径"
+[Environment]::SetEnvironmentVariable(
+  "HALPHA_MONITOR_DB_PATH",
+  $databasePath,
+  "User"
+)
+```
+
+重新启动终端或服务后生效。默认保留 90 天，可用 `--retention-days` 调整。
 
 BTC 关系监控的规范化闭合日线缓存位于数据库同目录下的 `cache/btc-relationship/`。它只用于避免同一闭合日重复下载，不是第二数据库或研究证据；来源落后于当前应有闭合日时不会用于生成新指标。
 

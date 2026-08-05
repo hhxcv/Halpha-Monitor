@@ -1,8 +1,28 @@
 from decimal import Decimal
 
-from halpha_monitor.__main__ import build_parser
+from halpha_monitor.__main__ import build_parser, default_database_path
 from halpha_monitor.monitors import register_builtin_monitors
 from halpha_monitor.service import MONITOR_ID_PATTERN, MonitorRegistry
+
+
+def test_database_path_prefers_explicit_environment_override(
+    monkeypatch, tmp_path
+) -> None:
+    database_path = tmp_path / "monitor.sqlite3"
+    monkeypatch.setenv("HALPHA_MONITOR_DB_PATH", str(database_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
+
+    assert default_database_path() == database_path
+    assert build_parser().parse_args([]).db_path == database_path
+
+
+def test_database_path_keeps_local_app_data_fallback(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("HALPHA_MONITOR_DB_PATH", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert default_database_path() == (
+        tmp_path / "Halpha" / "monitor" / "monitor.sqlite3"
+    )
 
 
 def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> None:

@@ -18,6 +18,9 @@ from halpha_monitor.web import create_app
 
 
 def default_database_path() -> Path:
+    configured_path = os.environ.get("HALPHA_MONITOR_DB_PATH", "").strip()
+    if configured_path:
+        return Path(configured_path).expanduser()
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         return Path(local_app_data) / "Halpha" / "monitor" / "monitor.sqlite3"

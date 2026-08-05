@@ -32,7 +32,7 @@ Do not introduce a framework, service, database, generic abstraction, or second 
 
 ## Implement source and lifecycle behavior
 
-- Use public data only; never load product secrets, account state, or exchange-changing capability.
+- Use public data only; never load product secrets, account state, or exchange-changing capability. Apply the network-egress boundary owned by `docs/PROJECT-PRINCIPLES.md`: do not attach host-private values or add telemetry, diagnostics or uploads to public-source requests.
 - Keep collectors independently fail-able. Attach source identity, observation time, source time, cutoff, units, and quality state where the fact requires them.
 - Preserve upstream timeout, rate-limit, and `Retry-After` semantics. Retry only temporary failures with bounded exponential backoff and jitter; surface permanent or contract errors.
 - Never fabricate freshness. Empty, stale, missing, malformed, and partial results remain distinguishable from valid current data.
@@ -53,4 +53,4 @@ Keep CI short, deterministic, and network-free. Run broad, live-network, long-du
 
 ## Integrate cleanly
 
-Review the full diff, remove scaffolding and unused paths, preserve unrelated owner work, and report changed behavior, validation, and residual risk. Do not infer authority to commit, push, publish, control another repository, or perform a trading action.
+Review the full diff, remove scaffolding and unused paths, preserve unrelated owner work, and run `python .githooks/check_local_privacy.py --all` before any Git publication. Report changed behavior, validation, and residual risk. Do not infer authority to commit, push, publish, control another repository, or perform a trading action.

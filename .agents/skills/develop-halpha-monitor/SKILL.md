@@ -49,7 +49,7 @@ Select the smallest relevant set and expand when failures could be hidden or per
 - projection: API semantics, source/time labels, unknown states, and localhost UI behavior;
 - operation: install/package, startup, health, one real public read when appropriate, clean shutdown, and no owned process leak.
 
-Keep CI short, deterministic, and network-free. Run broad, live-network, long-duration, or expensive checks locally and report exactly what ran.
+At the current project stage, do not add GitHub CI or GitHub Actions. Run deterministic tests, static checks, privacy gates, broad regressions, live-network, startup, restart, UI, long-duration, and expensive checks locally in proportion to impact, and report exactly what ran. Reconsider remote CI only after the recurring-failure threshold in `docs/PROJECT-PRINCIPLES.md` is demonstrably met; if it is reintroduced, keep it short, deterministic, and network-free.
 
 ## Integrate cleanly
 

@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Halpha Monitor</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260806-8">
-    <script src="/static/app.js?v=20260806-8" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260806-11">
+    <script src="/static/app.js?v=20260806-11" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -96,15 +96,9 @@
         <section class="table-region" aria-labelledby="quote-table-title">
           <div class="section-head table-section-head">
             <h2 id="quote-table-title">最新监控数据</h2>
-            <div class="table-head-meta">
-              <p id="data-cutoff">采集完成：未知</p>
-              <div class="table-scroll-controls" id="table-scroll-controls" aria-label="表格横向查看" hidden>
-                <span>横向查看</span>
-                <button id="table-scroll-left" type="button" aria-label="向左查看隐藏列" title="向左查看隐藏列">←</button>
-                <button id="table-scroll-right" type="button" aria-label="向右查看隐藏列" title="向右查看隐藏列">→</button>
-              </div>
-            </div>
+            <p id="data-cutoff">采集完成：未知</p>
           </div>
+          <dl class="run-summary" id="run-summary" hidden></dl>
           <div class="table-scroll" id="quote-scroll" tabindex="0" aria-label="最新监控数据，可横向滚动">
             <table>
               <thead><tr id="quote-head"></tr></thead>
@@ -135,6 +129,47 @@
           </section>
 
         </div>
+
+        <section class="evaluation-region" id="evaluation-region" aria-labelledby="evaluation-title" hidden>
+          <div class="section-head evaluation-head">
+            <div>
+              <h2 id="evaluation-title">后续行情检验</h2>
+              <p id="evaluation-method-note"></p>
+            </div>
+          </div>
+          <dl class="evaluation-overview" id="evaluation-overview"></dl>
+          <div class="evaluation-block">
+            <h3>阶段 × 检验期限</h3>
+            <div class="table-scroll evaluation-scroll" tabindex="0" aria-label="阶段与期限检验汇总">
+              <table>
+                <thead>
+                  <tr>
+                    <th>阶段</th><th>期限</th><th>完成样本</th><th>方向一致率</th>
+                    <th>平均相对 BTC</th><th>平均最大顺向</th><th>平均最大逆向</th>
+                  </tr>
+                </thead>
+                <tbody id="evaluation-group-body"></tbody>
+              </table>
+            </div>
+            <p class="empty-state" id="evaluation-group-empty">尚无完成的检验样本。</p>
+          </div>
+          <div class="evaluation-block">
+            <h3>最近检验样本</h3>
+            <div class="table-scroll evaluation-scroll" tabindex="0" aria-label="最近后续行情检验记录">
+              <table>
+                <thead>
+                  <tr>
+                    <th>币种</th><th>原阶段</th><th>信号截止</th><th>期限</th>
+                    <th>币种涨跌</th><th>相对 BTC</th><th>最大顺向</th><th>最大逆向</th>
+                    <th>结果</th><th>状态 / 结果截止</th>
+                  </tr>
+                </thead>
+                <tbody id="evaluation-recent-body"></tbody>
+              </table>
+            </div>
+            <p class="empty-state" id="evaluation-recent-empty">尚未建立检验样本；出现可检验阶段后会自动记录。</p>
+          </div>
+        </section>
 
         <details class="diagnostics-region" id="diagnostics-region" hidden>
           <summary>

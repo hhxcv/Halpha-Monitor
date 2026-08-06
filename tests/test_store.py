@@ -6,6 +6,8 @@ from halpha_monitor.contracts import (
     CollectionArtifact,
     CollectionBatch,
     CollectionIssue,
+    ForwardEvaluationCase,
+    ForwardEvaluationResult,
     MetricSample,
 )
 from halpha_monitor.store import SQLiteMonitorStore
@@ -101,7 +103,7 @@ def test_version_two_database_adds_raw_artifact_storage_in_place(
             row[1]
             for row in connection.execute("PRAGMA table_info(monitor_artifact)")
         }
-    assert version == 4
+    assert version == 5
     assert {
         "request_started_at",
         "response_completed_at",
@@ -109,6 +111,78 @@ def test_version_two_database_adds_raw_artifact_storage_in_place(
         "response_sha256",
         "response_body",
     }.issubset(artifact_columns)
+
+
+def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    case = ForwardEvaluationCase(
+        case_key="AAAUSDT|BREAKOUT|2026-07-22T05:00:00.000Z|15",
+        entity_key="AAAUSDT",
+        stage="BREAKOUT",
+        stage_label="启动",
+        direction="UP",
+        signal_observed_at=NOW,
+        source_cutoff_at=NOW,
+        horizon_minutes=15,
+        due_at=NOW + timedelta(minutes=15),
+        entry_price_text="10.000000000000",
+        benchmark_entry_price_text="50000.000000000000",
+        source="BINANCE_SPOT_PUBLIC_CLOSED_5M_KLINES",
+    )
+    source_run = store.start_run("test-monitor", started_at=NOW)
+    store.finish_run(
+        source_run,
+        "test-monitor",
+        CollectionBatch(samples=(sample("6.75"),), evaluation_cases=(case,)),
+        completed_at=NOW,
+    )
+
+    assert store.pending_forward_evaluations(
+        "test-monitor",
+        due_before=NOW + timedelta(minutes=14),
+        limit=10,
+    ) == ()
+    assert store.pending_forward_evaluations(
+        "test-monitor",
+        due_before=NOW + timedelta(minutes=15),
+        limit=10,
+    ) == (case,)
+
+    resolved_at = NOW + timedelta(minutes=16)
+    result = ForwardEvaluationResult(
+        case_key=case.case_key,
+        status="COMPLETE",
+        evaluated_at=resolved_at,
+        outcome_cutoff_at=case.due_at,
+        exit_price_text="10.500000000000",
+        benchmark_exit_price_text="50250.000000000000",
+        forward_return_percent=5.0,
+        benchmark_return_percent=0.5,
+        relative_return_percent=4.5,
+        maximum_favorable_excursion_percent=6.0,
+        maximum_adverse_excursion_percent=-1.0,
+        verdict="ALIGNED",
+    )
+    resolved_run = store.start_run("test-monitor", started_at=resolved_at)
+    store.finish_run(
+        resolved_run,
+        "test-monitor",
+        CollectionBatch(samples=(sample("6.76", resolved_at),), evaluation_results=(result,)),
+        completed_at=resolved_at,
+    )
+
+    stored = store.recent_forward_evaluations("test-monitor")
+    summary = store.forward_evaluation_summary("test-monitor", now=resolved_at)
+    assert len(stored) == 1
+    assert stored[0].source_run_id == source_run
+    assert stored[0].resolved_run_id == resolved_run
+    assert stored[0].status == "COMPLETE"
+    assert stored[0].relative_return_percent == 4.5
+    assert summary["due_cases"] == 1
+    assert summary["completed_cases"] == 1
+    assert summary["groups"][0]["aligned_count"] == 1
 
 
 def test_configuration_survives_reopen(tmp_path: Path) -> None:

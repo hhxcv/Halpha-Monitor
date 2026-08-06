@@ -7,9 +7,10 @@ import re
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 
-from halpha_monitor.contracts import RegisteredMonitor
-from halpha_monitor.store import SQLiteMonitorStore, StoredControl
+from halpha_monitor.contracts import ForwardEvaluatingMonitor, RegisteredMonitor
+from halpha_monitor.store import SQLiteMonitorStore, StoredControl, utc_now
 
 
 MONITOR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
@@ -140,6 +141,33 @@ class MonitorScheduler:
         run_id = self.store.start_run(monitor.monitor_id)
         try:
             batch = monitor.collect()
+            if isinstance(monitor, ForwardEvaluatingMonitor):
+                evaluation_now = utc_now()
+                pending = self.store.pending_forward_evaluations(
+                    monitor.monitor_id,
+                    due_before=evaluation_now,
+                    limit=monitor.evaluation_batch_limit,
+                )
+                if pending:
+                    try:
+                        resolved = monitor.evaluate(pending, now=evaluation_now)
+                    except Exception as exc:
+                        # Follow-up validation must not invalidate the current
+                        # market snapshot. Pending cases remain durable and are
+                        # retried by the next bounded collection cycle.
+                        print(
+                            "MONITOR_EVALUATION_FAILED "
+                            f"id={monitor.monitor_id} type={type(exc).__name__}",
+                            flush=True,
+                        )
+                    else:
+                        batch = replace(
+                            batch,
+                            evaluation_results=(
+                                *batch.evaluation_results,
+                                *resolved,
+                            ),
+                        )
             self.store.finish_run(run_id, monitor.monitor_id, batch)
         except Exception as exc:
             reason_code = f"COLLECTION_FAILED_{type(exc).__name__.upper()}"

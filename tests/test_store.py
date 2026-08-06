@@ -174,10 +174,12 @@ def test_partial_run_commits_samples_and_scoped_issue_together(tmp_path: Path) -
 
     latest = store.latest_run("test-monitor")
     issues = store.recent_issues("test-monitor")
+    run_issues = store.issues_for_run(run_id)
     assert status == "PARTIAL"
     assert latest is not None and latest.status == "PARTIAL"
     assert store.samples_for_run(run_id)[0].value_text == "6.75"
     assert issues[0].scope == "BUY:USDT"
+    assert run_issues == issues
 
 
 def test_raw_artifact_survives_reopen_with_the_same_run_transaction(

@@ -120,6 +120,10 @@ class MonitorScheduler:
         wake_event.set()
         return True
 
+    @property
+    def started(self) -> bool:
+        return self._started
+
     def set_enabled(self, monitor_id: str, enabled: bool) -> StoredControl:
         monitor = self.registry.get(monitor_id)
         self.store.ensure_control(

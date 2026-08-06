@@ -31,6 +31,7 @@ from halpha_monitor.contracts import (
     ViewFilter,
 )
 from halpha_monitor.store import iso_utc
+from halpha_monitor.telemetry import NetworkRequestWindow
 
 
 TimeRange = Literal["30m", "1h"]
@@ -249,6 +250,10 @@ class BinanceSmartMoneyClient:
         self._random_uniform = random_uniform
         self._backoff_until: datetime | None = None
         self._throttle_failures = 0
+        self._network_requests = NetworkRequestWindow()
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int:
+        return self._network_requests.count(window_seconds=window_seconds)
 
     def ensure_available(self) -> None:
         if self._backoff_until is not None and self._now() < self._backoff_until:
@@ -275,6 +280,7 @@ class BinanceSmartMoneyClient:
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         )
         requested_at = self._now()
+        self._network_requests.record()
         try:
             with self.opener.open(request, timeout=self.timeout_seconds) as response:
                 raw_status = getattr(response, "status", None)
@@ -726,6 +732,12 @@ class BinanceSmartMoneyMonitor:
             table_title="最新聪明钱特征",
             chart_title="OI 标准化净流历史 (%)",
         )
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int | None:
+        counter = getattr(self.client, "network_request_count", None)
+        if not callable(counter):
+            return None
+        return int(counter(window_seconds=window_seconds))
 
     def collect(self) -> CollectionBatch:
         artifacts: list[CollectionArtifact] = []

@@ -23,6 +23,7 @@ from halpha_monitor.contracts import (
     ViewColumn,
     ViewFilter,
 )
+from halpha_monitor.telemetry import NetworkRequestWindow
 
 
 C2C_AGENT_BASE = "https://www.binance.com"
@@ -278,6 +279,10 @@ class BinancePublicClient:
             if proxy_url
             else build_opener()
         )
+        self._network_requests = NetworkRequestWindow()
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int:
+        return self._network_requests.count(window_seconds=window_seconds)
 
     def _get(self, base: str, path: str, params: list[tuple[str, str]]) -> Any:
         url = f"{base}{path}?{urlencode(params)}"
@@ -285,6 +290,7 @@ class BinancePublicClient:
             url,
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         )
+        self._network_requests.record()
         try:
             with self.opener.open(request, timeout=self.timeout_seconds) as response:
                 body = response.read(MAX_RESPONSE_BYTES + 1)
@@ -550,6 +556,12 @@ class BinanceC2CMonitor:
                 target_fiat=Decimal(str(normalized["target_fiat"])),
                 trade_methods=tuple(str(item) for item in normalized["trade_methods"]),
             )
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int | None:
+        counter = getattr(self.client, "network_request_count", None)
+        if not callable(counter):
+            return None
+        return int(counter(window_seconds=window_seconds))
 
     def collect(self) -> CollectionBatch:
         with self._settings_lock:

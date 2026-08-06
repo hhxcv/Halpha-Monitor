@@ -18,6 +18,10 @@ from halpha_monitor.monitors.binance_smart_money import (
     BinanceSmartMoneyMonitor,
     BinanceSmartMoneySettings,
 )
+from halpha_monitor.monitors.binance_altcoin_radar import (
+    BinanceAltcoinRadarMonitor,
+    BinanceAltcoinRadarSettings,
+)
 from halpha_monitor.monitors.binance_btc_relationship import (
     BinanceBtcRelationshipMonitor,
     BinanceBtcRelationshipSettings,
@@ -48,6 +52,15 @@ def add_builtin_monitor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--smart-money-interval-seconds", type=float, default=60)
     parser.add_argument("--smart-money-jitter-seconds", type=float, default=5)
     parser.add_argument("--smart-money-symbols", default="BTCUSDT")
+    parser.add_argument("--altcoin-radar-interval-seconds", type=float, default=300)
+    parser.add_argument("--altcoin-radar-jitter-seconds", type=float, default=30)
+    parser.add_argument(
+        "--altcoin-radar-min-quote-volume",
+        type=_positive_decimal,
+        default=Decimal("5000000"),
+    )
+    parser.add_argument("--altcoin-radar-max-candidates", type=int, default=30)
+    parser.add_argument("--altcoin-radar-workers", type=int, default=6)
     parser.add_argument("--btc-relationship-interval-seconds", type=float, default=3600)
     parser.add_argument("--btc-relationship-jitter-seconds", type=float, default=120)
     parser.add_argument("--btc-relationship-workers", type=int, default=8)
@@ -96,6 +109,19 @@ def register_builtin_monitors(
         )
     )
     registry.register(
+        BinanceAltcoinRadarMonitor(
+            BinanceAltcoinRadarSettings(
+                interval_seconds=args.altcoin_radar_interval_seconds,
+                jitter_seconds=args.altcoin_radar_jitter_seconds,
+                min_quote_volume_24h=args.altcoin_radar_min_quote_volume,
+                max_candidates=args.altcoin_radar_max_candidates,
+                workers=args.altcoin_radar_workers,
+                timeout_seconds=args.timeout_seconds,
+                proxy_url=args.proxy_url,
+            )
+        )
+    )
+    registry.register(
         BinanceBtcRelationshipMonitor(
             BinanceBtcRelationshipSettings(
                 cache_root=database_path.resolve().parent
@@ -111,6 +137,8 @@ def register_builtin_monitors(
 
 
 __all__ = [
+    "BinanceAltcoinRadarMonitor",
+    "BinanceAltcoinRadarSettings",
     "BinanceC2CMonitor",
     "BinanceC2CSettings",
     "BinanceBtcRelationshipMonitor",

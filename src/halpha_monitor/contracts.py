@@ -35,6 +35,8 @@ class ViewColumn:
     minimum_fraction_digits: int = 0
     maximum_fraction_digits: int = 8
     use_grouping: bool = False
+    show_sign: bool = True
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,8 @@ class MonitorView:
     columns: tuple[ViewColumn, ...]
     chart_title: str
     table_title: str = "最新监控数据"
+    method_note: str | None = None
+    show_description: bool = True
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,13 @@ class RegisteredMonitor(Protocol):
     view: MonitorView
 
     def collect(self) -> CollectionBatch: ...
+
+
+@runtime_checkable
+class NetworkObservableMonitor(Protocol):
+    """Optional process-local count of actual public HTTP request attempts."""
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int | None: ...
 
 
 @runtime_checkable

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 
 from halpha_monitor.monitors.binance_c2c import (
     BinanceC2CMonitor,
@@ -27,6 +26,7 @@ from halpha_monitor.monitors.binance_btc_relationship import (
     BinanceBtcRelationshipSettings,
 )
 from halpha_monitor.service import MonitorRegistry
+from halpha_monitor.store import SQLiteMonitorStore
 
 
 def _csv_tokens(value: str) -> tuple[str, ...]:
@@ -81,7 +81,7 @@ def register_builtin_monitors(
     registry: MonitorRegistry,
     *,
     args: argparse.Namespace,
-    database_path: Path,
+    store: SQLiteMonitorStore,
 ) -> None:
     registry.register(
         BinanceC2CMonitor(
@@ -118,13 +118,14 @@ def register_builtin_monitors(
                 workers=args.altcoin_radar_workers,
                 timeout_seconds=args.timeout_seconds,
                 proxy_url=args.proxy_url,
-            )
+            ),
+            evaluation_store=store,
         )
     )
     registry.register(
         BinanceBtcRelationshipMonitor(
             BinanceBtcRelationshipSettings(
-                cache_root=database_path.resolve().parent
+                cache_root=store.path.parent
                 / "cache"
                 / "btc-relationship",
                 interval_seconds=args.btc_relationship_interval_seconds,

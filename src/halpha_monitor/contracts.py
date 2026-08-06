@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, Sequence, runtime_checkable
 
 
 ColumnKind = Literal["text", "number", "percent", "time"]
 ColumnPriority = Literal["primary", "secondary"]
 ConfigurationKind = Literal["decimal", "multi_choice"]
+EvaluationDirection = Literal["UP", "DOWN"]
+EvaluationStatus = Literal["COMPLETE", "UNAVAILABLE"]
+EvaluationVerdict = Literal["ALIGNED", "INCONCLUSIVE", "OPPOSED", "UNAVAILABLE"]
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,22 @@ class ViewColumn:
     use_grouping: bool = False
     show_sign: bool = True
     description: str | None = None
+    promote_when_uniform: bool = False
+    uniform_summary_label: str | None = None
+
+
+@dataclass(frozen=True)
+class ViewSummaryField:
+    key: str
+    label: str
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationView:
+    title: str
+    method_note: str
+    minimum_group_samples: int = 30
 
 
 @dataclass(frozen=True)
@@ -47,6 +66,8 @@ class MonitorView:
     table_title: str = "最新监控数据"
     method_note: str | None = None
     show_description: bool = True
+    summary_fields: tuple[ViewSummaryField, ...] = ()
+    evaluation: EvaluationView | None = None
 
 
 @dataclass(frozen=True)
@@ -91,10 +112,49 @@ class CollectionArtifact:
 
 
 @dataclass(frozen=True)
+class ForwardEvaluationCase:
+    """A signal-time observation frozen before its future outcome is known."""
+
+    case_key: str
+    entity_key: str
+    stage: str
+    stage_label: str
+    direction: EvaluationDirection
+    signal_observed_at: datetime
+    source_cutoff_at: datetime
+    horizon_minutes: int
+    due_at: datetime
+    entry_price_text: str
+    benchmark_entry_price_text: str
+    source: str
+
+
+@dataclass(frozen=True)
+class ForwardEvaluationResult:
+    """A forward outcome resolved from closed public-market candles."""
+
+    case_key: str
+    status: EvaluationStatus
+    evaluated_at: datetime
+    outcome_cutoff_at: datetime | None
+    exit_price_text: str | None
+    benchmark_exit_price_text: str | None
+    forward_return_percent: float | None
+    benchmark_return_percent: float | None
+    relative_return_percent: float | None
+    maximum_favorable_excursion_percent: float | None
+    maximum_adverse_excursion_percent: float | None
+    verdict: EvaluationVerdict
+    reason_code: str | None = None
+
+
+@dataclass(frozen=True)
 class CollectionBatch:
     samples: tuple[MetricSample, ...]
     issues: tuple[CollectionIssue, ...] = ()
     artifacts: tuple[CollectionArtifact, ...] = ()
+    evaluation_cases: tuple[ForwardEvaluationCase, ...] = ()
+    evaluation_results: tuple[ForwardEvaluationResult, ...] = ()
 
 
 class RegisteredMonitor(Protocol):
@@ -130,3 +190,18 @@ class ConfigurableMonitor(Protocol):
     def normalize_configuration(self, values: dict[str, Any]) -> dict[str, Any]: ...
 
     def apply_configuration(self, values: dict[str, Any]) -> None: ...
+
+
+@runtime_checkable
+class ForwardEvaluatingMonitor(Protocol):
+    """Optional bounded follow-up evaluation performed by the same worker."""
+
+    monitor_id: str
+    evaluation_batch_limit: int
+
+    def evaluate(
+        self,
+        cases: Sequence[ForwardEvaluationCase],
+        *,
+        now: datetime,
+    ) -> tuple[ForwardEvaluationResult, ...]: ...

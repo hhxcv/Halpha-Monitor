@@ -467,49 +467,38 @@ select:focus-visible,
 
 .table-region { padding-top: 16px; }
 
-.section-head { min-height: 32px; }
-.section-head p { margin: 0; color: var(--text-muted); font-size: 12px; }
-
-.table-head-meta {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 12px;
-  min-width: 0;
+.run-summary {
+  margin: 7px 0 0;
+  padding: 9px 11px;
+  border-left: 3px solid var(--success);
+  background: var(--success-soft);
 }
 
-.table-scroll-controls {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--text-muted);
+.run-summary[hidden] { display: none; }
+
+.run-summary div {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.run-summary div + div { margin-top: 4px; }
+
+.run-summary dt {
+  color: var(--success);
   font-size: 12px;
+  font-weight: 700;
   white-space: nowrap;
 }
 
-.table-scroll-controls[hidden] { display: none; }
-
-.table-scroll-controls button {
-  width: 30px;
-  height: 28px;
-  padding: 0;
-  border: 1px solid var(--border-strong);
-  border-radius: 3px;
-  background: var(--surface);
-  color: var(--text);
-  cursor: pointer;
-  font-weight: 700;
+.run-summary dd {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
-.table-scroll-controls button:hover:not(:disabled) {
-  border-color: var(--focus);
-  color: var(--accent-text);
-}
-
-.table-scroll-controls button:disabled {
-  color: #a5acb8;
-  cursor: not-allowed;
-}
+.section-head { min-height: 32px; }
+.section-head p { margin: 0; color: var(--text-muted); font-size: 12px; }
 
 #data-cutoff::before {
   content: "";
@@ -671,6 +660,74 @@ th[data-kind="percent"] { text-align: right; }
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
+
+.evaluation-region {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.evaluation-region[hidden] { display: none; }
+
+.evaluation-head {
+  align-items: flex-start;
+}
+
+.evaluation-head h2 {
+  font-size: 15px;
+}
+
+.evaluation-head p {
+  max-width: 980px;
+  margin-top: 5px;
+  line-height: 1.55;
+}
+
+.evaluation-overview {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(112px, 1fr));
+  gap: 8px;
+  margin: 12px 0 16px;
+}
+
+.evaluation-overview div {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.evaluation-overview dt {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.evaluation-overview dd {
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.evaluation-block + .evaluation-block { margin-top: 18px; }
+
+.evaluation-block h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.evaluation-scroll {
+  max-height: 330px;
+}
+
+.evaluation-row { cursor: default; }
+.evaluation-row:hover { background: #f7f8fb; }
+.evaluation-row[data-verdict="ALIGNED"] td:nth-last-child(2) { color: var(--success); font-weight: 650; }
+.evaluation-row[data-verdict="OPPOSED"] td:nth-last-child(2) { color: var(--danger); font-weight: 650; }
+.evaluation-row[data-verdict="INCONCLUSIVE"] td:nth-last-child(2) { color: var(--text-secondary); }
+.evaluation-number { text-align: right; font-variant-numeric: tabular-nums; }
 
 .diagnostics-region {
   margin-top: 18px;
@@ -846,6 +903,7 @@ th[data-kind="percent"] { text-align: right; }
   .rail-summary { display: none; }
   .dynamic-filters { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
   .configuration-fields { grid-template-columns: minmax(150px, .65fr) minmax(280px, 1.35fr); }
+  .evaluation-overview { grid-template-columns: repeat(3, minmax(112px, 1fr)); }
 }
 
 @media (max-width: 620px) {
@@ -873,11 +931,6 @@ th[data-kind="percent"] { text-align: right; }
     text-align: right;
   }
   .table-section-head { align-items: center; }
-  .table-head-meta {
-    flex: 1 1 100%;
-    justify-content: space-between;
-    width: 100%;
-  }
   #quote-scroll { max-height: 56vh; }
   .monitor-context { align-items: flex-start; }
   .monitor-context p { max-width: 32ch; }
@@ -904,6 +957,8 @@ th[data-kind="percent"] { text-align: right; }
   .chart-toolbar p { max-width: 22ch; }
   .history-chart { min-height: 225px; }
   .history-chart svg { height: 225px; }
+  .run-summary div { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .evaluation-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -9,11 +9,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from halpha_monitor.contracts import CollectionBatch
+from halpha_monitor.contracts import CollectionBatch, ForwardEvaluationCase
 
 
 RunStatus = Literal["RUNNING", "SUCCESS", "PARTIAL", "FAILED"]
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> datetime:
@@ -97,6 +97,38 @@ class StoredControl:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class StoredForwardEvaluation:
+    evaluation_id: int
+    source_run_id: int
+    resolved_run_id: int | None
+    monitor_id: str
+    case_key: str
+    entity_key: str
+    stage: str
+    stage_label: str
+    direction: str
+    signal_observed_at: datetime
+    source_cutoff_at: datetime
+    horizon_minutes: int
+    due_at: datetime
+    entry_price_text: str
+    benchmark_entry_price_text: str
+    source: str
+    status: str
+    evaluated_at: datetime | None
+    outcome_cutoff_at: datetime | None
+    exit_price_text: str | None
+    benchmark_exit_price_text: str | None
+    forward_return_percent: float | None
+    benchmark_return_percent: float | None
+    relative_return_percent: float | None
+    maximum_favorable_excursion_percent: float | None
+    maximum_adverse_excursion_percent: float | None
+    verdict: str | None
+    reason_code: str | None
+
+
 class SQLiteMonitorStore:
     """One SQLite database with WAL and short, atomic write transactions."""
 
@@ -155,6 +187,8 @@ class SQLiteMonitorStore:
                     ON monitor_sample (monitor_id, series_key, observed_at DESC);
                 CREATE INDEX IF NOT EXISTS monitor_sample_run_idx
                     ON monitor_sample (run_id, sample_id);
+                CREATE INDEX IF NOT EXISTS monitor_sample_entity_latest_idx
+                    ON monitor_sample (monitor_id, entity_key, sample_id DESC);
 
                 CREATE TABLE IF NOT EXISTS monitor_issue (
                     issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,6 +235,57 @@ class SQLiteMonitorStore:
                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS monitor_forward_evaluation (
+                    evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_run_id INTEGER NOT NULL
+                        REFERENCES monitor_run(run_id) ON DELETE CASCADE,
+                    resolved_run_id INTEGER
+                        REFERENCES monitor_run(run_id) ON DELETE SET NULL,
+                    monitor_id TEXT NOT NULL,
+                    case_key TEXT NOT NULL,
+                    entity_key TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    stage_label TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK (direction IN ('UP', 'DOWN')),
+                    signal_observed_at TEXT NOT NULL,
+                    source_cutoff_at TEXT NOT NULL,
+                    horizon_minutes INTEGER NOT NULL CHECK (horizon_minutes > 0),
+                    due_at TEXT NOT NULL,
+                    entry_price_text TEXT NOT NULL,
+                    benchmark_entry_price_text TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (
+                        status IN ('PENDING', 'COMPLETE', 'UNAVAILABLE')
+                    ),
+                    evaluated_at TEXT,
+                    outcome_cutoff_at TEXT,
+                    exit_price_text TEXT,
+                    benchmark_exit_price_text TEXT,
+                    forward_return_percent REAL,
+                    benchmark_return_percent REAL,
+                    relative_return_percent REAL,
+                    maximum_favorable_excursion_percent REAL,
+                    maximum_adverse_excursion_percent REAL,
+                    verdict TEXT CHECK (
+                        verdict IS NULL OR verdict IN (
+                            'ALIGNED', 'INCONCLUSIVE', 'OPPOSED', 'UNAVAILABLE'
+                        )
+                    ),
+                    reason_code TEXT,
+                    UNIQUE (monitor_id, case_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_forward_evaluation_pending_idx
+                    ON monitor_forward_evaluation (monitor_id, status, due_at);
+                CREATE INDEX IF NOT EXISTS monitor_forward_evaluation_recent_idx
+                    ON monitor_forward_evaluation (
+                        monitor_id, source_cutoff_at DESC, evaluation_id DESC
+                    );
+                CREATE INDEX IF NOT EXISTS monitor_forward_evaluation_entity_idx
+                    ON monitor_forward_evaluation (
+                        monitor_id, entity_key, evaluation_id DESC
+                    );
                 """
             )
             interrupted = connection.execute(
@@ -429,6 +514,82 @@ class SQLiteMonitorStore:
                         ),
                     ),
                 )
+            for case in batch.evaluation_cases:
+                connection.execute(
+                    """
+                    INSERT INTO monitor_forward_evaluation (
+                        source_run_id, monitor_id, case_key, entity_key,
+                        stage, stage_label, direction,
+                        signal_observed_at, source_cutoff_at,
+                        horizon_minutes, due_at,
+                        entry_price_text, benchmark_entry_price_text, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(monitor_id, case_key) DO NOTHING
+                    """,
+                    (
+                        run_id,
+                        monitor_id,
+                        case.case_key,
+                        case.entity_key,
+                        case.stage,
+                        case.stage_label,
+                        case.direction,
+                        iso_utc(case.signal_observed_at),
+                        iso_utc(case.source_cutoff_at),
+                        case.horizon_minutes,
+                        iso_utc(case.due_at),
+                        case.entry_price_text,
+                        case.benchmark_entry_price_text,
+                        case.source,
+                    ),
+                )
+            for result in batch.evaluation_results:
+                cursor = connection.execute(
+                    """
+                    UPDATE monitor_forward_evaluation
+                    SET resolved_run_id = ?, status = ?, evaluated_at = ?,
+                        outcome_cutoff_at = ?, exit_price_text = ?,
+                        benchmark_exit_price_text = ?,
+                        forward_return_percent = ?, benchmark_return_percent = ?,
+                        relative_return_percent = ?,
+                        maximum_favorable_excursion_percent = ?,
+                        maximum_adverse_excursion_percent = ?,
+                        verdict = ?, reason_code = ?
+                    WHERE monitor_id = ? AND case_key = ? AND status = 'PENDING'
+                    """,
+                    (
+                        run_id,
+                        result.status,
+                        iso_utc(result.evaluated_at),
+                        (
+                            iso_utc(result.outcome_cutoff_at)
+                            if result.outcome_cutoff_at is not None
+                            else None
+                        ),
+                        result.exit_price_text,
+                        result.benchmark_exit_price_text,
+                        result.forward_return_percent,
+                        result.benchmark_return_percent,
+                        result.relative_return_percent,
+                        result.maximum_favorable_excursion_percent,
+                        result.maximum_adverse_excursion_percent,
+                        result.verdict,
+                        result.reason_code,
+                        monitor_id,
+                        result.case_key,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    existing = connection.execute(
+                        """
+                        SELECT status
+                        FROM monitor_forward_evaluation
+                        WHERE monitor_id = ? AND case_key = ?
+                        """,
+                        (monitor_id, result.case_key),
+                    ).fetchone()
+                    if existing is None:
+                        raise RuntimeError("MONITOR_EVALUATION_CASE_NOT_FOUND")
             for issue in batch.issues:
                 connection.execute(
                     """
@@ -533,6 +694,198 @@ class SQLiteMonitorStore:
                 (run_id,),
             ).fetchall()
         return tuple(self._sample_from_row(row) for row in rows)
+
+    def latest_samples_by_entity(
+        self,
+        monitor_id: str,
+        entity_keys: tuple[str, ...],
+    ) -> tuple[StoredSample, ...]:
+        if not entity_keys:
+            return ()
+        placeholders = ",".join("?" for _ in entity_keys)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT sample_id, run_id, monitor_id, series_key, entity_key,
+                       observed_at, value_text, unit, payload_json
+                FROM monitor_sample AS sample
+                WHERE sample.monitor_id = ?
+                  AND sample.entity_key IN ({placeholders})
+                  AND sample.sample_id = (
+                      SELECT MAX(candidate.sample_id)
+                      FROM monitor_sample AS candidate
+                      WHERE candidate.monitor_id = sample.monitor_id
+                        AND candidate.entity_key = sample.entity_key
+                  )
+                ORDER BY sample.entity_key
+                """,
+                (monitor_id, *entity_keys),
+            ).fetchall()
+        return tuple(self._sample_from_row(row) for row in rows)
+
+    def latest_forward_evaluations_by_entity(
+        self,
+        monitor_id: str,
+        entity_keys: tuple[str, ...],
+    ) -> tuple[StoredForwardEvaluation, ...]:
+        if not entity_keys:
+            return ()
+        placeholders = ",".join("?" for _ in entity_keys)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM monitor_forward_evaluation AS evaluation
+                WHERE evaluation.monitor_id = ?
+                  AND evaluation.entity_key IN ({placeholders})
+                  AND evaluation.evaluation_id = (
+                      SELECT MAX(candidate.evaluation_id)
+                      FROM monitor_forward_evaluation AS candidate
+                      WHERE candidate.monitor_id = evaluation.monitor_id
+                        AND candidate.entity_key = evaluation.entity_key
+                  )
+                ORDER BY evaluation.entity_key
+                """,
+                (monitor_id, *entity_keys),
+            ).fetchall()
+        return tuple(self._evaluation_from_row(row) for row in rows)
+
+    def pending_forward_evaluations(
+        self,
+        monitor_id: str,
+        *,
+        due_before: datetime,
+        limit: int,
+    ) -> tuple[ForwardEvaluationCase, ...]:
+        if limit < 1:
+            raise ValueError("evaluation limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM monitor_forward_evaluation
+                WHERE monitor_id = ? AND status = 'PENDING' AND due_at <= ?
+                ORDER BY due_at, evaluation_id
+                LIMIT ?
+                """,
+                (monitor_id, iso_utc(due_before), limit),
+            ).fetchall()
+        return tuple(
+            ForwardEvaluationCase(
+                case_key=str(row["case_key"]),
+                entity_key=str(row["entity_key"]),
+                stage=str(row["stage"]),
+                stage_label=str(row["stage_label"]),
+                direction=str(row["direction"]),  # type: ignore[arg-type]
+                signal_observed_at=parse_utc(str(row["signal_observed_at"])),
+                source_cutoff_at=parse_utc(str(row["source_cutoff_at"])),
+                horizon_minutes=int(row["horizon_minutes"]),
+                due_at=parse_utc(str(row["due_at"])),
+                entry_price_text=str(row["entry_price_text"]),
+                benchmark_entry_price_text=str(
+                    row["benchmark_entry_price_text"]
+                ),
+                source=str(row["source"]),
+            )
+            for row in rows
+        )
+
+    def recent_forward_evaluations(
+        self,
+        monitor_id: str,
+        *,
+        limit: int = 120,
+    ) -> tuple[StoredForwardEvaluation, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM monitor_forward_evaluation
+                WHERE monitor_id = ?
+                ORDER BY source_cutoff_at DESC, evaluation_id DESC
+                LIMIT ?
+                """,
+                (monitor_id, limit),
+            ).fetchall()
+        return tuple(self._evaluation_from_row(row) for row in rows)
+
+    def forward_evaluation_summary(
+        self,
+        monitor_id: str,
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        now_text = iso_utc(now)
+        with self._connect() as connection:
+            counts = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_cases,
+                    SUM(CASE WHEN due_at <= ? THEN 1 ELSE 0 END) AS due_cases,
+                    SUM(CASE WHEN status = 'COMPLETE' THEN 1 ELSE 0 END)
+                        AS completed_cases,
+                    SUM(CASE WHEN status = 'UNAVAILABLE' THEN 1 ELSE 0 END)
+                        AS unavailable_cases,
+                    SUM(CASE WHEN status = 'PENDING' AND due_at <= ? THEN 1 ELSE 0 END)
+                        AS pending_due_cases,
+                    SUM(CASE WHEN status = 'PENDING' AND due_at > ? THEN 1 ELSE 0 END)
+                        AS pending_future_cases
+                FROM monitor_forward_evaluation
+                WHERE monitor_id = ?
+                """,
+                (now_text, now_text, now_text, monitor_id),
+            ).fetchone()
+            groups = connection.execute(
+                """
+                SELECT stage, stage_label, horizon_minutes,
+                       COUNT(*) AS sample_count,
+                       SUM(CASE WHEN verdict = 'ALIGNED' THEN 1 ELSE 0 END)
+                           AS aligned_count,
+                       AVG(relative_return_percent) AS average_relative_return_percent,
+                       AVG(maximum_favorable_excursion_percent)
+                           AS average_favorable_excursion_percent,
+                       AVG(maximum_adverse_excursion_percent)
+                           AS average_adverse_excursion_percent
+                FROM monitor_forward_evaluation
+                WHERE monitor_id = ? AND status = 'COMPLETE'
+                GROUP BY stage, stage_label, horizon_minutes
+                ORDER BY stage_label, horizon_minutes
+                """,
+                (monitor_id,),
+            ).fetchall()
+        count_payload = {
+            key: int(counts[key] or 0)
+            for key in (
+                "total_cases",
+                "due_cases",
+                "completed_cases",
+                "unavailable_cases",
+                "pending_due_cases",
+                "pending_future_cases",
+            )
+        }
+        return {
+            **count_payload,
+            "groups": [
+                {
+                    "stage": str(row["stage"]),
+                    "stage_label": str(row["stage_label"]),
+                    "horizon_minutes": int(row["horizon_minutes"]),
+                    "sample_count": int(row["sample_count"]),
+                    "aligned_count": int(row["aligned_count"] or 0),
+                    "average_relative_return_percent": row[
+                        "average_relative_return_percent"
+                    ],
+                    "average_favorable_excursion_percent": row[
+                        "average_favorable_excursion_percent"
+                    ],
+                    "average_adverse_excursion_percent": row[
+                        "average_adverse_excursion_percent"
+                    ],
+                }
+                for row in groups
+            ],
+        }
 
     def history(
         self,
@@ -680,6 +1033,67 @@ class SQLiteMonitorStore:
             value_text=str(row["value_text"]),
             unit=str(row["unit"]),
             payload=payload,
+        )
+
+    @staticmethod
+    def _evaluation_from_row(row: sqlite3.Row) -> StoredForwardEvaluation:
+        def optional_time(key: str) -> datetime | None:
+            return parse_utc(str(row[key])) if row[key] is not None else None
+
+        def optional_float(key: str) -> float | None:
+            return float(row[key]) if row[key] is not None else None
+
+        return StoredForwardEvaluation(
+            evaluation_id=int(row["evaluation_id"]),
+            source_run_id=int(row["source_run_id"]),
+            resolved_run_id=(
+                int(row["resolved_run_id"])
+                if row["resolved_run_id"] is not None
+                else None
+            ),
+            monitor_id=str(row["monitor_id"]),
+            case_key=str(row["case_key"]),
+            entity_key=str(row["entity_key"]),
+            stage=str(row["stage"]),
+            stage_label=str(row["stage_label"]),
+            direction=str(row["direction"]),
+            signal_observed_at=parse_utc(str(row["signal_observed_at"])),
+            source_cutoff_at=parse_utc(str(row["source_cutoff_at"])),
+            horizon_minutes=int(row["horizon_minutes"]),
+            due_at=parse_utc(str(row["due_at"])),
+            entry_price_text=str(row["entry_price_text"]),
+            benchmark_entry_price_text=str(row["benchmark_entry_price_text"]),
+            source=str(row["source"]),
+            status=str(row["status"]),
+            evaluated_at=optional_time("evaluated_at"),
+            outcome_cutoff_at=optional_time("outcome_cutoff_at"),
+            exit_price_text=(
+                str(row["exit_price_text"])
+                if row["exit_price_text"] is not None
+                else None
+            ),
+            benchmark_exit_price_text=(
+                str(row["benchmark_exit_price_text"])
+                if row["benchmark_exit_price_text"] is not None
+                else None
+            ),
+            forward_return_percent=optional_float("forward_return_percent"),
+            benchmark_return_percent=optional_float(
+                "benchmark_return_percent"
+            ),
+            relative_return_percent=optional_float("relative_return_percent"),
+            maximum_favorable_excursion_percent=optional_float(
+                "maximum_favorable_excursion_percent"
+            ),
+            maximum_adverse_excursion_percent=optional_float(
+                "maximum_adverse_excursion_percent"
+            ),
+            verdict=(str(row["verdict"]) if row["verdict"] is not None else None),
+            reason_code=(
+                str(row["reason_code"])
+                if row["reason_code"] is not None
+                else None
+            ),
         )
 
     @staticmethod

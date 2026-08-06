@@ -18,10 +18,12 @@ from halpha_monitor.contracts import (
     ConfigurableMonitor,
     NetworkObservableMonitor,
     RegisteredMonitor,
+    ViewColumn,
 )
 from halpha_monitor.service import MonitorRegistry, MonitorScheduler
 from halpha_monitor.store import (
     SQLiteMonitorStore,
+    StoredForwardEvaluation,
     StoredIssue,
     StoredRun,
     StoredSample,
@@ -493,6 +495,191 @@ def _sample_payload(sample: StoredSample) -> dict[str, Any]:
     }
 
 
+def _column_payload(column: ViewColumn) -> dict[str, Any]:
+    return {
+        "key": column.key,
+        "label": column.label,
+        "kind": column.kind,
+        "priority": column.priority,
+        "minimum_fraction_digits": column.minimum_fraction_digits,
+        "maximum_fraction_digits": column.maximum_fraction_digits,
+        "use_grouping": column.use_grouping,
+        "show_sign": column.show_sign,
+        "description": column.description,
+    }
+
+
+def _promoted_uniform_columns(
+    monitor: RegisteredMonitor,
+    samples: tuple[StoredSample, ...],
+) -> dict[str, Any]:
+    promoted: dict[str, Any] = {}
+    for column in monitor.view.columns:
+        if not column.promote_when_uniform or not samples:
+            continue
+        values = [sample.payload.get(column.key) for sample in samples]
+        if any(value in (None, "") for value in values):
+            continue
+        first = values[0]
+        if all(value == first for value in values[1:]):
+            promoted[column.key] = first
+    return promoted
+
+
+def _run_summary_payload(
+    monitor: RegisteredMonitor,
+    samples: tuple[StoredSample, ...],
+    promoted_columns: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not samples:
+        return []
+    payload = samples[0].payload
+    summary = [
+        {
+            "key": field.key,
+            "label": field.label,
+            "value": payload.get(field.key),
+            "kind": "text",
+            "description": field.description,
+        }
+        for field in monitor.view.summary_fields
+        if payload.get(field.key) not in (None, "")
+    ]
+    summary.extend(
+        {
+            **_column_payload(column),
+            "label": column.uniform_summary_label or column.label,
+            "value": promoted_columns[column.key],
+        }
+        for column in monitor.view.columns
+        if column.key in promoted_columns
+    )
+    return summary
+
+
+def _forward_evaluation_row(
+    evaluation: StoredForwardEvaluation,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    verdict_labels = {
+        "ALIGNED": "方向一致",
+        "INCONCLUSIVE": "未形成显著方向",
+        "OPPOSED": "方向相反",
+        "UNAVAILABLE": "无法检验",
+    }
+    if evaluation.status == "PENDING":
+        status_label = "等待到期" if evaluation.due_at > now else "待补采"
+    elif evaluation.status == "COMPLETE":
+        status_label = "已完成"
+    else:
+        status_label = "无法检验"
+    return {
+        "case_key": evaluation.case_key,
+        "entity_key": evaluation.entity_key,
+        "stage": evaluation.stage,
+        "stage_label": evaluation.stage_label,
+        "direction": evaluation.direction,
+        "signal_observed_at": iso_utc(evaluation.signal_observed_at),
+        "source_cutoff_at": iso_utc(evaluation.source_cutoff_at),
+        "horizon_minutes": evaluation.horizon_minutes,
+        "due_at": iso_utc(evaluation.due_at),
+        "status": evaluation.status,
+        "status_label": status_label,
+        "evaluated_at": (
+            iso_utc(evaluation.evaluated_at)
+            if evaluation.evaluated_at is not None
+            else None
+        ),
+        "outcome_cutoff_at": (
+            iso_utc(evaluation.outcome_cutoff_at)
+            if evaluation.outcome_cutoff_at is not None
+            else None
+        ),
+        "forward_return_percent": evaluation.forward_return_percent,
+        "benchmark_return_percent": evaluation.benchmark_return_percent,
+        "relative_return_percent": evaluation.relative_return_percent,
+        "maximum_favorable_excursion_percent": (
+            evaluation.maximum_favorable_excursion_percent
+        ),
+        "maximum_adverse_excursion_percent": (
+            evaluation.maximum_adverse_excursion_percent
+        ),
+        "verdict": evaluation.verdict,
+        "verdict_label": verdict_labels.get(evaluation.verdict or "", status_label),
+        "reason_code": evaluation.reason_code,
+    }
+
+
+def _forward_evaluation_payload(
+    monitor: RegisteredMonitor,
+    store: SQLiteMonitorStore,
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    definition = monitor.view.evaluation
+    if definition is None:
+        return None
+    summary = store.forward_evaluation_summary(monitor.monitor_id, now=now)
+    due_cases = int(summary["due_cases"])
+    completed_cases = int(summary["completed_cases"])
+    coverage_percent = (
+        round(completed_cases / due_cases * 100.0, 1) if due_cases else None
+    )
+    groups = []
+    for group in summary["groups"]:
+        sample_count = int(group["sample_count"])
+        groups.append(
+            {
+                **group,
+                "agreement_rate_percent": (
+                    round(int(group["aligned_count"]) / sample_count * 100.0, 1)
+                    if sample_count >= definition.minimum_group_samples
+                    else None
+                ),
+                "average_relative_return_percent": (
+                    round(float(group["average_relative_return_percent"]), 4)
+                    if group["average_relative_return_percent"] is not None
+                    else None
+                ),
+                "average_favorable_excursion_percent": (
+                    round(float(group["average_favorable_excursion_percent"]), 4)
+                    if group["average_favorable_excursion_percent"] is not None
+                    else None
+                ),
+                "average_adverse_excursion_percent": (
+                    round(float(group["average_adverse_excursion_percent"]), 4)
+                    if group["average_adverse_excursion_percent"] is not None
+                    else None
+                ),
+            }
+        )
+    return {
+        "title": definition.title,
+        "method_note": definition.method_note,
+        "minimum_group_samples": definition.minimum_group_samples,
+        "overview": {
+            **{key: summary[key] for key in (
+                "total_cases",
+                "due_cases",
+                "completed_cases",
+                "unavailable_cases",
+                "pending_due_cases",
+                "pending_future_cases",
+            )},
+            "coverage_percent": coverage_percent,
+        },
+        "groups": groups,
+        "recent": [
+            _forward_evaluation_row(item, now=now)
+            for item in store.recent_forward_evaluations(
+                monitor.monitor_id,
+                limit=120,
+            )
+        ],
+    }
+
+
 def _configuration_payload(
     monitor: RegisteredMonitor,
     store: SQLiteMonitorStore,
@@ -687,6 +874,7 @@ def create_app(
         current_issues = (
             store.issues_for_run(latest_run.run_id) if latest_run is not None else ()
         )
+        promoted_columns = _promoted_uniform_columns(selected, samples)
 
         service_status, service_status_label = _overall_data_status(summaries)
         return {
@@ -700,18 +888,9 @@ def create_app(
                 "filters": filter_payload,
                 "selected_filters": selected_filters,
                 "columns": [
-                    {
-                        "key": column.key,
-                        "label": column.label,
-                        "kind": column.kind,
-                        "priority": column.priority,
-                        "minimum_fraction_digits": column.minimum_fraction_digits,
-                        "maximum_fraction_digits": column.maximum_fraction_digits,
-                        "use_grouping": column.use_grouping,
-                        "show_sign": column.show_sign,
-                        "description": column.description,
-                    }
+                    _column_payload(column)
                     for column in selected.view.columns
+                    if column.key not in promoted_columns
                 ],
                 "table_title": selected.view.table_title,
                 "chart_title": selected.view.chart_title,
@@ -721,6 +900,12 @@ def create_app(
                 "configuration": _configuration_payload(selected, store),
             },
             "rows": [_sample_payload(sample) for sample in rows],
+            "run_summary": _run_summary_payload(
+                selected,
+                samples,
+                promoted_columns,
+            ),
+            "evaluation": _forward_evaluation_payload(selected, store, now=now),
             "selected_series_key": selected_series,
             "history": history_points,
             "collection_gaps": collection_gaps,

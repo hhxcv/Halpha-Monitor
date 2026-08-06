@@ -22,13 +22,17 @@ from urllib.request import OpenerDirector, ProxyHandler, Request, build_opener
 from halpha_monitor.contracts import (
     CollectionBatch,
     CollectionIssue,
+    EvaluationView,
     FilterChoice,
+    ForwardEvaluationCase,
+    ForwardEvaluationResult,
     MetricSample,
     MonitorView,
     ViewColumn,
     ViewFilter,
+    ViewSummaryField,
 )
-from halpha_monitor.store import iso_utc
+from halpha_monitor.store import SQLiteMonitorStore, iso_utc
 from halpha_monitor.telemetry import NetworkRequestWindow
 
 
@@ -38,6 +42,17 @@ USER_AGENT = "Halpha-Monitor/0.1 public-market-read-only"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_ROLLING_SYMBOLS = 100
 KLINE_INTERVAL_MINUTES = 5
+EVALUATION_HORIZONS_MINUTES = (15, 60, 240)
+EVALUATION_REPEAT_AFTER = timedelta(hours=4)
+EVALUATION_GRACE = timedelta(hours=1)
+EVALUATION_RELATIVE_BAND_PERCENT = 0.5
+EVALUATION_DIRECTIONS = {
+    "SETUP": "UP",
+    "BREAKOUT": "UP",
+    "ACCELERATION": "UP",
+    "EXHAUSTION": "DOWN",
+    "COOLDOWN": "DOWN",
+}
 
 STABLE_BASE_ASSETS = frozenset(
     {
@@ -264,6 +279,7 @@ class CandleFeatures:
     compression_ratio: float | None
     peak_drawdown_15m_percent: float
     latest_candle_return_percent: float
+    close_price: float
 
 
 @dataclass(frozen=True)
@@ -307,6 +323,15 @@ class AltcoinRadarProvider(Protocol):
     ) -> TimedValue: ...
 
     def spot_klines(self, symbol: str, *, limit: int) -> TimedValue: ...
+
+    def spot_klines_between(
+        self,
+        symbol: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int,
+    ) -> TimedValue: ...
 
     def futures_premium_index(self) -> TimedValue: ...
 
@@ -615,6 +640,33 @@ class BinanceAltcoinRadarClient:
         )
         return TimedValue(value, response.completed_at, malformed)
 
+    def spot_klines_between(
+        self,
+        symbol: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int,
+    ) -> TimedValue:
+        if limit < 1 or limit > 1000 or end_at <= start_at:
+            raise ValueError("RADAR_EVALUATION_RANGE_INVALID")
+        response = self._get_json(
+            BINANCE_SPOT_MARKET_BASE,
+            "/api/v3/klines",
+            (
+                ("symbol", symbol),
+                ("interval", "5m"),
+                ("startTime", str(int(start_at.timestamp() * 1000) + 1)),
+                ("endTime", str(int(end_at.timestamp() * 1000) + 1)),
+                ("limit", str(limit)),
+            ),
+        )
+        value, malformed = parse_spot_klines(
+            response.value,
+            completed_at=response.completed_at,
+        )
+        return TimedValue(value, response.completed_at, malformed)
+
     def futures_premium_index(self) -> TimedValue:
         response = self._get_json(BINANCE_USDM_BASE, "/fapi/v1/premiumIndex", ())
         value, malformed = parse_funding_contexts(response.value)
@@ -825,6 +877,7 @@ def analyze_candles(candles: Sequence[SpotCandle]) -> CandleFeatures:
         compression_ratio=compression_ratio,
         peak_drawdown_15m_percent=peak_drawdown,
         latest_candle_return_percent=latest_return,
+        close_price=latest.close_price,
     )
 
 
@@ -1019,25 +1072,6 @@ def score_candidate(
     }
 
 
-def _evidence_strength(
-    *,
-    stage: str,
-    alert_score: float,
-    benchmark_available: bool,
-    futures_available: bool,
-) -> tuple[str, str]:
-    if (
-        stage != "NEUTRAL"
-        and alert_score >= 75.0
-        and benchmark_available
-        and futures_available
-    ):
-        return "HIGH", "高"
-    if stage != "NEUTRAL" and alert_score >= 55.0 and benchmark_available:
-        return "MEDIUM", "中"
-    return "LOW", "低"
-
-
 def _evidence_label(
     stage: str,
     features: CandleFeatures,
@@ -1114,12 +1148,14 @@ class BinanceAltcoinRadarMonitor:
         "尾声风险和回落确认。评分是可解释异常证据，不是上涨概率、买卖建议或拉盘定性。"
     )
     default_enabled = False
+    evaluation_batch_limit = 12
 
     def __init__(
         self,
         settings: BinanceAltcoinRadarSettings,
         *,
         client: AltcoinRadarProvider | None = None,
+        evaluation_store: SQLiteMonitorStore | None = None,
     ) -> None:
         self.settings = settings
         self.interval_seconds = settings.interval_seconds
@@ -1128,6 +1164,7 @@ class BinanceAltcoinRadarMonitor:
             timeout_seconds=settings.timeout_seconds,
             proxy_url=settings.proxy_url,
         )
+        self.evaluation_store = evaluation_store
         self.view = MonitorView(
             filters=(
                 ViewFilter(
@@ -1143,17 +1180,6 @@ class BinanceAltcoinRadarMonitor:
                         FilterChoice("COOLDOWN", "回落确认"),
                         FilterChoice("NEUTRAL", "尚未形成"),
                         FilterChoice("DATA_GAP", "数据不足"),
-                    ),
-                ),
-                ViewFilter(
-                    key="evidence_strength",
-                    label="证据强度",
-                    default="*",
-                    choices=(
-                        FilterChoice("*", "全部"),
-                        FilterChoice("HIGH", "高"),
-                        FilterChoice("MEDIUM", "中"),
-                        FilterChoice("LOW", "低"),
                     ),
                 ),
             ),
@@ -1179,32 +1205,7 @@ class BinanceAltcoinRadarMonitor:
                     description=(
                         "0–100规则分：蓄势观察使用蓄势分，启动/加速使用启动分，"
                         "尾声风险/回落确认使用尾声风险分，尚未形成取三者最大值。"
-                        "它是异常证据强度，不是上涨概率。"
-                    ),
-                ),
-                ViewColumn(
-                    "evidence_strength_label",
-                    "证据",
-                    description=(
-                        "高：已形成阶段、异动强度≥75，且BTC基准与合约补充均完整；"
-                        "中：已形成阶段、异动强度≥55，且BTC基准完整；其他为低。"
-                    ),
-                ),
-                ViewColumn(
-                    "valid_until",
-                    "有效至",
-                    "time",
-                    description=(
-                        "本行规则结论的时效截止：最新闭合5m K线结束时间加15分钟。"
-                        "到期后必须等待包含更新K线的新一轮采集，不能继续把本行视为当前信号。"
-                    ),
-                ),
-                ViewColumn(
-                    "review_window_label",
-                    "复核节奏",
-                    description=(
-                        "按5m闭合K线更新频率给出的风险复核节奏；尾声风险需当前即复核。"
-                        "这不是经过手续费、滑点和样本外回测验证的期望盈利持仓期。"
+                        "它是规则化异动强度，不是证据充分性或上涨概率。"
                     ),
                 ),
                 ViewColumn(
@@ -1247,8 +1248,15 @@ class BinanceAltcoinRadarMonitor:
                     "relative_return_15m_percent",
                     "相对 BTC",
                     "percent",
-                    priority="secondary",
                     description="该币15m涨跌幅减去BTC同期15m涨跌幅。",
+                ),
+                ViewColumn(
+                    "evidence_label",
+                    "关键事实",
+                    description=(
+                        "按本轮各特征偏离程度排序后，显示贡献最显著的3项已观测市场事实。"
+                        "它解释规则归因，不代表独立来源佐证、新闻事实或证据充分性分级。"
+                    ),
                 ),
                 ViewColumn(
                     "oi_change_15m_percent",
@@ -1280,31 +1288,37 @@ class BinanceAltcoinRadarMonitor:
                     description="Binance现货滚动24h的USDT计价成交额，用于流动性初筛。",
                 ),
                 ViewColumn(
-                    "evidence_label",
-                    "主要证据",
+                    "review_window_label",
+                    "复核节奏",
                     priority="secondary",
                     description=(
-                        "按本轮各特征偏离程度排序后显示贡献最显著的3项事实；"
-                        "它用于解释阶段归因，不是额外评分。"
+                        "按5m闭合K线更新频率给出的风险复核节奏；尾声风险需当前即复核。"
+                        "这不是经过手续费、滑点和样本外回测验证的期望盈利持仓期。"
                     ),
                 ),
                 ViewColumn(
-                    "coverage_label",
-                    "扫描覆盖",
+                    "valid_until",
+                    "有效至",
+                    "time",
                     priority="secondary",
                     description=(
-                        "依次列出本轮参与初筛的USDT现货数、达到24h流动性门槛的数量，"
-                        "以及实际读取5m K线详查的候选数量。"
+                        "规则结论的时效截止：最新闭合5m K线结束时间加15分钟。"
+                        "本轮全部候选一致时在表格上方统一显示；存在差异或缺失时保留逐行值。"
                     ),
+                    promote_when_uniform=True,
+                    uniform_summary_label="本轮结论有效至",
                 ),
                 ViewColumn(
                     "data_cutoff_at",
                     "市场截止",
                     "time",
+                    priority="secondary",
                     description=(
                         "本行计算所使用的最新闭合5m K线结束时间，"
-                        "不是页面刷新时间或网络响应时间。"
+                        "不是页面刷新时间或网络响应时间。全部候选一致时在表格上方统一显示。"
                     ),
+                    promote_when_uniform=True,
+                    uniform_summary_label="本轮市场截止",
                 ),
             ),
             table_title="全市场初筛后的异动候选",
@@ -1312,11 +1326,33 @@ class BinanceAltcoinRadarMonitor:
             method_note=(
                 "分析周期：每根闭合5m K重算，短线主判看15m，趋势背景看1h，"
                 "波动压缩比较覆盖约2小时15分，流动性与部分风险条件看24h。"
-                "表内“有效至”是每行结论的硬截止；“复核节奏”是风险检查频率，"
+                "“本轮结论有效至”是规则结论的硬截止；“复核节奏”是风险检查频率，"
                 "不是期望盈利持仓期。当前尚无含手续费、滑点的样本外回测，"
                 "因此不推断持仓时长。"
             ),
             show_description=False,
+            summary_fields=(
+                ViewSummaryField(
+                    "coverage_label",
+                    "本轮扫描",
+                    (
+                        "本轮参与初筛的USDT现货数、达到24h流动性门槛的数量，"
+                        "以及实际读取5m K线详查的候选数量。该信息属于整轮采集，"
+                        "不在每个币种行内重复。"
+                    ),
+                ),
+            ),
+            evaluation=EvaluationView(
+                title="后续行情检验",
+                method_note=(
+                    "阶段首次出现、发生变化或连续4小时未复建样本时，固定记录信号"
+                    "截止价，并在15分钟、1小时、4小时后用闭合5m K线检验。"
+                    "方向一致要求绝对方向正确且相对BTC超出±0.5个百分点；"
+                    "该带宽是暂定噪声区间，不含手续费、滑点或可成交性。"
+                    "每个阶段×期限完成少于30例时只显示样本积累，不报告一致率。"
+                ),
+                minimum_group_samples=30,
+            ),
         )
 
     def network_request_count(self, *, window_seconds: float = 60) -> int | None:
@@ -1509,7 +1545,312 @@ class BinanceAltcoinRadarMonitor:
             issue.reason_code in THROTTLE_REASON_CODES for issue in issues
         ):
             self.client.reset_throttle_backoff()
-        return CollectionBatch(samples=tuple(samples), issues=tuple(issues))
+        evaluation_cases = self._new_evaluation_cases(tuple(samples))
+        return CollectionBatch(
+            samples=tuple(samples),
+            issues=tuple(issues),
+            evaluation_cases=evaluation_cases,
+        )
+
+    def _new_evaluation_cases(
+        self,
+        samples: tuple[MetricSample, ...],
+    ) -> tuple[ForwardEvaluationCase, ...]:
+        """Freeze bounded stage episodes before any future return is observable."""
+
+        if self.evaluation_store is None:
+            return ()
+        candidates = tuple(
+            sample
+            for sample in samples
+            if str(sample.payload.get("stage")) in EVALUATION_DIRECTIONS
+            and sample.payload.get("close_price")
+            and sample.payload.get("benchmark_close_price")
+            and sample.payload.get("data_cutoff_at")
+        )
+        if not candidates:
+            return ()
+        entity_keys = tuple(sample.entity_key for sample in candidates)
+        previous_samples = {
+            sample.entity_key: sample
+            for sample in self.evaluation_store.latest_samples_by_entity(
+                self.monitor_id,
+                entity_keys,
+            )
+        }
+        previous_evaluations = {
+            evaluation.entity_key: evaluation
+            for evaluation in self.evaluation_store.latest_forward_evaluations_by_entity(
+                self.monitor_id,
+                entity_keys,
+            )
+        }
+        cases: list[ForwardEvaluationCase] = []
+        for sample in candidates:
+            stage = str(sample.payload["stage"])
+            cutoff = datetime.fromisoformat(
+                str(sample.payload["data_cutoff_at"]).replace("Z", "+00:00")
+            ).astimezone(UTC)
+            previous_sample = previous_samples.get(sample.entity_key)
+            previous_stage = (
+                str(previous_sample.payload.get("stage"))
+                if previous_sample is not None
+                else None
+            )
+            previous_evaluation = previous_evaluations.get(sample.entity_key)
+            repeated_after_gap = (
+                previous_evaluation is None
+                or cutoff - previous_evaluation.source_cutoff_at
+                >= EVALUATION_REPEAT_AFTER
+            )
+            if previous_stage == stage and not repeated_after_gap:
+                continue
+            direction = EVALUATION_DIRECTIONS[stage]
+            for horizon_minutes in EVALUATION_HORIZONS_MINUTES:
+                cases.append(
+                    ForwardEvaluationCase(
+                        case_key=(
+                            f"{sample.entity_key}|{stage}|"
+                            f"{iso_utc(cutoff)}|{horizon_minutes}"
+                        ),
+                        entity_key=sample.entity_key,
+                        stage=stage,
+                        stage_label=str(sample.payload["stage_label"]),
+                        direction=direction,  # type: ignore[arg-type]
+                        signal_observed_at=sample.observed_at,
+                        source_cutoff_at=cutoff,
+                        horizon_minutes=horizon_minutes,
+                        due_at=cutoff + timedelta(minutes=horizon_minutes),
+                        entry_price_text=str(sample.payload["close_price"]),
+                        benchmark_entry_price_text=str(
+                            sample.payload["benchmark_close_price"]
+                        ),
+                        source="BINANCE_SPOT_PUBLIC_CLOSED_5M_KLINES",
+                    )
+                )
+        return tuple(cases)
+
+    def evaluate(
+        self,
+        cases: Sequence[ForwardEvaluationCase],
+        *,
+        now: datetime,
+    ) -> tuple[ForwardEvaluationResult, ...]:
+        """Resolve due cases from exact closed 5m windows, with no interpolation."""
+
+        pending = tuple(cases)
+        if not pending:
+            return ()
+        earliest = min(case.source_cutoff_at for case in pending)
+        latest = max(case.due_at for case in pending)
+        try:
+            benchmark_result = self.client.spot_klines_between(
+                "BTCUSDT",
+                start_at=earliest,
+                end_at=latest,
+                limit=self._evaluation_range_limit(earliest, latest),
+            )
+            benchmark_candles = tuple(benchmark_result.value)
+        except (RadarSourceError, ValueError) as exc:
+            reason = (
+                exc.reason_code
+                if isinstance(exc, RadarSourceError)
+                else "RADAR_EVALUATION_RANGE_INVALID"
+            )
+            return tuple(
+                self._unavailable_evaluation(case, now=now, reason_code=reason)
+                for case in pending
+                if now >= case.due_at + EVALUATION_GRACE
+            )
+
+        by_entity: dict[str, list[ForwardEvaluationCase]] = {}
+        for case in pending:
+            by_entity.setdefault(case.entity_key, []).append(case)
+        resolved: list[ForwardEvaluationResult] = []
+        for entity_key, entity_cases in by_entity.items():
+            entity_start = min(case.source_cutoff_at for case in entity_cases)
+            entity_end = max(case.due_at for case in entity_cases)
+            try:
+                asset_result = self.client.spot_klines_between(
+                    entity_key,
+                    start_at=entity_start,
+                    end_at=entity_end,
+                    limit=self._evaluation_range_limit(entity_start, entity_end),
+                )
+                asset_candles = tuple(asset_result.value)
+            except (RadarSourceError, ValueError) as exc:
+                reason = (
+                    exc.reason_code
+                    if isinstance(exc, RadarSourceError)
+                    else "RADAR_EVALUATION_RANGE_INVALID"
+                )
+                resolved.extend(
+                    self._unavailable_evaluation(
+                        case,
+                        now=now,
+                        reason_code=reason,
+                    )
+                    for case in entity_cases
+                    if now >= case.due_at + EVALUATION_GRACE
+                )
+                continue
+            for case in entity_cases:
+                result = self._resolve_evaluation(
+                    case,
+                    asset_candles=asset_candles,
+                    benchmark_candles=benchmark_candles,
+                    now=now,
+                )
+                if result is not None:
+                    resolved.append(result)
+        return tuple(resolved)
+
+    @staticmethod
+    def _evaluation_range_limit(start_at: datetime, end_at: datetime) -> int:
+        candle_count = math.ceil(
+            (end_at - start_at).total_seconds()
+            / (KLINE_INTERVAL_MINUTES * 60)
+        )
+        return min(1000, max(1, candle_count + 2))
+
+    @staticmethod
+    def _evaluation_window(
+        case: ForwardEvaluationCase,
+        candles: Sequence[SpotCandle],
+    ) -> tuple[SpotCandle, ...] | None:
+        expected = case.horizon_minutes // KLINE_INTERVAL_MINUTES
+        selected = tuple(
+            candle
+            for candle in candles
+            if candle.close_time > case.source_cutoff_at
+            and candle.close_time <= case.due_at + timedelta(seconds=5)
+        )
+        if len(selected) != expected:
+            return None
+        if abs((selected[0].open_time - case.source_cutoff_at).total_seconds()) > 5:
+            return None
+        if abs((selected[-1].close_time - case.due_at).total_seconds()) > 5:
+            return None
+        if any(
+            abs(
+                (current.open_time - previous.open_time).total_seconds()
+                - KLINE_INTERVAL_MINUTES * 60
+            )
+            > 5
+            for previous, current in zip(selected, selected[1:])
+        ):
+            return None
+        return selected
+
+    def _resolve_evaluation(
+        self,
+        case: ForwardEvaluationCase,
+        *,
+        asset_candles: Sequence[SpotCandle],
+        benchmark_candles: Sequence[SpotCandle],
+        now: datetime,
+    ) -> ForwardEvaluationResult | None:
+        asset_window = self._evaluation_window(case, asset_candles)
+        benchmark_window = self._evaluation_window(case, benchmark_candles)
+        if asset_window is None or benchmark_window is None:
+            if now < case.due_at + EVALUATION_GRACE:
+                return None
+            return self._unavailable_evaluation(
+                case,
+                now=now,
+                reason_code="RADAR_EVALUATION_KLINES_UNAVAILABLE",
+            )
+        try:
+            entry_price = float(_decimal(
+                case.entry_price_text,
+                field="evaluation.entryPrice",
+                positive=True,
+            ))
+            benchmark_entry = float(_decimal(
+                case.benchmark_entry_price_text,
+                field="evaluation.benchmarkEntryPrice",
+                positive=True,
+            ))
+        except ValueError:
+            return self._unavailable_evaluation(
+                case,
+                now=now,
+                reason_code="RADAR_EVALUATION_ENTRY_INVALID",
+            )
+        exit_price = asset_window[-1].close_price
+        benchmark_exit = benchmark_window[-1].close_price
+        forward_return = (exit_price / entry_price - 1.0) * 100.0
+        benchmark_return = (benchmark_exit / benchmark_entry - 1.0) * 100.0
+        relative_return = forward_return - benchmark_return
+        highest_return = (
+            max(candle.high_price for candle in asset_window) / entry_price - 1.0
+        ) * 100.0
+        lowest_return = (
+            min(candle.low_price for candle in asset_window) / entry_price - 1.0
+        ) * 100.0
+        if case.direction == "UP":
+            favorable = highest_return
+            adverse = lowest_return
+            aligned = (
+                forward_return > 0
+                and relative_return >= EVALUATION_RELATIVE_BAND_PERCENT
+            )
+            opposed = (
+                forward_return < 0
+                and relative_return <= -EVALUATION_RELATIVE_BAND_PERCENT
+            )
+        else:
+            favorable = -lowest_return
+            adverse = -highest_return
+            aligned = (
+                forward_return < 0
+                and relative_return <= -EVALUATION_RELATIVE_BAND_PERCENT
+            )
+            opposed = (
+                forward_return > 0
+                and relative_return >= EVALUATION_RELATIVE_BAND_PERCENT
+            )
+        verdict = "ALIGNED" if aligned else "OPPOSED" if opposed else "INCONCLUSIVE"
+        return ForwardEvaluationResult(
+            case_key=case.case_key,
+            status="COMPLETE",
+            evaluated_at=now,
+            outcome_cutoff_at=min(
+                asset_window[-1].close_time,
+                benchmark_window[-1].close_time,
+            ),
+            exit_price_text=f"{exit_price:.12f}",
+            benchmark_exit_price_text=f"{benchmark_exit:.12f}",
+            forward_return_percent=forward_return,
+            benchmark_return_percent=benchmark_return,
+            relative_return_percent=relative_return,
+            maximum_favorable_excursion_percent=favorable,
+            maximum_adverse_excursion_percent=adverse,
+            verdict=verdict,  # type: ignore[arg-type]
+        )
+
+    @staticmethod
+    def _unavailable_evaluation(
+        case: ForwardEvaluationCase,
+        *,
+        now: datetime,
+        reason_code: str,
+    ) -> ForwardEvaluationResult:
+        return ForwardEvaluationResult(
+            case_key=case.case_key,
+            status="UNAVAILABLE",
+            evaluated_at=now,
+            outcome_cutoff_at=None,
+            exit_price_text=None,
+            benchmark_exit_price_text=None,
+            forward_return_percent=None,
+            benchmark_return_percent=None,
+            relative_return_percent=None,
+            maximum_favorable_excursion_percent=None,
+            maximum_adverse_excursion_percent=None,
+            verdict="UNAVAILABLE",
+            reason_code=reason_code,
+        )
 
     def _fresh_tickers(
         self,
@@ -1680,6 +2021,8 @@ class BinanceAltcoinRadarMonitor:
             "oi_change_15m_percent",
             "funding_rate_percent",
             "data_cutoff_at",
+            "close_price",
+            "benchmark_close_price",
         )
         return MetricSample(
             series_key=f"{enrichment.seed.symbol}|alert-score",
@@ -1698,8 +2041,6 @@ class BinanceAltcoinRadarMonitor:
                 "stage": "DATA_GAP",
                 "stage_label": STAGE_LABELS["DATA_GAP"],
                 "row_tone": STAGE_TONES["DATA_GAP"],
-                "evidence_strength": "LOW",
-                "evidence_strength_label": "低",
                 "evidence_label": "候选详查数据不足",
                 "review_window_label": STAGE_REVIEW_LABELS["DATA_GAP"],
                 **{field: None for field in missing_fields},
@@ -1743,20 +2084,14 @@ class BinanceAltcoinRadarMonitor:
             oi_change_15m_percent=enrichment.oi_change_15m_percent,
         )
         stage = str(scoring["stage"])
-        strength, strength_label = _evidence_strength(
-            stage=stage,
-            alert_score=float(scoring["alert_score"]),
-            benchmark_available=benchmark_features is not None,
-            futures_available=(
-                enrichment.funding is not None
-                and enrichment.oi_change_15m_percent is not None
-            ),
-        )
         missing_reasons: dict[str, str] = {}
         if relative_return is None:
             missing_reasons["relative_return_15m_percent"] = (
                 "未取得 BTC 同期通过校验的闭合 K 线；"
                 "相对表现保持为空，未使用替代值。"
+            )
+            missing_reasons["benchmark_close_price"] = (
+                "未取得BTC同期通过校验的闭合K线；本轮不建立后续行情检验样本。"
             )
         if funding_rate is None:
             missing_reasons["funding_rate_percent"] = (
@@ -1781,8 +2116,6 @@ class BinanceAltcoinRadarMonitor:
             "stage_label": STAGE_LABELS[stage],
             "row_tone": STAGE_TONES[stage],
             "review_window_label": STAGE_REVIEW_LABELS[stage],
-            "evidence_strength": strength,
-            "evidence_strength_label": strength_label,
             "alert_score": _float_text(alert_score, 3),
             "setup_score": _float_text(float(scoring["setup_score"]), 3),
             "pump_score": _float_text(float(scoring["pump_score"]), 3),
@@ -1814,6 +2147,12 @@ class BinanceAltcoinRadarMonitor:
                 oi_change_15m_percent=enrichment.oi_change_15m_percent,
             ),
             "data_cutoff_at": iso_utc(features.cutoff_at),
+            "close_price": _float_text(features.close_price, 12),
+            "benchmark_close_price": (
+                _float_text(benchmark_features.close_price, 12)
+                if benchmark_features is not None
+                else None
+            ),
             "valid_until": iso_utc(
                 features.cutoff_at + timedelta(seconds=self.settings.kline_stale_seconds)
             ),

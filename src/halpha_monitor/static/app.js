@@ -35,11 +35,9 @@ const ui = {
   filters: document.querySelector("#dynamic-filters"),
   timeWindow: document.querySelector("#time-window"),
   dataCutoff: document.querySelector("#data-cutoff"),
-  tableScrollControls: document.querySelector("#table-scroll-controls"),
-  tableScrollLeft: document.querySelector("#table-scroll-left"),
-  tableScrollRight: document.querySelector("#table-scroll-right"),
   quoteScroll: document.querySelector("#quote-scroll"),
   quoteTableTitle: document.querySelector("#quote-table-title"),
+  runSummary: document.querySelector("#run-summary"),
   quoteHead: document.querySelector("#quote-head"),
   quoteBody: document.querySelector("#quote-body"),
   quoteEmpty: document.querySelector("#quote-empty"),
@@ -52,6 +50,14 @@ const ui = {
   chartViewportStatus: document.querySelector("#chart-viewport-status"),
   collectionGapNote: document.querySelector("#collection-gap-note"),
   chartSummary: document.querySelector("#chart-summary"),
+  evaluationRegion: document.querySelector("#evaluation-region"),
+  evaluationTitle: document.querySelector("#evaluation-title"),
+  evaluationMethodNote: document.querySelector("#evaluation-method-note"),
+  evaluationOverview: document.querySelector("#evaluation-overview"),
+  evaluationGroupBody: document.querySelector("#evaluation-group-body"),
+  evaluationGroupEmpty: document.querySelector("#evaluation-group-empty"),
+  evaluationRecentBody: document.querySelector("#evaluation-recent-body"),
+  evaluationRecentEmpty: document.querySelector("#evaluation-recent-empty"),
   diagnosticsRegion: document.querySelector("#diagnostics-region"),
   issueCount: document.querySelector("#issue-count"),
   issueBody: document.querySelector("#issue-body"),
@@ -78,7 +84,6 @@ const state = {
   chartDrag: null,
   chartResizeTimer: null,
   tableSort: null,
-  tableResizeTimer: null,
 };
 
 const TABLE_TEXT_COLLATOR = new Intl.Collator("zh-CN", {
@@ -283,6 +288,7 @@ function render(payload) {
   renderConfiguration(payload.monitor.configuration, payload.monitor.latest_run);
   renderFilters(payload.monitor.filters, payload.time_windows);
   ui.quoteTableTitle.textContent = payload.monitor.table_title;
+  renderRunSummary(payload.run_summary);
   renderTable(
     payload.monitor.columns,
     payload.rows,
@@ -298,7 +304,24 @@ function render(payload) {
     payload.history,
     payload.collection_gaps,
   );
+  renderEvaluation(payload.evaluation);
   renderIssues(payload.issues);
+}
+
+function renderRunSummary(items) {
+  ui.runSummary.replaceChildren();
+  (items || []).forEach((item) => {
+    const group = document.createElement("div");
+    if (item.description) {
+      group.title = item.description;
+      group.setAttribute("aria-description", item.description);
+    }
+    const rendered = cellValue({ [item.key]: item.value }, item);
+    group.append(createElement("dt", "", item.label));
+    group.append(createElement("dd", rendered.missing ? "missing-value" : "", rendered.text));
+    ui.runSummary.append(group);
+  });
+  ui.runSummary.hidden = ui.runSummary.childElementCount === 0;
 }
 
 function renderGlobal(payload) {
@@ -821,19 +844,6 @@ function marketDestination(row) {
   };
 }
 
-function updateTableScrollControls() {
-  const maximum = Math.max(0, ui.quoteScroll.scrollWidth - ui.quoteScroll.clientWidth);
-  const overflowed = maximum > 2;
-  ui.tableScrollControls.hidden = !overflowed;
-  ui.tableScrollLeft.disabled = !overflowed || ui.quoteScroll.scrollLeft <= 2;
-  ui.tableScrollRight.disabled = !overflowed || ui.quoteScroll.scrollLeft >= maximum - 2;
-}
-
-function scrollTableHorizontally(direction) {
-  const distance = Math.max(280, Math.round(ui.quoteScroll.clientWidth * 0.72));
-  ui.quoteScroll.scrollBy({ left: direction * distance, behavior: "smooth" });
-}
-
 function renderTable(
   columns,
   rows,
@@ -950,7 +960,102 @@ function renderTable(
   issueGroups.forEach((group) => appendTableIssueRow(columns, group));
   ui.quoteEmpty.hidden = rows.length > 0 || issueGroups.length > 0;
   ui.quoteEmpty.textContent = emptyTableMessage(dataStatus);
-  requestAnimationFrame(updateTableScrollControls);
+}
+
+function evaluationHorizonLabel(minutes) {
+  if (Number(minutes) === 60) return "1小时";
+  if (Number(minutes) === 240) return "4小时";
+  return `${Number(minutes)}分钟`;
+}
+
+function evaluationPercent(value) {
+  const numeric = Number(value);
+  if (value === null || value === undefined || !Number.isFinite(numeric)) return "—";
+  return `${numeric >= 0 ? "+" : ""}${numeric.toFixed(4)}%`;
+}
+
+function appendEvaluationCell(row, text, { numeric = false } = {}) {
+  const cell = createElement("td", numeric ? "evaluation-number" : "", text);
+  row.append(cell);
+}
+
+function renderEvaluation(evaluation) {
+  if (!evaluation) {
+    ui.evaluationRegion.hidden = true;
+    ui.evaluationOverview.replaceChildren();
+    ui.evaluationGroupBody.replaceChildren();
+    ui.evaluationRecentBody.replaceChildren();
+    return;
+  }
+  ui.evaluationRegion.hidden = false;
+  ui.evaluationTitle.textContent = evaluation.title;
+  ui.evaluationMethodNote.textContent = evaluation.method_note;
+
+  const overview = evaluation.overview;
+  const overviewItems = [
+    ["已固定期限样本", overview.total_cases],
+    ["已到期", overview.due_cases],
+    ["已完成", overview.completed_cases],
+    ["到期覆盖", overview.coverage_percent === null ? "等待首批到期" : `${Number(overview.coverage_percent).toFixed(1)}%`],
+    ["等待到期", overview.pending_future_cases],
+    ["待补采 / 无法检验", `${overview.pending_due_cases} / ${overview.unavailable_cases}`],
+  ];
+  ui.evaluationOverview.replaceChildren();
+  overviewItems.forEach(([label, value]) => {
+    const group = document.createElement("div");
+    group.append(createElement("dt", "", label));
+    group.append(createElement("dd", "", String(value)));
+    ui.evaluationOverview.append(group);
+  });
+
+  ui.evaluationGroupBody.replaceChildren();
+  evaluation.groups.forEach((group) => {
+    const row = document.createElement("tr");
+    row.className = "evaluation-row";
+    appendEvaluationCell(row, group.stage_label);
+    appendEvaluationCell(row, evaluationHorizonLabel(group.horizon_minutes));
+    appendEvaluationCell(row, String(group.sample_count), { numeric: true });
+    appendEvaluationCell(
+      row,
+      group.agreement_rate_percent === null
+        ? `样本积累中（${group.sample_count}/${evaluation.minimum_group_samples}）`
+        : `${Number(group.agreement_rate_percent).toFixed(1)}%`,
+      { numeric: group.agreement_rate_percent !== null },
+    );
+    appendEvaluationCell(row, evaluationPercent(group.average_relative_return_percent), { numeric: true });
+    appendEvaluationCell(row, evaluationPercent(group.average_favorable_excursion_percent), { numeric: true });
+    appendEvaluationCell(row, evaluationPercent(group.average_adverse_excursion_percent), { numeric: true });
+    ui.evaluationGroupBody.append(row);
+  });
+  ui.evaluationGroupEmpty.hidden = evaluation.groups.length > 0;
+
+  ui.evaluationRecentBody.replaceChildren();
+  evaluation.recent.forEach((item) => {
+    const row = document.createElement("tr");
+    row.className = "evaluation-row";
+    if (item.verdict) row.dataset.verdict = item.verdict;
+    appendEvaluationCell(row, item.entity_key);
+    appendEvaluationCell(row, item.stage_label);
+    appendEvaluationCell(row, formatTime(item.source_cutoff_at));
+    appendEvaluationCell(row, evaluationHorizonLabel(item.horizon_minutes));
+    appendEvaluationCell(row, evaluationPercent(item.forward_return_percent), { numeric: true });
+    appendEvaluationCell(row, evaluationPercent(item.relative_return_percent), { numeric: true });
+    appendEvaluationCell(row, evaluationPercent(item.maximum_favorable_excursion_percent), { numeric: true });
+    appendEvaluationCell(row, evaluationPercent(item.maximum_adverse_excursion_percent), { numeric: true });
+    appendEvaluationCell(row, item.verdict_label);
+    appendEvaluationCell(
+      row,
+      item.status === "COMPLETE"
+        ? `已完成 · ${formatTime(item.outcome_cutoff_at)}`
+        : item.status === "PENDING"
+          ? `${item.status_label} · 到期 ${formatTime(item.due_at)}`
+          : item.reason_code
+            ? `${item.status_label} · ${item.reason_code}`
+            : item.status_label,
+    );
+    ui.evaluationRecentBody.append(row);
+  });
+  ui.evaluationRecentEmpty.hidden = evaluation.recent.length > 0;
 }
 
 function renderHistory(title, rows, selectedSeries, history, collectionGaps) {
@@ -1283,16 +1388,10 @@ ui.historyChart.addEventListener("keydown", (event) => {
 
 window.addEventListener("resize", () => {
   clearTimeout(state.chartResizeTimer);
-  clearTimeout(state.tableResizeTimer);
   state.chartResizeTimer = setTimeout(() => {
     if (state.chartModel) drawHistoryChart();
   }, 100);
-  state.tableResizeTimer = setTimeout(updateTableScrollControls, 100);
 });
-
-ui.quoteScroll.addEventListener("scroll", updateTableScrollControls, { passive: true });
-ui.tableScrollLeft.addEventListener("click", () => scrollTableHorizontally(-1));
-ui.tableScrollRight.addEventListener("click", () => scrollTableHorizontally(1));
 
 function renderIssues(issues) {
   const diagnosticIssues = issues.filter(

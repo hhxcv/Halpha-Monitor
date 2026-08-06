@@ -1,13 +1,15 @@
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from halpha_monitor.contracts import (
     CollectionBatch,
+    ForwardEvaluationCase,
+    ForwardEvaluationResult,
     MetricSample,
     MonitorView,
 )
@@ -233,3 +235,75 @@ def test_maintenance_failure_does_not_change_a_completed_monitor_run(
     assert latest is not None
     assert latest.status == "SUCCESS"
     assert calls == 1
+
+
+def test_scheduler_resolves_due_evaluations_without_changing_current_samples(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class EvaluatingMonitor(FakeMonitor):
+        monitor_id: str = "evaluating-monitor"
+        evaluation_batch_limit: int = 4
+        evaluated_case_keys: tuple[str, ...] = ()
+
+        def evaluate(
+            self,
+            cases: tuple[ForwardEvaluationCase, ...],
+            *,
+            now: datetime,
+        ) -> tuple[ForwardEvaluationResult, ...]:
+            self.evaluated_case_keys = tuple(case.case_key for case in cases)
+            return tuple(
+                ForwardEvaluationResult(
+                    case_key=case.case_key,
+                    status="COMPLETE",
+                    evaluated_at=now,
+                    outcome_cutoff_at=case.due_at,
+                    exit_price_text="10.5",
+                    benchmark_exit_price_text="101",
+                    forward_return_percent=5.0,
+                    benchmark_return_percent=1.0,
+                    relative_return_percent=4.0,
+                    maximum_favorable_excursion_percent=6.0,
+                    maximum_adverse_excursion_percent=-1.0,
+                    verdict="ALIGNED",
+                )
+                for case in cases
+            )
+
+    store = make_store(tmp_path)
+    monitor = EvaluatingMonitor()
+    now = datetime.now(UTC)
+    case = ForwardEvaluationCase(
+        case_key="AAAUSDT|BREAKOUT|fixture|15",
+        entity_key="AAAUSDT",
+        stage="BREAKOUT",
+        stage_label="启动",
+        direction="UP",
+        signal_observed_at=now - timedelta(minutes=20),
+        source_cutoff_at=now - timedelta(minutes=20),
+        horizon_minutes=15,
+        due_at=now - timedelta(minutes=5),
+        entry_price_text="10",
+        benchmark_entry_price_text="100",
+        source="PUBLIC_FIXTURE",
+    )
+    source_run = store.start_run(monitor.monitor_id, started_at=now - timedelta(minutes=20))
+    store.finish_run(
+        source_run,
+        monitor.monitor_id,
+        CollectionBatch(samples=(), evaluation_cases=(case,)),
+        completed_at=now - timedelta(minutes=20),
+    )
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    scheduler = MonitorScheduler(registry, store)
+
+    scheduler.run_once(monitor)
+
+    latest = store.latest_run(monitor.monitor_id)
+    evaluation = store.recent_forward_evaluations(monitor.monitor_id)[0]
+    assert monitor.evaluated_case_keys == (case.case_key,)
+    assert latest is not None and latest.sample_count == 1
+    assert evaluation.status == "COMPLETE"
+    assert evaluation.resolved_run_id == latest.run_id

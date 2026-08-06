@@ -151,12 +151,16 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert 'id="collection-load"' in page.text
     assert 'id="network-requests"' in page.text
     assert 'id="quote-scroll"' in page.text
-    assert 'id="table-scroll-controls"' in page.text
+    assert 'id="table-scroll-controls"' not in page.text
+    assert 'id="table-scroll-left"' not in page.text
+    assert 'id="table-scroll-right"' not in page.text
     assert 'id="monitor-method-note"' in page.text
     assert 'id="time-window-label"' in page.text
     assert "历史范围" in page.text
     assert "payload.current_issues" in script.text
     assert "function sortTableRows" in script.text
+    assert "updateTableScrollControls" not in script.text
+    assert "scrollTableHorizontally" not in script.text
     assert 'button.setAttribute("aria-description", column.description)' in script.text
     assert "function monitorIdFromLocation" in script.text
     assert "window.history.replaceState" in script.text
@@ -248,6 +252,100 @@ def test_view_returns_latest_rows_history_and_registration_metadata(
             "请求数为本进程近 60 秒实际发出的公开 HTTP 请求。"
         ),
     }
+
+
+def test_view_promotes_uniform_opt_in_columns_and_restores_differing_values(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class UniformMonitor:
+        monitor_id: str = "uniform-monitor"
+        display_name: str = "Uniform"
+        description: str = "Uniform fixture"
+        interval_seconds: float = 60
+        view: MonitorView = MonitorView(
+            filters=(),
+            columns=(
+                ViewColumn("symbol", "币种"),
+                ViewColumn("stage", "阶段"),
+                ViewColumn(
+                    "valid_until",
+                    "有效至",
+                    "time",
+                    promote_when_uniform=True,
+                    uniform_summary_label="本轮结论有效至",
+                ),
+            ),
+            chart_title="分值",
+        )
+
+        def collect(self) -> CollectionBatch:
+            return CollectionBatch(samples=())
+
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    registry = MonitorRegistry()
+    registry.register(UniformMonitor())
+    app = create_app(store, registry, None, start_scheduler=False)
+    now = datetime.now(UTC)
+
+    def add_uniform_run(*, differing: bool) -> None:
+        run_id = store.start_run("uniform-monitor", started_at=now)
+        values = (
+            "2026-08-06T16:00:00Z",
+            "2026-08-06T16:05:00Z" if differing else "2026-08-06T16:00:00Z",
+        )
+        store.finish_run(
+            run_id,
+            "uniform-monitor",
+            CollectionBatch(
+                samples=tuple(
+                    MetricSample(
+                        series_key=f"{symbol}|score",
+                        entity_key=symbol,
+                        observed_at=now,
+                        value_text="1",
+                        unit="SCORE",
+                        payload={
+                            "symbol": symbol,
+                            "stage": "SETUP",
+                            "valid_until": value,
+                        },
+                    )
+                    for symbol, value in zip(("AAA", "BBB"), values, strict=True)
+                )
+            ),
+            completed_at=now,
+        )
+
+    add_uniform_run(differing=False)
+    with TestClient(app, base_url="http://127.0.0.1:8790") as client:
+        uniform_payload = client.get("/api/view").json()
+        assert [
+            column["key"] for column in uniform_payload["monitor"]["columns"]
+        ] == ["symbol", "stage"]
+        assert uniform_payload["run_summary"] == [
+            {
+                "key": "valid_until",
+                "label": "本轮结论有效至",
+                "kind": "time",
+                "priority": "primary",
+                "minimum_fraction_digits": 0,
+                "maximum_fraction_digits": 8,
+                "use_grouping": False,
+                "show_sign": True,
+                "description": None,
+                "value": "2026-08-06T16:00:00Z",
+            }
+        ]
+
+        add_uniform_run(differing=True)
+        differing_payload = client.get("/api/view").json()
+
+    assert [
+        column["key"] for column in differing_payload["monitor"]["columns"]
+    ] == ["symbol", "stage", "valid_until"]
+    assert differing_payload["run_summary"] == []
 
 
 def test_view_wildcard_filter_returns_all_registered_values(tmp_path: Path) -> None:

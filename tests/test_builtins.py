@@ -3,6 +3,7 @@ from decimal import Decimal
 from halpha_monitor.__main__ import build_parser, default_database_path
 from halpha_monitor.monitors import register_builtin_monitors
 from halpha_monitor.service import MONITOR_ID_PATTERN, MonitorRegistry
+from halpha_monitor.store import SQLiteMonitorStore
 
 
 def test_database_path_prefers_explicit_environment_override(
@@ -48,7 +49,7 @@ def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> 
     register_builtin_monitors(
         registry,
         args=args,
-        database_path=database_path,
+        store=SQLiteMonitorStore(database_path),
     )
 
     assert tuple(monitor.monitor_id for monitor in registry) == (
@@ -77,7 +78,7 @@ def test_builtin_monitors_conform_to_shared_view_contract(tmp_path) -> None:
     register_builtin_monitors(
         registry,
         args=args,
-        database_path=args.db_path,
+        store=SQLiteMonitorStore(args.db_path),
     )
 
     for monitor in registry:

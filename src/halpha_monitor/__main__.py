@@ -47,13 +47,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("port must be between 1024 and 65535")
     if args.retention_days < 1:
         raise SystemExit("retention-days must be positive")
+    store = SQLiteMonitorStore(args.db_path)
     registry = MonitorRegistry()
     register_builtin_monitors(
         registry,
         args=args,
-        database_path=args.db_path,
+        store=store,
     )
-    store = SQLiteMonitorStore(args.db_path)
     scheduler = MonitorScheduler(
         registry,
         store,

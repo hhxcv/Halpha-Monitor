@@ -1,10 +1,21 @@
 "use strict";
 
+const MONITOR_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+function monitorIdFromLocation() {
+  const monitorId = new URL(window.location.href).searchParams.get("monitor_id");
+  return monitorId && MONITOR_ID_PATTERN.test(monitorId) ? monitorId : null;
+}
+
 const ui = {
   workspace: document.querySelector("#workspace"),
   serviceStatus: document.querySelector("#service-status"),
+  collectionLoad: document.querySelector("#collection-load"),
+  networkRequests: document.querySelector("#network-requests"),
+  collectionCadence: document.querySelector("#collection-cadence"),
   lastRefresh: document.querySelector("#last-refresh"),
   monitorList: document.querySelector("#monitor-list"),
+  monitoringCount: document.querySelector("#monitoring-count"),
   healthyCount: document.querySelector("#healthy-count"),
   staleCount: document.querySelector("#stale-count"),
   failedCount: document.querySelector("#failed-count"),
@@ -12,8 +23,8 @@ const ui = {
   summaryCutoff: document.querySelector("#summary-cutoff"),
   monitorTitle: document.querySelector("#monitor-title"),
   monitorDescription: document.querySelector("#monitor-description"),
+  monitorMethodNote: document.querySelector("#monitor-method-note"),
   monitorState: document.querySelector("#monitor-state"),
-  monitorStatusDetail: document.querySelector("#monitor-status-detail"),
   monitorControlButton: document.querySelector("#monitor-control-button"),
   monitorControlStatus: document.querySelector("#monitor-control-status"),
   configurationRegion: document.querySelector("#configuration-region"),
@@ -24,6 +35,10 @@ const ui = {
   filters: document.querySelector("#dynamic-filters"),
   timeWindow: document.querySelector("#time-window"),
   dataCutoff: document.querySelector("#data-cutoff"),
+  tableScrollControls: document.querySelector("#table-scroll-controls"),
+  tableScrollLeft: document.querySelector("#table-scroll-left"),
+  tableScrollRight: document.querySelector("#table-scroll-right"),
+  quoteScroll: document.querySelector("#quote-scroll"),
   quoteTableTitle: document.querySelector("#quote-table-title"),
   quoteHead: document.querySelector("#quote-head"),
   quoteBody: document.querySelector("#quote-body"),
@@ -45,7 +60,7 @@ const ui = {
 };
 
 const state = {
-  monitorId: null,
+  monitorId: monitorIdFromLocation(),
   seriesKey: null,
   hours: 6,
   filters: {},
@@ -54,6 +69,7 @@ const state = {
   configurationDirty: false,
   configurationSubmitting: false,
   controlSubmitting: false,
+  pendingControl: null,
   pendingConfigurationRunAfter: null,
   latestRunId: null,
   chartModel: null,
@@ -61,7 +77,14 @@ const state = {
   chartView: { seriesKey: null, zoom: 1, start: 0 },
   chartDrag: null,
   chartResizeTimer: null,
+  tableSort: null,
+  tableResizeTimer: null,
 };
+
+const TABLE_TEXT_COLLATOR = new Intl.Collator("zh-CN", {
+  numeric: true,
+  sensitivity: "base",
+});
 
 const STATUS_LABELS = {
   HEALTHY: "运行正常",
@@ -86,6 +109,20 @@ const ISSUE_REASON_LABELS = {
   SMART_MONEY_OI_STALE: "持仓量陈旧",
   SMART_MONEY_OVERVIEW_STALE: "仓位总览陈旧",
   SMART_MONEY_SCHEMA_CHANGED: "接口字段契约变化",
+  RADAR_BACKOFF_ACTIVE: "异动雷达退避中",
+  RADAR_CANDIDATE_COLLECTION_FAILED: "候选详查失败",
+  RADAR_FUTURES_ROWS_STALE: "合约数据陈旧",
+  RADAR_HTTP_THROTTLED_418: "公开接口已封禁并退避",
+  RADAR_HTTP_THROTTLED_429: "公开接口限流并退避",
+  RADAR_KLINES_EMPTY: "闭合 K 线为空",
+  RADAR_KLINES_INSUFFICIENT: "闭合 K 线不足",
+  RADAR_KLINES_NON_CONTIGUOUS: "闭合 K 线不连续",
+  RADAR_KLINES_STALE: "闭合 K 线陈旧",
+  RADAR_OI_EMPTY: "OI 历史为空",
+  RADAR_OI_INSUFFICIENT: "OI 历史不足",
+  RADAR_OI_STALE: "OI 历史陈旧",
+  RADAR_SOURCE_ROWS_MALFORMED: "来源存在畸形记录",
+  RADAR_TICKER_ROWS_STALE: "行情记录陈旧",
 };
 
 const ISSUE_REASON_DETAILS = {
@@ -100,6 +137,20 @@ const ISSUE_REASON_DETAILS = {
   SMART_MONEY_OI_STALE: "官方 USDⓈ-M 持仓量时间超过允许阈值，未生成新特征",
   SMART_MONEY_OVERVIEW_STALE: "仓位总览更新时间陈旧，资金流特征保留但不使用总览字段",
   SMART_MONEY_SCHEMA_CHANGED: "未文档化接口的字段集合与已核验契约不一致，未生成新特征",
+  RADAR_BACKOFF_ACTIVE: "Binance 上游退避窗口尚未结束，本轮没有继续发送公开行情请求",
+  RADAR_CANDIDATE_COLLECTION_FAILED: "单个候选详查发生隔离失败，其他候选仍可展示",
+  RADAR_FUTURES_ROWS_STALE: "资金费率来源时间超过有效截止点，相关字段保持为空",
+  RADAR_HTTP_THROTTLED_418: "Binance 返回 HTTP 418；采集器遵守 Retry-After 并停止本轮后续请求",
+  RADAR_HTTP_THROTTLED_429: "Binance 返回 HTTP 429；采集器遵守 Retry-After 并停止本轮后续请求",
+  RADAR_KLINES_EMPTY: "没有取得通过校验的已闭合 5 分钟 K 线，未生成评分",
+  RADAR_KLINES_INSUFFICIENT: "连续闭合 5 分钟 K 线少于计算窗口，未生成评分",
+  RADAR_KLINES_NON_CONTIGUOUS: "K 线窗口存在空档，未插值或跨空档计算",
+  RADAR_KLINES_STALE: "最近闭合 K 线超过有效截止点，未沿用旧数据",
+  RADAR_OI_EMPTY: "同名 USDⓈ-M 合约没有返回 OI 历史",
+  RADAR_OI_INSUFFICIENT: "OI 历史不足以计算 15 分钟变化率",
+  RADAR_OI_STALE: "最新 OI 时间超过有效截止点，变化率保持为空",
+  RADAR_SOURCE_ROWS_MALFORMED: "公开来源中部分记录未通过字段或数值校验，已隔离",
+  RADAR_TICKER_ROWS_STALE: "部分滚动行情超过有效截止点，已从本轮候选中排除",
 };
 
 const CHART = {
@@ -159,6 +210,16 @@ function createElement(tag, className, text) {
   return element;
 }
 
+function syncMonitorLocation(monitorId) {
+  const url = new URL(window.location.href);
+  if (monitorId) url.searchParams.set("monitor_id", monitorId);
+  else url.searchParams.delete("monitor_id");
+  const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+  if (`${window.location.pathname}${window.location.search}${window.location.hash}` !== nextLocation) {
+    window.history.replaceState(window.history.state, "", nextLocation);
+  }
+}
+
 function queryUrl() {
   const params = new URLSearchParams();
   if (state.monitorId) params.set("monitor_id", state.monitorId);
@@ -174,25 +235,38 @@ async function loadView({ preserveSeries = true } = {}) {
   state.request = new AbortController();
   ui.workspace.setAttribute("aria-busy", "true");
   try {
-    const response = await fetch(queryUrl(), {
+    let response = await fetch(queryUrl(), {
       signal: state.request.signal,
       headers: { Accept: "application/json" },
       cache: "no-store",
     });
+    if (response.status === 404 && state.monitorId) {
+      state.monitorId = null;
+      state.seriesKey = null;
+      state.filters = {};
+      state.tableSort = null;
+      syncMonitorLocation(null);
+      response = await fetch(queryUrl(), {
+        signal: state.request.signal,
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+    }
     if (!response.ok) throw new Error(`HTTP_${response.status}`);
     const payload = await response.json();
     state.monitorId = payload.monitor.monitor_id;
     state.seriesKey = payload.selected_series_key;
     state.filters = payload.monitor.selected_filters;
     state.latestRunId = payload.monitor.latest_run?.run_id ?? null;
+    syncMonitorLocation(state.monitorId);
     render(payload);
     ui.pageError.hidden = true;
     return true;
   } catch (error) {
     if (error.name === "AbortError") return false;
     ui.pageError.hidden = false;
-    ui.pageError.textContent = `页面数据不可用 · ${formatTime(new Date().toISOString())} · ${error.message}`;
-    setStatus(ui.serviceStatus, "FAILED", "页面数据不可用");
+    ui.pageError.textContent = `页面加载失败 · ${formatTime(new Date().toISOString())} · ${error.message}`;
+    setStatus(ui.serviceStatus, "FAILED", "页面加载失败");
     return false;
   } finally {
     ui.workspace.setAttribute("aria-busy", "false");
@@ -213,10 +287,9 @@ function render(payload) {
     payload.monitor.columns,
     payload.rows,
     payload.selected_series_key,
-    payload.issues,
+    payload.current_issues,
     payload.monitor.selected_filters,
     payload.monitor.data_status,
-    payload.monitor.latest_run?.run_id,
   );
   renderHistory(
     payload.monitor.chart_title,
@@ -230,11 +303,27 @@ function render(payload) {
 
 function renderGlobal(payload) {
   setStatus(ui.serviceStatus, payload.service_status, payload.service_status_label);
-  const completed = payload.monitor.latest_run?.completed_at || payload.monitor.data_run?.completed_at;
-  ui.lastRefresh.textContent = formatTime(completed);
+  const load = payload.collection_load;
+  ui.collectionLoad.dataset.load = load.level;
+  ui.collectionLoad.textContent = `负载${load.level_label} ${load.utilization_percent}%`;
+  ui.collectionLoad.title = load.definition;
+  ui.collectionLoad.setAttribute(
+    "aria-label",
+    `采集负载${load.level_label}，占用${load.utilization_percent}%`,
+  );
+  ui.networkRequests.textContent = load.network_requests === null
+    ? "近60秒请求未计量"
+    : `近60秒请求 ${load.network_requests} 次`;
+  ui.networkRequests.title = `${load.measured_monitor_count}/${load.enabled_count} 项启用监控已接入请求计数`;
+  ui.collectionCadence.textContent = `计划 ${Number(load.planned_runs_per_minute).toFixed(1)} 轮/分`;
+  ui.collectionCadence.title = "按各启用监控的采集周期计算；一轮可能包含多个公开 HTTP 请求。";
+  ui.lastRefresh.textContent = formatTime(load.latest_completed_at);
   ui.summaryCutoff.textContent = `状态统计截止：${formatTime(payload.server_time)}`;
+  ui.monitoringCount.textContent = String(payload.monitors.filter(
+    (item) => item.enabled
+  ).length);
   ui.healthyCount.textContent = String(payload.monitors.filter(
-    (item) => item.enabled && ["CURRENT", "CURRENT_WITH_GAPS"].includes(item.data_status.kind)
+    (item) => item.enabled && ["CURRENT", "CURRENT_WITH_NOTICES", "CURRENT_WITH_GAPS"].includes(item.data_status.kind)
   ).length);
   ui.staleCount.textContent = String(payload.monitors.filter(
     (item) => item.enabled && ["COLLECTING_PREVIOUS", "HISTORICAL", "STALE"].includes(item.data_status.kind)
@@ -253,22 +342,32 @@ function renderMonitorList(monitors) {
     button.dataset.monitorId = monitor.monitor_id;
     if (monitor.monitor_id === state.monitorId) button.setAttribute("aria-current", "page");
     button.append(createElement("span", "monitor-link-name", monitor.display_name));
-    const status = createElement("span", "monitor-link-status", monitor.data_status.label);
-    status.dataset.status = monitor.data_status.tone;
+    const status = createElement(
+      "span",
+      "monitor-link-status",
+      monitor.operational_status.label,
+    );
+    status.dataset.status = monitor.operational_status.tone;
     button.append(status);
     button.addEventListener("click", async () => {
       const previous = {
         monitorId: state.monitorId,
         filters: state.filters,
         seriesKey: state.seriesKey,
+        tableSort: state.tableSort,
+        tableScrollLeft: ui.quoteScroll.scrollLeft,
       };
       state.monitorId = monitor.monitor_id;
       state.filters = {};
       state.seriesKey = null;
+      state.tableSort = null;
+      ui.quoteScroll.scrollLeft = 0;
       if (!await loadView({ preserveSeries: false })) {
         state.monitorId = previous.monitorId;
         state.filters = previous.filters;
         state.seriesKey = previous.seriesKey;
+        state.tableSort = previous.tableSort;
+        ui.quoteScroll.scrollLeft = previous.tableScrollLeft;
       }
     });
     ui.monitorList.append(button);
@@ -277,15 +376,34 @@ function renderMonitorList(monitors) {
 
 function renderContext(monitor) {
   ui.monitorTitle.textContent = monitor.display_name;
-  ui.monitorDescription.textContent = monitor.description;
-  setStatus(ui.monitorState, monitor.data_status.tone, monitor.data_status.label);
-  ui.monitorStatusDetail.textContent = monitor.data_status.detail;
+  const description = String(monitor.description || "").trim();
+  ui.monitorDescription.textContent = description;
+  ui.monitorDescription.hidden = !description || monitor.show_description === false;
+  const methodNote = String(monitor.method_note || "").trim();
+  ui.monitorMethodNote.textContent = methodNote;
+  ui.monitorMethodNote.hidden = !methodNote;
+  setStatus(
+    ui.monitorState,
+    monitor.operational_status.tone,
+    monitor.operational_status.label,
+  );
   const cutoff = monitor.data_run?.completed_at;
   ui.dataCutoff.textContent = `${monitor.data_status.cutoff_label}：${cutoff ? formatTime(cutoff) : "—"}`;
+  ui.dataCutoff.dataset.status = monitor.data_status.tone;
 }
 
 function renderControl(monitor) {
   if (state.controlSubmitting) return;
+  if (
+    state.pendingControl?.monitorId === monitor.monitor_id
+    && monitor.latest_run?.run_id > state.pendingControl.runAfter
+    && monitor.latest_run.status !== "RUNNING"
+  ) {
+    ui.monitorControlStatus.textContent = ["SUCCESS", "PARTIAL"].includes(monitor.latest_run.status)
+      ? "已开启，首轮采集完成"
+      : "已开启，首轮采集失败；系统将自动重试";
+    state.pendingControl = null;
+  }
   ui.monitorControlButton.disabled = false;
   ui.monitorControlButton.dataset.enabled = String(monitor.enabled);
   ui.monitorControlButton.textContent = monitor.enabled ? "关闭监控" : "开启监控";
@@ -298,6 +416,8 @@ function renderControl(monitor) {
 ui.monitorControlButton.addEventListener("click", async () => {
   if (state.controlSubmitting || !state.monitorId) return;
   const enabling = ui.monitorControlButton.dataset.enabled !== "true";
+  const controlMonitorId = state.monitorId;
+  const runAfter = state.latestRunId ?? 0;
   state.controlSubmitting = true;
   ui.monitorControlButton.disabled = true;
   ui.monitorControlButton.textContent = enabling ? "正在开启…" : "正在关闭…";
@@ -313,6 +433,9 @@ ui.monitorControlButton.addEventListener("click", async () => {
     ui.monitorControlStatus.textContent = payload.enabled
       ? payload.refresh_requested ? "已开启，正在采集" : "已开启"
       : "已关闭，不再安排新的采集";
+    state.pendingControl = payload.enabled && payload.refresh_requested
+      ? { monitorId: controlMonitorId, runAfter }
+      : null;
     state.controlSubmitting = false;
     await loadView();
     ui.monitorControlButton.focus();
@@ -341,7 +464,7 @@ function renderConfiguration(configuration, latestRun) {
     if (["SUCCESS", "PARTIAL"].includes(latestRun.status)) {
       setConfigurationStatus("已按新条件完成采集", "success");
     } else {
-      setConfigurationStatus("新条件采集失败，仍显示上次可用报价", "error");
+      setConfigurationStatus("新条件采集失败，仍显示上次已校验报价", "error");
     }
     state.pendingConfigurationRunAfter = null;
   } else if (!state.configurationDirty && !state.configurationSubmitting && !ui.configurationStatus.textContent) {
@@ -490,7 +613,7 @@ ui.timeWindow.addEventListener("change", async () => {
 function cellValue(row, column) {
   const value = row[column.key];
   const declaredReason = row.missing_reasons?.[column.key];
-  const missing = (reason = declaredReason || "来源未返回可用值，未使用替代数据。") => ({
+  const missing = (reason = declaredReason || "来源未返回通过校验的值，未使用替代数据。") => ({
     text: "—",
     missing: true,
     reason,
@@ -505,7 +628,7 @@ function cellValue(row, column) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return missing("数值异常，已停止展示。");
     return {
-      text: `${numeric >= 0 ? "+" : ""}${numeric.toFixed(4)}%`,
+      text: `${column.show_sign !== false && numeric >= 0 ? "+" : ""}${numeric.toFixed(4)}%`,
       missing: false,
     };
   }
@@ -524,39 +647,191 @@ function cellValue(row, column) {
   return { text: String(value), missing: false };
 }
 
-function matchingIssue(issues, filters, latestRunId) {
-  const exactScopes = new Set(["monitor"]);
-  if (filters.symbol) {
-    exactScopes.add(filters.symbol);
-    if (filters.time_range) exactScopes.add(`${filters.symbol}:${filters.time_range}`);
-  }
-  return issues.find((issue) => (
-    issue.run_id === latestRunId
-    && (
-      exactScopes.has(issue.scope)
-      || (filters.trade_type && issue.scope.startsWith(`${filters.trade_type}:`))
-    )
-  ));
-}
-
-function emptyTableMessage(issues, filters, dataStatus, latestRunId) {
-  const issue = matchingIssue(issues, filters, latestRunId);
-  if (issue) {
-    const reason = ISSUE_REASON_LABELS[issue.reason_code] || issue.reason_code;
-    return `本轮该范围没有通过校验的数据；未使用任何替代值。原因：${reason}。系统会自动重试。`;
-  }
+function emptyTableMessage(dataStatus) {
   if ([
     "HISTORICAL",
     "STALE",
     "COLLECTING_PREVIOUS",
     "DISABLED_WITH_HISTORY",
   ].includes(dataStatus.kind)) {
-    return "当前显示的历史记录中，该范围没有可用数据；未使用任何替代值。";
+    return "当前历史快照中没有该范围的已校验记录；未使用任何替代值。";
   }
   if (dataStatus.kind === "DISABLED_EMPTY") {
     return "监控尚未开启或没有已采集数据；未使用任何替代值。";
   }
-  return "当前范围暂无可用数据；未使用任何替代值。";
+  return "当前范围尚无采集结果；未使用任何替代值。";
+}
+
+const GLOBAL_ISSUE_SCOPES = new Set([
+  "monitor",
+  "universe",
+  "exchange-info",
+  "ticker-24h",
+  "futures",
+]);
+
+function rowEntityKeys(row) {
+  return new Set([
+    row.entity_key,
+    row.asset,
+    row.symbol,
+  ].filter(Boolean).map(String));
+}
+
+function scopeEntity(scope) {
+  const parts = String(scope).split(":");
+  return parts.length > 1 && ["BUY", "SELL"].includes(parts[0])
+    ? parts[1]
+    : parts[0];
+}
+
+function issueMatchesTable(issue, filters, rows) {
+  const scope = String(issue.scope);
+  if (GLOBAL_ISSUE_SCOPES.has(scope)) return true;
+  const directionalScope = /^(BUY|SELL):(.+)$/.exec(scope);
+  if (directionalScope) {
+    return !filters.trade_type || directionalScope[1] === filters.trade_type;
+  }
+  if (filters.symbol) {
+    if (scope === filters.symbol) return true;
+    if (filters.time_range && scope === `${filters.symbol}:${filters.time_range}`) return true;
+  }
+  if (filters.trade_type) {
+    if (/^[A-Z0-9]{2,20}$/.test(scope)) return true;
+  }
+  const entity = scopeEntity(scope);
+  return rows.some((row) => rowEntityKeys(row).has(entity));
+}
+
+function rowAlreadyMarksIssue(issue, rows) {
+  const entity = scopeEntity(issue.scope);
+  return rows.some((row) => (
+    rowEntityKeys(row).has(entity)
+    && row.missing_reasons
+    && Object.keys(row.missing_reasons).length > 0
+  ));
+}
+
+function issueScopeLabel(scope) {
+  if (scope === "monitor") return "全部范围";
+  const parts = String(scope).split(":");
+  if (parts.length > 1 && ["BUY", "SELL"].includes(parts[0])) return parts[1];
+  return String(scope);
+}
+
+function tableIssueGroups(issues, filters, rows) {
+  const groups = new Map();
+  issues
+    .filter((issue) => issueMatchesTable(issue, filters, rows))
+    .filter((issue) => !rowAlreadyMarksIssue(issue, rows))
+    .forEach((issue) => {
+      const key = `${issue.classification}|${issue.reason_code}`;
+      if (!groups.has(key)) groups.set(key, { ...issue, scopes: [] });
+      groups.get(key).scopes.push(issueScopeLabel(issue.scope));
+    });
+  return [...groups.values()].map((group) => ({
+    ...group,
+    scopes: [...new Set(group.scopes)],
+  }));
+}
+
+function appendTableIssueRow(columns, group) {
+  const tr = document.createElement("tr");
+  tr.className = "table-notice-row";
+  tr.dataset.tone = group.tone;
+  const td = document.createElement("td");
+  td.colSpan = Math.max(columns.length, 1);
+  const scopes = group.scopes.join("、");
+  const expectedAbsence = group.classification === "EXPECTED_ABSENCE";
+  const heading = expectedAbsence
+    ? `本轮无报价：${scopes}`
+    : `本轮受影响：${scopes}`;
+  const detail = expectedAbsence
+    ? ISSUE_REASON_DETAILS.NO_ELIGIBLE_C2C_AD
+    : `${ISSUE_REASON_LABELS[group.reason_code] || group.reason_code}；对应范围未展示未通过校验的值。`;
+  td.append(createElement("strong", "table-notice-title", heading));
+  td.append(createElement("span", "table-notice-detail", detail));
+  td.title = `${detail}（${group.reason_code}）`;
+  tr.append(td);
+  ui.quoteBody.append(tr);
+}
+
+function tableSortValue(row, column) {
+  const value = row[column.key];
+  if (value === null || value === undefined || value === "") return null;
+  if (column.kind === "number" || column.kind === "percent") {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  if (column.kind === "time") {
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  return String(value);
+}
+
+function sortTableRows(rows, columns) {
+  const activeSort = state.tableSort;
+  if (!activeSort || activeSort.monitorId !== state.monitorId) return [...rows];
+  const column = columns.find((item) => item.key === activeSort.columnKey);
+  if (!column) return [...rows];
+  return rows
+    .map((row, index) => ({ row, index, value: tableSortValue(row, column) }))
+    .sort((left, right) => {
+      const leftMissing = left.value === null;
+      const rightMissing = right.value === null;
+      if (leftMissing || rightMissing) {
+        if (leftMissing && rightMissing) return left.index - right.index;
+        return leftMissing ? 1 : -1;
+      }
+      const comparison = typeof left.value === "number"
+        ? left.value - right.value
+        : TABLE_TEXT_COLLATOR.compare(left.value, right.value);
+      if (comparison === 0) return left.index - right.index;
+      return activeSort.direction === "ascending" ? comparison : -comparison;
+    })
+    .map((item) => item.row);
+}
+
+function nextSortDirection(columnKey) {
+  if (
+    state.tableSort?.monitorId === state.monitorId
+    && state.tableSort.columnKey === columnKey
+  ) {
+    return state.tableSort.direction === "ascending" ? "descending" : "ascending";
+  }
+  return "ascending";
+}
+
+function marketDestination(row) {
+  if (state.monitorId !== "binance-altcoin-radar") return null;
+  const symbol = String(row.symbol || "").toUpperCase();
+  if (!/^[A-Z0-9]{1,24}USDT$/.test(symbol)) return null;
+  if (row.data_scope_label === "现货 + 合约") {
+    return {
+      url: `https://www.binance.com/zh-CN/futures/${encodeURIComponent(symbol)}`,
+      label: "Binance USDⓈ-M 合约行情",
+    };
+  }
+  const baseAsset = String(row.base_asset || symbol.slice(0, -4)).toUpperCase();
+  if (!/^[A-Z0-9]{1,24}$/.test(baseAsset)) return null;
+  return {
+    url: `https://www.binance.com/zh-CN/trade/${encodeURIComponent(baseAsset)}_USDT`,
+    label: "本轮未确认同名合约，打开 Binance 现货行情",
+  };
+}
+
+function updateTableScrollControls() {
+  const maximum = Math.max(0, ui.quoteScroll.scrollWidth - ui.quoteScroll.clientWidth);
+  const overflowed = maximum > 2;
+  ui.tableScrollControls.hidden = !overflowed;
+  ui.tableScrollLeft.disabled = !overflowed || ui.quoteScroll.scrollLeft <= 2;
+  ui.tableScrollRight.disabled = !overflowed || ui.quoteScroll.scrollLeft >= maximum - 2;
+}
+
+function scrollTableHorizontally(direction) {
+  const distance = Math.max(280, Math.round(ui.quoteScroll.clientWidth * 0.72));
+  ui.quoteScroll.scrollBy({ left: direction * distance, behavior: "smooth" });
 }
 
 function renderTable(
@@ -566,56 +841,116 @@ function renderTable(
   issues,
   filters,
   dataStatus,
-  latestRunId,
 ) {
   ui.quoteHead.replaceChildren();
   columns.forEach((column) => {
-    const th = createElement("th", column.priority === "secondary" ? "col-secondary" : "", column.label);
+    const th = createElement("th", column.priority === "secondary" ? "col-secondary" : "");
     th.scope = "col";
     th.dataset.kind = column.kind;
+    const active = state.tableSort?.monitorId === state.monitorId
+      && state.tableSort.columnKey === column.key;
+    const direction = active ? state.tableSort.direction : null;
+    th.ariaSort = direction || "none";
+    const button = createElement("button", "table-sort-button");
+    button.type = "button";
+    button.dataset.columnKey = column.key;
+    const nextDirection = nextSortDirection(column.key);
+    button.setAttribute(
+      "aria-label",
+      `${column.label}，${direction === "ascending" ? "当前正序" : direction === "descending" ? "当前倒序" : "当前未排序"}，点击切换为${nextDirection === "ascending" ? "正序" : "倒序"}`,
+    );
+    button.append(createElement("span", "table-sort-label", column.label));
+    if (column.description) {
+      button.title = column.description;
+      button.setAttribute("aria-description", column.description);
+      const help = createElement("span", "table-column-help", "ⓘ");
+      help.setAttribute("aria-hidden", "true");
+      button.append(help);
+    }
+    const indicator = createElement(
+      "span",
+      "table-sort-indicator",
+      direction === "ascending" ? "↑" : direction === "descending" ? "↓" : "↕",
+    );
+    indicator.setAttribute("aria-hidden", "true");
+    button.append(indicator);
+    button.addEventListener("click", () => {
+      state.tableSort = {
+        monitorId: state.monitorId,
+        columnKey: column.key,
+        direction: nextSortDirection(column.key),
+      };
+      renderTable(columns, rows, selectedSeries, issues, filters, dataStatus);
+    });
+    th.append(button);
     ui.quoteHead.append(th);
   });
   ui.quoteBody.replaceChildren();
-  rows.forEach((row) => {
+  sortTableRows(rows, columns).forEach((row) => {
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
+    if (row.row_tone) tr.dataset.tone = String(row.row_tone);
     tr.setAttribute("aria-selected", String(row.series_key === selectedSeries));
-    columns.forEach((column) => {
-      const rendered = cellValue(row, column);
-      const td = createElement(
-        "td",
-        column.priority === "secondary" ? "col-secondary" : "",
-        rendered.text,
-      );
-      td.dataset.kind = column.kind;
-      if (rendered.missing) {
-        td.dataset.missing = "true";
-        td.title = rendered.reason;
-        td.setAttribute("aria-label", `${column.label}：无可用数据。${rendered.reason}`);
-      }
-      tr.append(td);
-    });
+    const destination = marketDestination(row);
+    let marketAnchor = null;
     const select = async () => {
       const previous = state.seriesKey;
       state.seriesKey = row.series_key;
       if (!await loadView()) state.seriesKey = previous;
     };
-    tr.addEventListener("click", select);
+    columns.forEach((column) => {
+      const rendered = cellValue(row, column);
+      const td = createElement(
+        "td",
+        column.priority === "secondary" ? "col-secondary" : "",
+      );
+      td.dataset.kind = column.kind;
+      if (rendered.missing) {
+        td.textContent = rendered.text;
+        td.dataset.missing = "true";
+        td.title = rendered.reason;
+        td.setAttribute("aria-label", `${column.label}：无已校验值。${rendered.reason}`);
+      } else if (destination && column.key === "symbol") {
+        marketAnchor = createElement("a", "market-symbol-link", rendered.text);
+        marketAnchor.href = destination.url;
+        marketAnchor.target = "_blank";
+        marketAnchor.rel = "noopener noreferrer";
+        marketAnchor.title = `${destination.label}（新标签页）`;
+        marketAnchor.setAttribute("aria-label", `${row.symbol}：${destination.label}，新标签页`);
+        marketAnchor.addEventListener("click", () => { void select(); });
+        td.append(marketAnchor);
+        const externalIcon = createElement("span", "market-link-icon", "↗");
+        externalIcon.setAttribute("aria-hidden", "true");
+        td.append(externalIcon);
+      } else {
+        td.textContent = rendered.text;
+      }
+      tr.append(td);
+    });
+    if (destination && marketAnchor) {
+      tr.classList.add("market-row");
+      tr.title = `${destination.label}（新标签页）`;
+      tr.setAttribute("aria-label", `${row.symbol}：${destination.label}，新标签页`);
+    }
+    tr.addEventListener("click", (event) => {
+      if (event.target.closest("a")) return;
+      if (marketAnchor) marketAnchor.click();
+      else void select();
+    });
     tr.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
+      if (event.key === "Enter" || (!marketAnchor && event.key === " ")) {
         event.preventDefault();
-        select();
+        if (marketAnchor) marketAnchor.click();
+        else void select();
       }
     });
     ui.quoteBody.append(tr);
   });
-  ui.quoteEmpty.hidden = rows.length > 0;
-  ui.quoteEmpty.textContent = emptyTableMessage(
-    issues,
-    filters,
-    dataStatus,
-    latestRunId,
-  );
+  const issueGroups = tableIssueGroups(issues || [], filters, rows);
+  issueGroups.forEach((group) => appendTableIssueRow(columns, group));
+  ui.quoteEmpty.hidden = rows.length > 0 || issueGroups.length > 0;
+  ui.quoteEmpty.textContent = emptyTableMessage(dataStatus);
+  requestAnimationFrame(updateTableScrollControls);
 }
 
 function renderHistory(title, rows, selectedSeries, history, collectionGaps) {
@@ -692,6 +1027,11 @@ function drawHistoryChart() {
   if (!allPoints.length) {
     ui.chartViewportStatus.textContent = "";
     ui.collectionGapNote.textContent = "";
+    state.chartGeometry = null;
+    ui.historyChart.setAttribute(
+      "aria-label",
+      `${ui.historySeries.textContent}，当前时间范围没有历史样本。`,
+    );
     ui.historyChart.append(createElement("p", "empty-state", "当前时间范围没有历史样本。"));
     return;
   }
@@ -943,15 +1283,24 @@ ui.historyChart.addEventListener("keydown", (event) => {
 
 window.addEventListener("resize", () => {
   clearTimeout(state.chartResizeTimer);
+  clearTimeout(state.tableResizeTimer);
   state.chartResizeTimer = setTimeout(() => {
     if (state.chartModel) drawHistoryChart();
   }, 100);
+  state.tableResizeTimer = setTimeout(updateTableScrollControls, 100);
 });
 
+ui.quoteScroll.addEventListener("scroll", updateTableScrollControls, { passive: true });
+ui.tableScrollLeft.addEventListener("click", () => scrollTableHorizontally(-1));
+ui.tableScrollRight.addEventListener("click", () => scrollTableHorizontally(1));
+
 function renderIssues(issues) {
-  ui.diagnosticsRegion.hidden = issues.length === 0;
+  const diagnosticIssues = issues.filter(
+    (issue) => issue.classification !== "EXPECTED_ABSENCE"
+  );
+  ui.diagnosticsRegion.hidden = diagnosticIssues.length === 0;
   ui.issueBody.replaceChildren();
-  issues.forEach((issue) => {
+  diagnosticIssues.forEach((issue) => {
     const row = document.createElement("tr");
     const [direction, asset] = issue.scope.split(":", 2);
     const scope = asset ? `${direction === "BUY" ? "买入" : direction === "SELL" ? "卖出" : direction} ${asset}` : issue.scope;
@@ -962,8 +1311,8 @@ function renderIssues(issues) {
     row.append(reason);
     ui.issueBody.append(row);
   });
-  ui.issueCount.textContent = `${issues.length} 条`;
-  ui.issueEmpty.hidden = issues.length > 0;
+  ui.issueCount.textContent = `${diagnosticIssues.length} 条`;
+  ui.issueEmpty.hidden = diagnosticIssues.length > 0;
 }
 
 document.addEventListener("visibilitychange", () => {

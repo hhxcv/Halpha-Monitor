@@ -4,14 +4,20 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Halpha Monitor</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260727-5">
-    <script src="/static/app.js?v=20260727-5" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260806-8">
+    <script src="/static/app.js?v=20260806-8" defer></script>
   </head>
   <body>
     <header class="topbar">
       <div class="brand">Halpha Monitor</div>
       <div class="service-facts" aria-live="polite">
         <span class="status-text" id="service-status">正在连接</span>
+        <span class="divider" aria-hidden="true"></span>
+        <span class="workload-facts" aria-label="总体采集负载">
+          <span class="load-fact" id="collection-load">负载计算中</span>
+          <span id="network-requests">近60秒请求 —</span>
+          <span id="collection-cadence">计划 — 轮/分</span>
+        </span>
         <span class="divider" aria-hidden="true"></span>
         <span class="fact-label">最后采集</span>
         <time id="last-refresh">未知</time>
@@ -25,9 +31,10 @@
         <section class="rail-summary" aria-labelledby="summary-title">
           <h2 id="summary-title">监控状态</h2>
           <dl>
-            <div><dt>当前可用</dt><dd id="healthy-count">0</dd></div>
-            <div><dt>历史 / 过期</dt><dd id="stale-count">0</dd></div>
-            <div><dt>暂无可用</dt><dd id="failed-count">0</dd></div>
+            <div><dt>监控中</dt><dd id="monitoring-count">0</dd></div>
+            <div><dt>最新结果</dt><dd id="healthy-count">0</dd></div>
+            <div><dt>历史快照</dt><dd id="stale-count">0</dd></div>
+            <div><dt>尚无结果</dt><dd id="failed-count">0</dd></div>
             <div><dt>已关闭</dt><dd id="disabled-count">0</dd></div>
           </dl>
           <p id="summary-cutoff">状态统计截止：未知</p>
@@ -42,7 +49,6 @@
           </div>
           <div class="monitor-status-summary">
             <div class="monitor-state" id="monitor-state">状态未知</div>
-            <p id="monitor-status-detail">正在核对数据状态。</p>
             <div class="monitor-control">
               <button id="monitor-control-button" type="button">正在读取</button>
               <span id="monitor-control-status" role="status" aria-live="polite"></span>
@@ -66,24 +72,46 @@
 
         <section class="filters" id="filters" aria-label="查看条件">
           <div id="dynamic-filters" class="dynamic-filters"></div>
-          <label class="filter-field">
-            <span>时间范围</span>
-            <select id="time-window" aria-label="时间范围"></select>
+          <label
+            class="filter-field history-window-field"
+            title="只控制下方历史曲线回看多久，不参与本轮异动阶段或评分计算。当前评分使用固定的5m、15m、1h、约2小时15分和24h市场窗口。"
+          >
+            <span id="time-window-label" class="filter-label">
+              历史范围 <span class="field-help" aria-hidden="true">ⓘ</span>
+            </span>
+            <select
+              id="time-window"
+              aria-labelledby="time-window-label"
+              aria-describedby="time-window-help"
+              title="只改变下方历史曲线的回看范围，不改变当前阶段、异动强度或尾声风险。"
+            ></select>
+            <span id="time-window-help" class="visually-hidden">
+              只控制下方历史曲线回看多久，不参与本轮异动阶段或评分计算。
+            </span>
           </label>
         </section>
 
+        <p id="monitor-method-note" class="monitor-method-note" hidden></p>
+
         <section class="table-region" aria-labelledby="quote-table-title">
-          <div class="section-head">
+          <div class="section-head table-section-head">
             <h2 id="quote-table-title">最新监控数据</h2>
-            <p id="data-cutoff">数据截止：未知</p>
+            <div class="table-head-meta">
+              <p id="data-cutoff">采集完成：未知</p>
+              <div class="table-scroll-controls" id="table-scroll-controls" aria-label="表格横向查看" hidden>
+                <span>横向查看</span>
+                <button id="table-scroll-left" type="button" aria-label="向左查看隐藏列" title="向左查看隐藏列">←</button>
+                <button id="table-scroll-right" type="button" aria-label="向右查看隐藏列" title="向右查看隐藏列">→</button>
+              </div>
+            </div>
           </div>
-          <div class="table-scroll" tabindex="0" aria-label="最新监控数据，可横向滚动">
+          <div class="table-scroll" id="quote-scroll" tabindex="0" aria-label="最新监控数据，可横向滚动">
             <table>
               <thead><tr id="quote-head"></tr></thead>
               <tbody id="quote-body"></tbody>
             </table>
           </div>
-          <p class="empty-state" id="quote-empty" hidden>当前筛选没有可用数据。</p>
+          <p class="empty-state" id="quote-empty" hidden>当前筛选没有匹配结果。</p>
         </section>
 
         <div class="lower-grid">

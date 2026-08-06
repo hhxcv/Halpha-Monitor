@@ -131,6 +131,18 @@ def test_disabled_monitor_waits_until_enabled_and_then_collects(
     assert monitor.calls == 1
 
 
+def test_scheduler_exposes_started_lifecycle_state(tmp_path: Path) -> None:
+    registry = MonitorRegistry()
+    registry.register(FakeMonitor("lifecycle-monitor", default_enabled=False))
+    scheduler = MonitorScheduler(registry, make_store(tmp_path))
+
+    assert scheduler.started is False
+    scheduler.start()
+    assert scheduler.started is True
+    scheduler.stop()
+    assert scheduler.started is False
+
+
 def test_stop_reports_a_collector_that_did_not_exit_before_timeout(
     tmp_path: Path,
 ) -> None:

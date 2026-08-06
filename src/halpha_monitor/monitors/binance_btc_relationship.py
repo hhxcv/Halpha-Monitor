@@ -33,6 +33,7 @@ from halpha_monitor.monitors.btc_relationship_symbols import (
     UNIVERSE_SOURCE_SHA256,
 )
 from halpha_monitor.store import iso_utc
+from halpha_monitor.telemetry import NetworkRequestWindow
 
 
 BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
@@ -177,6 +178,10 @@ class BinanceSpotDailyClient:
         self._throttle_lock = threading.Lock()
         self._throttle_until = 0.0
         self._throttle_failures = 0
+        self._network_requests = NetworkRequestWindow(monotonic=monotonic)
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int:
+        return self._network_requests.count(window_seconds=window_seconds)
 
     def _throttle_active(self) -> bool:
         with self._throttle_lock:
@@ -269,6 +274,7 @@ class BinanceSpotDailyClient:
                         "User-Agent": "Halpha-Monitor/1.0",
                     },
                 )
+                self._network_requests.record()
                 with self._open_url(request, timeout=self.timeout_seconds) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 normalized = normalize_klines(payload, cutoff_ms)
@@ -580,6 +586,12 @@ class BinanceBtcRelationshipMonitor:
             table_title="BTC 关联与相对强弱",
             chart_title="BTC Pearson 相关性历史",
         )
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int | None:
+        counter = getattr(self.client, "network_request_count", None)
+        if not callable(counter):
+            return None
+        return int(counter(window_seconds=window_seconds))
 
     def collect(self) -> CollectionBatch:
         cutoff = latest_closed_cutoff()

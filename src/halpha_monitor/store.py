@@ -575,17 +575,22 @@ class SQLiteMonitorStore:
                 """,
                 (monitor_id, limit),
             ).fetchall()
-        return tuple(
-            StoredIssue(
-                issue_id=int(row["issue_id"]),
-                run_id=int(row["run_id"]),
-                monitor_id=str(row["monitor_id"]),
-                occurred_at=parse_utc(str(row["occurred_at"])),
-                scope=str(row["scope"]),
-                reason_code=str(row["reason_code"]),
-            )
-            for row in rows
-        )
+        return tuple(self._issue_from_row(row) for row in rows)
+
+    def issues_for_run(self, run_id: int) -> tuple[StoredIssue, ...]:
+        """Return every affected scope from one run for in-place UI marking."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT issue_id, run_id, monitor_id, occurred_at, scope, reason_code
+                FROM monitor_issue
+                WHERE run_id = ?
+                ORDER BY issue_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(self._issue_from_row(row) for row in rows)
 
     def artifacts_for_run(self, run_id: int) -> tuple[StoredArtifact, ...]:
         with self._connect() as connection:
@@ -675,6 +680,17 @@ class SQLiteMonitorStore:
             value_text=str(row["value_text"]),
             unit=str(row["unit"]),
             payload=payload,
+        )
+
+    @staticmethod
+    def _issue_from_row(row: sqlite3.Row) -> StoredIssue:
+        return StoredIssue(
+            issue_id=int(row["issue_id"]),
+            run_id=int(row["run_id"]),
+            monitor_id=str(row["monitor_id"]),
+            occurred_at=parse_utc(str(row["occurred_at"])),
+            scope=str(row["scope"]),
+            reason_code=str(row["reason_code"]),
         )
 
     @staticmethod

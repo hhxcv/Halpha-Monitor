@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import threading
 from typing import Any, Literal, Protocol, Sequence, runtime_checkable
 
 
@@ -13,12 +14,33 @@ ConfigurationKind = Literal["decimal", "multi_choice"]
 EvaluationDirection = Literal["UP", "DOWN"]
 EvaluationStatus = Literal["COMPLETE", "UNAVAILABLE"]
 EvaluationVerdict = Literal["ALIGNED", "INCONCLUSIVE", "OPPOSED", "UNAVAILABLE"]
+BuybackEntityType = Literal["DISCLOSURE_CANDIDATE", "HKEX_EXECUTION"]
+BuybackSourceStatus = Literal["SUCCESS", "EMPTY", "PARTIAL", "STALE", "ERROR"]
+AutomaticCollectionStatus = Literal["OPEN", "CLOSED", "UNAVAILABLE"]
+
+
+class CollectionCancelled(RuntimeError):
+    """Cooperative shutdown signal that must not be converted into source data."""
+
+
+@dataclass(frozen=True)
+class AutomaticCollectionState:
+    """Current state of an optional wall-clock gate for automatic collection."""
+
+    allowed: bool
+    status: AutomaticCollectionStatus
+    reason_code: str
+    label: str
+    detail: str
+    next_open_at: datetime | None = None
+    active_until: datetime | None = None
 
 
 @dataclass(frozen=True)
 class FilterChoice:
     value: str
     label: str
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -27,6 +49,7 @@ class ViewFilter:
     label: str
     default: str
     choices: tuple[FilterChoice, ...]
+    multiple: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,6 +135,62 @@ class CollectionArtifact:
 
 
 @dataclass(frozen=True)
+class BuybackEvidenceDocument:
+    """Immutable official source document prepared for content-addressed storage."""
+
+    source_key: str
+    source_label: str
+    source_document_id: str
+    source_url: str
+    published_at: datetime | None
+    observed_at: datetime
+    media_type: str
+    file_suffix: str
+    body: bytes
+    quality_state: str
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BuybackEntityRevision:
+    """Self-contained candidate or execution fact revision."""
+
+    entity_key: str
+    entity_type: BuybackEntityType
+    effective_at: datetime
+    observed_at: datetime
+    source_key: str
+    document_sha256: str | None
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BuybackSourceObservation:
+    """Latest checked state for one independently fail-able public source."""
+
+    source_key: str
+    source_label: str
+    status: BuybackSourceStatus
+    checked_at: datetime
+    source_time: datetime | None
+    next_due_at: datetime
+    record_count: int | None
+    detail_code: str | None
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MarketEventRevision:
+    """One durable revision of a market event observed after history starts."""
+
+    event_key: str
+    scheduled_at: datetime
+    observed_at: datetime
+    state: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ForwardEvaluationCase:
     """A signal-time observation frozen before its future outcome is known."""
 
@@ -155,6 +234,10 @@ class CollectionBatch:
     artifacts: tuple[CollectionArtifact, ...] = ()
     evaluation_cases: tuple[ForwardEvaluationCase, ...] = ()
     evaluation_results: tuple[ForwardEvaluationResult, ...] = ()
+    buyback_documents: tuple[BuybackEvidenceDocument, ...] = ()
+    buyback_revisions: tuple[BuybackEntityRevision, ...] = ()
+    buyback_source_observations: tuple[BuybackSourceObservation, ...] = ()
+    market_event_revisions: tuple[MarketEventRevision, ...] = ()
 
 
 class RegisteredMonitor(Protocol):
@@ -165,6 +248,26 @@ class RegisteredMonitor(Protocol):
     view: MonitorView
 
     def collect(self) -> CollectionBatch: ...
+
+
+@runtime_checkable
+class AutomaticCollectionMonitor(Protocol):
+    """Optional schedule gate; explicit manual runs may bypass this state."""
+
+    monitor_id: str
+
+    def automatic_collection_state(
+        self,
+        *,
+        now: datetime,
+    ) -> AutomaticCollectionState: ...
+
+
+@runtime_checkable
+class CooperativeMonitor(Protocol):
+    """Optional binding for promptly stopping new network work on shutdown."""
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None: ...
 
 
 @runtime_checkable

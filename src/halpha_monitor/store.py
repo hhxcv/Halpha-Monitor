@@ -2,18 +2,45 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any, Literal
+from uuid import uuid4
 
-from halpha_monitor.contracts import CollectionBatch, ForwardEvaluationCase
+from halpha_monitor.contracts import (
+    BuybackEvidenceDocument,
+    CollectionBatch,
+    ForwardEvaluationCase,
+)
 
 
 RunStatus = Literal["RUNNING", "SUCCESS", "PARTIAL", "FAILED"]
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
+MAX_BUYBACK_DOCUMENT_BYTES = 20 * 1024 * 1024
+DEFAULT_BUYBACK_RETENTION_DAYS = 1095
+DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MARKET_EVENT_RETENTION_DAYS = 1095
+BUYBACK_DOCUMENT_SUFFIXES = frozenset({".pdf", ".xls", ".xlsx", ".json", ".html"})
+BUYBACK_REVIEW_EVENT_TYPES = frozenset(
+    {
+        "PLAN_OR_APPROVAL",
+        "FIRST_EXECUTION",
+        "PROGRESS",
+        "MODIFICATION",
+        "COMPLETION_OR_TERMINATION",
+        "POST_BUYBACK_CANCELLATION",
+        "POST_BUYBACK_DISPOSAL",
+        "AMBIGUOUS_BUYBACK",
+        "HKEX_EXECUTION",
+    }
+)
 
 
 def utc_now() -> datetime:
@@ -129,18 +156,122 @@ class StoredForwardEvaluation:
     reason_code: str | None
 
 
+@dataclass(frozen=True)
+class StoredBuybackDocument:
+    sha256: str
+    monitor_id: str
+    source_key: str
+    source_label: str
+    source_document_id: str
+    source_url: str
+    published_at: datetime | None
+    observed_at: datetime
+    media_type: str
+    size_bytes: int
+    relative_path: str
+    quality_state: str
+    metadata: dict[str, Any]
+    last_referenced_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredBuybackReview:
+    review_id: int
+    monitor_id: str
+    entity_key: str
+    base_revision_no: int
+    decision: str
+    corrected_event_type: str | None
+    program_key: str | None
+    program_status: str | None
+    note: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredBuybackEntity:
+    revision_id: int
+    revision_no: int
+    monitor_id: str
+    entity_key: str
+    entity_type: str
+    effective_at: datetime
+    observed_at: datetime
+    source_key: str
+    document_sha256: str | None
+    payload_sha256: str
+    payload: dict[str, Any]
+    review: StoredBuybackReview | None
+
+
+@dataclass(frozen=True)
+class StoredBuybackSourceState:
+    monitor_id: str
+    source_key: str
+    source_label: str
+    status: str
+    checked_at: datetime
+    source_time: datetime | None
+    next_due_at: datetime
+    record_count: int | None
+    detail_code: str | None
+    payload: dict[str, Any]
+    last_run_id: int
+
+
+@dataclass(frozen=True)
+class StoredMarketEventRevision:
+    revision_id: int
+    revision_no: int
+    monitor_id: str
+    event_key: str
+    scheduled_at: datetime
+    observed_at: datetime
+    state: str
+    payload_sha256: str
+    payload: dict[str, Any]
+    source_run_id: int
+    created_at: datetime
+
+
 class SQLiteMonitorStore:
     """One SQLite database with WAL and short, atomic write transactions."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        buyback_retention_days: int = DEFAULT_BUYBACK_RETENTION_DAYS,
+        buyback_evidence_max_bytes: int = DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES,
+        market_event_retention_days: int = DEFAULT_MARKET_EVENT_RETENTION_DAYS,
+    ) -> None:
+        if buyback_retention_days < 1:
+            raise ValueError("buyback_retention_days must be positive")
+        if buyback_evidence_max_bytes < 1:
+            raise ValueError("buyback_evidence_max_bytes must be positive")
+        if market_event_retention_days < 1:
+            raise ValueError("market_event_retention_days must be positive")
         self.path = path.resolve()
+        self.buyback_retention_days = buyback_retention_days
+        self.buyback_evidence_max_bytes = buyback_evidence_max_bytes
+        self.market_event_retention_days = market_event_retention_days
+        self.buyback_evidence_root = self.path.parent / "evidence" / "buyback"
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
-        return connection
+        try:
+            yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,6 +417,142 @@ class SQLiteMonitorStore:
                     ON monitor_forward_evaluation (
                         monitor_id, entity_key, evaluation_id DESC
                     );
+
+                CREATE TABLE IF NOT EXISTS buyback_document (
+                    sha256 TEXT PRIMARY KEY CHECK (length(sha256) = 64),
+                    monitor_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    source_label TEXT NOT NULL,
+                    source_document_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    published_at TEXT,
+                    observed_at TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+                    relative_path TEXT NOT NULL UNIQUE,
+                    quality_state TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    last_referenced_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS buyback_document_source_idx
+                    ON buyback_document (
+                        monitor_id, source_key, source_document_id, observed_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS buyback_document_reference_idx
+                    ON buyback_document (last_referenced_at);
+
+                CREATE TABLE IF NOT EXISTS buyback_entity_revision (
+                    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    monitor_id TEXT NOT NULL,
+                    entity_key TEXT NOT NULL,
+                    entity_type TEXT NOT NULL CHECK (
+                        entity_type IN ('DISCLOSURE_CANDIDATE', 'HKEX_EXECUTION')
+                    ),
+                    revision_no INTEGER NOT NULL CHECK (revision_no > 0),
+                    effective_at TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    document_sha256 TEXT REFERENCES buyback_document(sha256)
+                        ON DELETE RESTRICT,
+                    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+                    payload_json TEXT NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (monitor_id, entity_key, revision_no),
+                    UNIQUE (monitor_id, entity_key, payload_sha256)
+                );
+
+                CREATE INDEX IF NOT EXISTS buyback_entity_latest_idx
+                    ON buyback_entity_revision (
+                        monitor_id, entity_key, revision_no DESC
+                    );
+                CREATE INDEX IF NOT EXISTS buyback_entity_effective_idx
+                    ON buyback_entity_revision (
+                        monitor_id, effective_at DESC, revision_id DESC
+                    );
+
+                CREATE TABLE IF NOT EXISTS buyback_review (
+                    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    monitor_id TEXT NOT NULL,
+                    entity_key TEXT NOT NULL,
+                    base_revision_no INTEGER NOT NULL CHECK (base_revision_no > 0),
+                    decision TEXT NOT NULL CHECK (
+                        decision IN (
+                            'CONFIRMED_EVENT', 'REJECTED_EVENT', 'NEEDS_FOLLOW_UP'
+                        )
+                    ),
+                    corrected_event_type TEXT,
+                    program_key TEXT,
+                    program_status TEXT CHECK (
+                        program_status IS NULL OR program_status IN (
+                            'PROPOSED', 'APPROVED', 'ACTIVE', 'COMPLETED',
+                            'TERMINATED', 'UNKNOWN'
+                        )
+                    ),
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS buyback_review_latest_idx
+                    ON buyback_review (monitor_id, entity_key, review_id DESC);
+
+                CREATE TABLE IF NOT EXISTS buyback_source_state (
+                    monitor_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    source_label TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('SUCCESS', 'EMPTY', 'PARTIAL', 'STALE', 'ERROR')
+                    ),
+                    checked_at TEXT NOT NULL,
+                    source_time TEXT,
+                    next_due_at TEXT NOT NULL,
+                    record_count INTEGER CHECK (
+                        record_count IS NULL OR record_count >= 0
+                    ),
+                    detail_code TEXT,
+                    payload_json TEXT NOT NULL,
+                    last_run_id INTEGER NOT NULL,
+                    PRIMARY KEY (monitor_id, source_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS buyback_source_due_idx
+                    ON buyback_source_state (monitor_id, next_due_at);
+
+                CREATE TABLE IF NOT EXISTS market_event_history_state (
+                    monitor_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS market_event_revision (
+                    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    monitor_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    revision_no INTEGER NOT NULL CHECK (revision_no > 0),
+                    scheduled_at TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'SCHEDULED', 'AWAITING_OFFICIAL', 'RELEASED',
+                            'OCCURRED'
+                        )
+                    ),
+                    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+                    payload_json TEXT NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (monitor_id, event_key, revision_no),
+                    UNIQUE (monitor_id, event_key, payload_sha256)
+                );
+
+                CREATE INDEX IF NOT EXISTS market_event_revision_latest_idx
+                    ON market_event_revision (
+                        monitor_id, event_key, revision_no DESC
+                    );
+                CREATE INDEX IF NOT EXISTS market_event_revision_schedule_idx
+                    ON market_event_revision (
+                        monitor_id, scheduled_at DESC, revision_id DESC
+                    );
                 """
             )
             interrupted = connection.execute(
@@ -425,9 +692,163 @@ class SQLiteMonitorStore:
             updated_at=parse_utc(str(row["updated_at"])),
         )
 
+    def _prepare_buyback_documents(
+        self,
+        monitor_id: str,
+        documents: tuple[BuybackEvidenceDocument, ...],
+    ) -> dict[str, tuple[BuybackEvidenceDocument, str]]:
+        """Write immutable bytes before the DB transaction.
+
+        A later database failure can leave an unreferenced content-addressed file.
+        It remains inside the evidence quota and can be inspected deliberately; a
+        committed database row can never point at a partially written file because
+        the final rename is atomic.
+        """
+
+        prepared: dict[str, tuple[BuybackEvidenceDocument, str]] = {}
+        for document in documents:
+            if not document.body:
+                raise RuntimeError("BUYBACK_DOCUMENT_EMPTY")
+            if len(document.body) > MAX_BUYBACK_DOCUMENT_BYTES:
+                raise RuntimeError("BUYBACK_DOCUMENT_TOO_LARGE")
+            suffix = document.file_suffix.casefold()
+            if suffix not in BUYBACK_DOCUMENT_SUFFIXES:
+                raise RuntimeError("BUYBACK_DOCUMENT_SUFFIX_UNSUPPORTED")
+            if not document.source_url.startswith("https://"):
+                raise RuntimeError("BUYBACK_DOCUMENT_URL_INVALID")
+            if not document.source_key or not document.source_document_id:
+                raise RuntimeError("BUYBACK_DOCUMENT_IDENTITY_INVALID")
+            iso_utc(document.observed_at)
+            if document.published_at is not None:
+                iso_utc(document.published_at)
+            digest = hashlib.sha256(document.body).hexdigest()
+            existing = prepared.get(digest)
+            if existing is not None:
+                if existing[0].body != document.body:
+                    raise RuntimeError("BUYBACK_DOCUMENT_HASH_COLLISION")
+                continue
+            relative = (
+                Path("evidence")
+                / "buyback"
+                / digest[:2]
+                / f"{digest}{suffix}"
+            )
+            prepared[digest] = (document, relative.as_posix())
+
+        if not prepared:
+            return prepared
+
+        current_bytes = self._buyback_evidence_bytes_on_disk()
+        incoming_bytes = sum(
+            len(document.body)
+            for document, relative_path in prepared.values()
+            if not (self.path.parent / Path(relative_path)).exists()
+        )
+        if current_bytes + incoming_bytes > self.buyback_evidence_max_bytes:
+            raise RuntimeError("BUYBACK_EVIDENCE_QUOTA_EXCEEDED")
+
+        root = self.buyback_evidence_root.resolve()
+        for digest, (document, relative_path) in prepared.items():
+            target = (self.path.parent / Path(relative_path)).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                raise RuntimeError("BUYBACK_EVIDENCE_PATH_INVALID") from None
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if not target.is_file():
+                    raise RuntimeError("BUYBACK_EVIDENCE_TARGET_INVALID")
+                if (
+                    target.stat().st_size != len(document.body)
+                    or hashlib.sha256(target.read_bytes()).hexdigest() != digest
+                ):
+                    raise RuntimeError("BUYBACK_EVIDENCE_CONTENT_MISMATCH")
+                continue
+            temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+            try:
+                with temporary.open("xb") as stream:
+                    stream.write(document.body)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+        return prepared
+
+    def _buyback_evidence_bytes_on_disk(self) -> int:
+        """Count owned evidence without following links or reparse points."""
+
+        root = self.buyback_evidence_root
+        if not root.exists():
+            return 0
+        total = 0
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_symlink():
+                        raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+                    stat_result = entry.stat(follow_symlinks=False)
+                    if getattr(stat_result, "st_file_attributes", 0) & 0x400:
+                        raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        total += stat_result.st_size
+                    else:
+                        raise RuntimeError("BUYBACK_EVIDENCE_ENTRY_INVALID")
+        return total
+
+    def storage_metrics(self) -> dict[str, int]:
+        """Return path-free, bounded-size diagnostics for periodic local logs."""
+
+        def file_size(path: Path) -> int:
+            try:
+                stat_result = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                return 0
+            if not path.is_file():
+                raise RuntimeError("MONITOR_STORAGE_ENTRY_INVALID")
+            return int(stat_result.st_size)
+
+        return {
+            "database_bytes": file_size(self.path),
+            "wal_bytes": file_size(Path(f"{self.path}-wal")),
+            "shared_memory_bytes": file_size(Path(f"{self.path}-shm")),
+            "buyback_evidence_bytes": self._buyback_evidence_bytes_on_disk(),
+        }
+
     def start_run(self, monitor_id: str, *, started_at: datetime | None = None) -> int:
         started = iso_utc(started_at or utc_now())
         with self._connect() as connection:
+            interrupted = connection.execute(
+                """
+                SELECT run_id
+                FROM monitor_run
+                WHERE monitor_id = ? AND status = 'RUNNING'
+                """,
+                (monitor_id,),
+            ).fetchall()
+            for row in interrupted:
+                connection.execute(
+                    """
+                    INSERT INTO monitor_issue (
+                        run_id, monitor_id, occurred_at, scope, reason_code
+                    ) VALUES (?, ?, ?, 'monitor', 'WORKER_PREVIOUS_RUN_INTERRUPTED')
+                    """,
+                    (int(row["run_id"]), monitor_id, started),
+                )
+            connection.execute(
+                """
+                UPDATE monitor_run
+                SET completed_at = ?, status = 'FAILED',
+                    error_code = 'WORKER_PREVIOUS_RUN_INTERRUPTED'
+                WHERE monitor_id = ? AND status = 'RUNNING'
+                """,
+                (started, monitor_id),
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO monitor_run (monitor_id, started_at, status)
@@ -449,9 +870,18 @@ class SQLiteMonitorStore:
     ) -> RunStatus:
         completed = completed_at or utc_now()
         completed_text = iso_utc(completed)
+        prepared_documents = self._prepare_buyback_documents(
+            monitor_id,
+            batch.buyback_documents,
+        )
+        has_current_result = bool(
+            batch.samples
+            or batch.buyback_source_observations
+            or batch.market_event_revisions
+        )
         status: RunStatus = (
             "FAILED"
-            if batch.issues and not batch.samples
+            if batch.issues and not has_current_result
             else "PARTIAL"
             if batch.issues
             else "SUCCESS"
@@ -465,6 +895,44 @@ class SQLiteMonitorStore:
                 raise RuntimeError("MONITOR_RUN_NOT_FOUND")
             if current["status"] != "RUNNING":
                 raise RuntimeError("MONITOR_RUN_ALREADY_FINISHED")
+            for digest, (document, relative_path) in prepared_documents.items():
+                connection.execute(
+                    """
+                    INSERT INTO buyback_document (
+                        sha256, monitor_id, source_key, source_label,
+                        source_document_id, source_url, published_at,
+                        observed_at, media_type, size_bytes, relative_path,
+                        quality_state, metadata_json, last_referenced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(sha256) DO UPDATE SET
+                        last_referenced_at = excluded.last_referenced_at
+                    """,
+                    (
+                        digest,
+                        monitor_id,
+                        document.source_key,
+                        document.source_label,
+                        document.source_document_id,
+                        document.source_url,
+                        (
+                            iso_utc(document.published_at)
+                            if document.published_at is not None
+                            else None
+                        ),
+                        iso_utc(document.observed_at),
+                        document.media_type,
+                        len(document.body),
+                        relative_path,
+                        document.quality_state,
+                        json.dumps(
+                            document.metadata,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        completed_text,
+                    ),
+                )
             for artifact in batch.artifacts:
                 connection.execute(
                     """
@@ -514,6 +982,217 @@ class SQLiteMonitorStore:
                         ),
                     ),
                 )
+            for observation in batch.buyback_source_observations:
+                if observation.record_count is not None and observation.record_count < 0:
+                    raise RuntimeError("BUYBACK_SOURCE_RECORD_COUNT_INVALID")
+                connection.execute(
+                    """
+                    INSERT INTO buyback_source_state (
+                        monitor_id, source_key, source_label, status,
+                        checked_at, source_time, next_due_at, record_count,
+                        detail_code, payload_json, last_run_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(monitor_id, source_key) DO UPDATE SET
+                        source_label = excluded.source_label,
+                        status = excluded.status,
+                        checked_at = excluded.checked_at,
+                        source_time = excluded.source_time,
+                        next_due_at = excluded.next_due_at,
+                        record_count = excluded.record_count,
+                        detail_code = excluded.detail_code,
+                        payload_json = excluded.payload_json,
+                        last_run_id = excluded.last_run_id
+                    """,
+                    (
+                        monitor_id,
+                        observation.source_key,
+                        observation.source_label,
+                        observation.status,
+                        iso_utc(observation.checked_at),
+                        (
+                            iso_utc(observation.source_time)
+                            if observation.source_time is not None
+                            else None
+                        ),
+                        iso_utc(observation.next_due_at),
+                        observation.record_count,
+                        observation.detail_code,
+                        json.dumps(
+                            observation.payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        run_id,
+                    ),
+                )
+            for revision in batch.buyback_revisions:
+                if not revision.entity_key or len(revision.entity_key) > 256:
+                    raise RuntimeError("BUYBACK_ENTITY_KEY_INVALID")
+                if revision.document_sha256 is not None and (
+                    len(revision.document_sha256) != 64
+                    or any(
+                        value not in "0123456789abcdef"
+                        for value in revision.document_sha256
+                    )
+                ):
+                    raise RuntimeError("BUYBACK_DOCUMENT_HASH_INVALID")
+                payload_json = json.dumps(
+                    revision.payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+                duplicate = connection.execute(
+                    """
+                    SELECT 1
+                    FROM buyback_entity_revision
+                    WHERE monitor_id = ? AND entity_key = ? AND payload_sha256 = ?
+                    """,
+                    (monitor_id, revision.entity_key, payload_sha256),
+                ).fetchone()
+                if duplicate is not None:
+                    continue
+                latest_revision = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(revision_no), 0)
+                    FROM buyback_entity_revision
+                    WHERE monitor_id = ? AND entity_key = ?
+                    """,
+                    (monitor_id, revision.entity_key),
+                ).fetchone()
+                revision_no = int(latest_revision[0]) + 1
+                connection.execute(
+                    """
+                    INSERT INTO buyback_entity_revision (
+                        monitor_id, entity_key, entity_type, revision_no,
+                        effective_at, observed_at, source_key,
+                        document_sha256, payload_sha256, payload_json,
+                        source_run_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        monitor_id,
+                        revision.entity_key,
+                        revision.entity_type,
+                        revision_no,
+                        iso_utc(revision.effective_at),
+                        iso_utc(revision.observed_at),
+                        revision.source_key,
+                        revision.document_sha256,
+                        payload_sha256,
+                        payload_json,
+                        run_id,
+                        completed_text,
+                    ),
+                )
+                if revision.document_sha256 is not None:
+                    connection.execute(
+                        """
+                        UPDATE buyback_document
+                        SET last_referenced_at = ?
+                        WHERE sha256 = ?
+                        """,
+                        (completed_text, revision.document_sha256),
+                    )
+            if batch.market_event_revisions:
+                history_started = min(
+                    revision.observed_at
+                    for revision in batch.market_event_revisions
+                )
+                connection.execute(
+                    """
+                    INSERT INTO market_event_history_state (monitor_id, started_at)
+                    VALUES (?, ?)
+                    ON CONFLICT(monitor_id) DO NOTHING
+                    """,
+                    (monitor_id, iso_utc(history_started)),
+                )
+                state_row = connection.execute(
+                    """
+                    SELECT started_at
+                    FROM market_event_history_state
+                    WHERE monitor_id = ?
+                    """,
+                    (monitor_id,),
+                ).fetchone()
+                if state_row is None:
+                    raise RuntimeError("MARKET_EVENT_HISTORY_STATE_MISSING")
+                history_started_at = parse_utc(str(state_row["started_at"]))
+                for revision in batch.market_event_revisions:
+                    if not revision.event_key or len(revision.event_key) > 256:
+                        raise RuntimeError("MARKET_EVENT_KEY_INVALID")
+                    if revision.state not in {
+                        "SCHEDULED",
+                        "AWAITING_OFFICIAL",
+                        "RELEASED",
+                        "OCCURRED",
+                    }:
+                        raise RuntimeError("MARKET_EVENT_STATE_INVALID")
+                    iso_utc(revision.scheduled_at)
+                    iso_utc(revision.observed_at)
+                    existing = connection.execute(
+                        """
+                        SELECT 1
+                        FROM market_event_revision
+                        WHERE monitor_id = ? AND event_key = ?
+                        LIMIT 1
+                        """,
+                        (monitor_id, revision.event_key),
+                    ).fetchone()
+                    if existing is None and revision.scheduled_at < history_started_at:
+                        continue
+                    payload_json = json.dumps(
+                        revision.payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    payload_sha256 = hashlib.sha256(
+                        payload_json.encode("utf-8")
+                    ).hexdigest()
+                    duplicate = connection.execute(
+                        """
+                        SELECT 1
+                        FROM market_event_revision
+                        WHERE monitor_id = ? AND event_key = ?
+                          AND payload_sha256 = ?
+                        """,
+                        (monitor_id, revision.event_key, payload_sha256),
+                    ).fetchone()
+                    if duplicate is not None:
+                        continue
+                    latest_revision = connection.execute(
+                        """
+                        SELECT COALESCE(MAX(revision_no), 0)
+                        FROM market_event_revision
+                        WHERE monitor_id = ? AND event_key = ?
+                        """,
+                        (monitor_id, revision.event_key),
+                    ).fetchone()
+                    revision_no = int(latest_revision[0]) + 1
+                    connection.execute(
+                        """
+                        INSERT INTO market_event_revision (
+                            monitor_id, event_key, revision_no, scheduled_at,
+                            observed_at, state, payload_sha256, payload_json,
+                            source_run_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            monitor_id,
+                            revision.event_key,
+                            revision_no,
+                            iso_utc(revision.scheduled_at),
+                            iso_utc(revision.observed_at),
+                            revision.state,
+                            payload_sha256,
+                            payload_json,
+                            run_id,
+                            completed_text,
+                        ),
+                    )
             for case in batch.evaluation_cases:
                 connection.execute(
                     """
@@ -681,6 +1360,23 @@ class SQLiteMonitorStore:
             ).fetchone()
         return self._run_from_row(row) if row is not None else None
 
+    def latest_completed_run(self, monitor_id: str) -> StoredRun | None:
+        """Return the newest committed result, including valid empty event scans."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, monitor_id, started_at, completed_at, status,
+                       sample_count, error_code
+                FROM monitor_run
+                WHERE monitor_id = ? AND status IN ('SUCCESS', 'PARTIAL')
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (monitor_id,),
+            ).fetchone()
+        return self._run_from_row(row) if row is not None else None
+
     def samples_for_run(self, run_id: int) -> tuple[StoredSample, ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -727,10 +1423,17 @@ class SQLiteMonitorStore:
         self,
         monitor_id: str,
         entity_keys: tuple[str, ...],
+        *,
+        source: str | None = None,
     ) -> tuple[StoredForwardEvaluation, ...]:
         if not entity_keys:
             return ()
         placeholders = ",".join("?" for _ in entity_keys)
+        source_filter = " AND evaluation.source = ?" if source else ""
+        candidate_source_filter = " AND candidate.source = ?" if source else ""
+        parameters: list[Any] = [monitor_id, *entity_keys]
+        if source:
+            parameters.extend((source, source))
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -738,15 +1441,17 @@ class SQLiteMonitorStore:
                 FROM monitor_forward_evaluation AS evaluation
                 WHERE evaluation.monitor_id = ?
                   AND evaluation.entity_key IN ({placeholders})
+                  {source_filter}
                   AND evaluation.evaluation_id = (
                       SELECT MAX(candidate.evaluation_id)
                       FROM monitor_forward_evaluation AS candidate
                       WHERE candidate.monitor_id = evaluation.monitor_id
                         AND candidate.entity_key = evaluation.entity_key
+                        {candidate_source_filter}
                   )
                 ORDER BY evaluation.entity_key
                 """,
-                (monitor_id, *entity_keys),
+                parameters,
             ).fetchall()
         return tuple(self._evaluation_from_row(row) for row in rows)
 
@@ -795,17 +1500,24 @@ class SQLiteMonitorStore:
         monitor_id: str,
         *,
         limit: int = 120,
+        source: str | None = None,
     ) -> tuple[StoredForwardEvaluation, ...]:
+        source_filter = " AND source = ?" if source else ""
+        parameters: list[Any] = [monitor_id]
+        if source:
+            parameters.append(source)
+        parameters.append(limit)
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT *
                 FROM monitor_forward_evaluation
                 WHERE monitor_id = ?
+                {source_filter}
                 ORDER BY source_cutoff_at DESC, evaluation_id DESC
                 LIMIT ?
                 """,
-                (monitor_id, limit),
+                parameters,
             ).fetchall()
         return tuple(self._evaluation_from_row(row) for row in rows)
 
@@ -814,11 +1526,23 @@ class SQLiteMonitorStore:
         monitor_id: str,
         *,
         now: datetime,
+        source: str | None = None,
     ) -> dict[str, Any]:
         now_text = iso_utc(now)
+        source_filter = " AND source = ?" if source else ""
+        count_parameters: list[Any] = [
+            now_text,
+            now_text,
+            now_text,
+            monitor_id,
+        ]
+        group_parameters: list[Any] = [monitor_id]
+        if source:
+            count_parameters.append(source)
+            group_parameters.append(source)
         with self._connect() as connection:
             counts = connection.execute(
-                """
+                f"""
                 SELECT
                     COUNT(*) AS total_cases,
                     SUM(CASE WHEN due_at <= ? THEN 1 ELSE 0 END) AS due_cases,
@@ -832,11 +1556,12 @@ class SQLiteMonitorStore:
                         AS pending_future_cases
                 FROM monitor_forward_evaluation
                 WHERE monitor_id = ?
+                {source_filter}
                 """,
-                (now_text, now_text, now_text, monitor_id),
+                count_parameters,
             ).fetchone()
             groups = connection.execute(
-                """
+                f"""
                 SELECT stage, stage_label, horizon_minutes,
                        COUNT(*) AS sample_count,
                        SUM(CASE WHEN verdict = 'ALIGNED' THEN 1 ELSE 0 END)
@@ -848,10 +1573,11 @@ class SQLiteMonitorStore:
                            AS average_adverse_excursion_percent
                 FROM monitor_forward_evaluation
                 WHERE monitor_id = ? AND status = 'COMPLETE'
+                {source_filter}
                 GROUP BY stage, stage_label, horizon_minutes
                 ORDER BY stage_label, horizon_minutes
                 """,
-                (monitor_id,),
+                group_parameters,
             ).fetchall()
         count_payload = {
             key: int(counts[key] or 0)
@@ -988,8 +1714,353 @@ class SQLiteMonitorStore:
             for row in rows
         )
 
+    def buyback_source_states(
+        self,
+        monitor_id: str,
+    ) -> tuple[StoredBuybackSourceState, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT monitor_id, source_key, source_label, status,
+                       checked_at, source_time, next_due_at, record_count,
+                       detail_code, payload_json, last_run_id
+                FROM buyback_source_state
+                WHERE monitor_id = ?
+                ORDER BY source_key
+                """,
+                (monitor_id,),
+            ).fetchall()
+        return tuple(self._buyback_source_from_row(row) for row in rows)
+
+    def buyback_document_for_source(
+        self,
+        monitor_id: str,
+        source_key: str,
+        source_document_id: str,
+    ) -> StoredBuybackDocument | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM buyback_document
+                WHERE monitor_id = ? AND source_key = ? AND source_document_id = ?
+                ORDER BY observed_at DESC
+                LIMIT 1
+                """,
+                (monitor_id, source_key, source_document_id),
+            ).fetchone()
+        return self._buyback_document_from_row(row) if row is not None else None
+
+    def buyback_document(self, sha256: str) -> StoredBuybackDocument | None:
+        if len(sha256) != 64 or any(
+            value not in "0123456789abcdef" for value in sha256
+        ):
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM buyback_document WHERE sha256 = ?",
+                (sha256,),
+            ).fetchone()
+        return self._buyback_document_from_row(row) if row is not None else None
+
+    def buyback_document_path(
+        self,
+        document: StoredBuybackDocument,
+        *,
+        verify_content: bool = True,
+    ) -> Path:
+        root = self.buyback_evidence_root.resolve()
+        candidate = self.path.parent / Path(document.relative_path)
+        if candidate.is_symlink():
+            raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+        try:
+            stat_result = candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            raise RuntimeError("BUYBACK_EVIDENCE_FILE_MISSING") from None
+        if getattr(stat_result, "st_file_attributes", 0) & 0x400:
+            raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+        path = candidate.resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise RuntimeError("BUYBACK_EVIDENCE_PATH_INVALID") from None
+        if not path.is_file():
+            raise RuntimeError("BUYBACK_EVIDENCE_FILE_MISSING")
+        if stat_result.st_size != document.size_bytes:
+            raise RuntimeError("BUYBACK_EVIDENCE_SIZE_MISMATCH")
+        if verify_content:
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            if digest != document.sha256:
+                raise RuntimeError("BUYBACK_EVIDENCE_CONTENT_MISMATCH")
+        return path
+
+    def latest_buyback_entities(
+        self,
+        monitor_id: str,
+        *,
+        limit: int = 1000,
+    ) -> tuple[StoredBuybackEntity, ...]:
+        if not 1 <= limit <= 20_000:
+            raise ValueError("buyback entity limit out of range")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH latest AS (
+                    SELECT monitor_id, entity_key, MAX(revision_no) AS revision_no
+                    FROM buyback_entity_revision
+                    WHERE monitor_id = ?
+                    GROUP BY monitor_id, entity_key
+                )
+                SELECT revision.*,
+                       review.review_id AS latest_review_id,
+                       review.base_revision_no AS latest_review_base_revision_no,
+                       review.decision AS latest_review_decision,
+                       review.corrected_event_type AS latest_review_event_type,
+                       review.program_key AS latest_review_program_key,
+                       review.program_status AS latest_review_program_status,
+                       review.note AS latest_review_note,
+                       review.created_at AS latest_review_created_at
+                FROM latest
+                JOIN buyback_entity_revision AS revision
+                  ON revision.monitor_id = latest.monitor_id
+                 AND revision.entity_key = latest.entity_key
+                 AND revision.revision_no = latest.revision_no
+                LEFT JOIN buyback_review AS review
+                  ON review.review_id = (
+                      SELECT MAX(candidate.review_id)
+                      FROM buyback_review AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.entity_key = revision.entity_key
+                        AND candidate.base_revision_no = revision.revision_no
+                  )
+                ORDER BY revision.effective_at DESC, revision.revision_id DESC
+                LIMIT ?
+                """,
+                (monitor_id, limit),
+            ).fetchall()
+        return tuple(self._buyback_entity_from_row(row) for row in rows)
+
+    def buyback_projection_version(self, monitor_id: str) -> tuple[int, int, int]:
+        """Compact cache key for every durable input to the buyback projection."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COALESCE((
+                        SELECT MAX(revision_id)
+                        FROM buyback_entity_revision
+                        WHERE monitor_id = ?
+                    ), 0) AS revision_id,
+                    COALESCE((
+                        SELECT MAX(review_id)
+                        FROM buyback_review
+                        WHERE monitor_id = ?
+                    ), 0) AS review_id,
+                    COALESCE((
+                        SELECT MAX(last_run_id)
+                        FROM buyback_source_state
+                        WHERE monitor_id = ?
+                    ), 0) AS source_run_id
+                """,
+                (monitor_id, monitor_id, monitor_id),
+            ).fetchone()
+        if row is None:
+            return (0, 0, 0)
+        return (
+            int(row["revision_id"]),
+            int(row["review_id"]),
+            int(row["source_run_id"]),
+        )
+
+    def buyback_entity(
+        self,
+        monitor_id: str,
+        entity_key: str,
+    ) -> StoredBuybackEntity | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT revision.*,
+                       review.review_id AS latest_review_id,
+                       review.base_revision_no AS latest_review_base_revision_no,
+                       review.decision AS latest_review_decision,
+                       review.corrected_event_type AS latest_review_event_type,
+                       review.program_key AS latest_review_program_key,
+                       review.program_status AS latest_review_program_status,
+                       review.note AS latest_review_note,
+                       review.created_at AS latest_review_created_at
+                FROM buyback_entity_revision AS revision
+                LEFT JOIN buyback_review AS review
+                  ON review.review_id = (
+                      SELECT MAX(candidate.review_id)
+                      FROM buyback_review AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.entity_key = revision.entity_key
+                        AND candidate.base_revision_no = revision.revision_no
+                  )
+                WHERE revision.monitor_id = ? AND revision.entity_key = ?
+                ORDER BY revision.revision_no DESC
+                LIMIT 1
+                """,
+                (monitor_id, entity_key),
+            ).fetchone()
+        return self._buyback_entity_from_row(row) if row is not None else None
+
+    def buyback_entity_revisions(
+        self,
+        monitor_id: str,
+        entity_key: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[StoredBuybackEntity, ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("buyback revision limit out of range")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision.*,
+                       NULL AS latest_review_id,
+                       NULL AS latest_review_base_revision_no,
+                       NULL AS latest_review_decision,
+                       NULL AS latest_review_event_type,
+                       NULL AS latest_review_program_key,
+                       NULL AS latest_review_program_status,
+                       NULL AS latest_review_note,
+                       NULL AS latest_review_created_at
+                FROM buyback_entity_revision AS revision
+                WHERE monitor_id = ? AND entity_key = ?
+                ORDER BY revision_no DESC
+                LIMIT ?
+                """,
+                (monitor_id, entity_key, limit),
+            ).fetchall()
+        return tuple(self._buyback_entity_from_row(row) for row in rows)
+
+    def buyback_reviews(
+        self,
+        monitor_id: str,
+        entity_key: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[StoredBuybackReview, ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("buyback review limit out of range")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM buyback_review
+                WHERE monitor_id = ? AND entity_key = ?
+                ORDER BY review_id DESC
+                LIMIT ?
+                """,
+                (monitor_id, entity_key, limit),
+            ).fetchall()
+        return tuple(self._buyback_review_from_row(row) for row in rows)
+
+    def save_buyback_review(
+        self,
+        monitor_id: str,
+        entity_key: str,
+        *,
+        base_revision_no: int,
+        decision: str,
+        corrected_event_type: str | None,
+        program_key: str | None,
+        program_status: str | None,
+        note: str,
+        created_at: datetime | None = None,
+    ) -> StoredBuybackReview:
+        decisions = {"CONFIRMED_EVENT", "REJECTED_EVENT", "NEEDS_FOLLOW_UP"}
+        program_statuses = {
+            "PROPOSED",
+            "APPROVED",
+            "ACTIVE",
+            "COMPLETED",
+            "TERMINATED",
+            "UNKNOWN",
+        }
+        if decision not in decisions:
+            raise ValueError("BUYBACK_REVIEW_DECISION_INVALID")
+        if program_status is not None and program_status not in program_statuses:
+            raise ValueError("BUYBACK_PROGRAM_STATUS_INVALID")
+        if (
+            corrected_event_type is not None
+            and corrected_event_type not in BUYBACK_REVIEW_EVENT_TYPES
+        ):
+            raise ValueError("BUYBACK_EVENT_TYPE_INVALID")
+        normalized_program_key = program_key.strip() if program_key is not None else None
+        if normalized_program_key == "":
+            normalized_program_key = None
+        if normalized_program_key is not None and len(normalized_program_key) > 120:
+            raise ValueError("BUYBACK_PROGRAM_KEY_INVALID")
+        normalized_note = note.strip()
+        if len(normalized_note) > 1000:
+            raise ValueError("BUYBACK_REVIEW_NOTE_TOO_LONG")
+        created = created_at or utc_now()
+        created_text = iso_utc(created)
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT MAX(revision_no)
+                FROM buyback_entity_revision
+                WHERE monitor_id = ? AND entity_key = ?
+                """,
+                (monitor_id, entity_key),
+            ).fetchone()
+            current_revision = int(current[0]) if current and current[0] is not None else None
+            if current_revision is None:
+                raise KeyError("BUYBACK_ENTITY_NOT_FOUND")
+            if current_revision != base_revision_no:
+                raise RuntimeError("BUYBACK_REVISION_CONFLICT")
+            cursor = connection.execute(
+                """
+                INSERT INTO buyback_review (
+                    monitor_id, entity_key, base_revision_no, decision,
+                    corrected_event_type, program_key, program_status,
+                    note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    monitor_id,
+                    entity_key,
+                    base_revision_no,
+                    decision,
+                    corrected_event_type,
+                    normalized_program_key,
+                    program_status,
+                    normalized_note,
+                    created_text,
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("BUYBACK_REVIEW_ID_MISSING")
+            review_id = int(cursor.lastrowid)
+        return StoredBuybackReview(
+            review_id=review_id,
+            monitor_id=monitor_id,
+            entity_key=entity_key,
+            base_revision_no=base_revision_no,
+            decision=decision,
+            corrected_event_type=corrected_event_type,
+            program_key=normalized_program_key,
+            program_status=program_status,
+            note=normalized_note,
+            created_at=created,
+        )
+
     def prune(self, retention_days: int, *, now: datetime | None = None) -> int:
-        cutoff = iso_utc((now or utc_now()) - timedelta(days=retention_days))
+        observed_now = now or utc_now()
+        cutoff = iso_utc(observed_now - timedelta(days=retention_days))
+        buyback_cutoff = iso_utc(
+            observed_now - timedelta(days=self.buyback_retention_days)
+        )
+        market_event_cutoff = iso_utc(
+            observed_now - timedelta(days=self.market_event_retention_days)
+        )
+        removed_evidence_paths: list[str] = []
         with self._connect() as connection:
             cursor = connection.execute(
                 """
@@ -998,7 +2069,186 @@ class SQLiteMonitorStore:
                 """,
                 (cutoff,),
             )
-            return int(cursor.rowcount)
+            removed_runs = int(cursor.rowcount)
+            connection.execute(
+                """
+                DELETE FROM buyback_review
+                WHERE (monitor_id, entity_key) IN (
+                    SELECT monitor_id, entity_key
+                    FROM buyback_entity_revision
+                    GROUP BY monitor_id, entity_key
+                    HAVING MAX(effective_at) < ?
+                )
+                """,
+                (buyback_cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM buyback_entity_revision
+                WHERE (monitor_id, entity_key) IN (
+                    SELECT monitor_id, entity_key
+                    FROM buyback_entity_revision
+                    GROUP BY monitor_id, entity_key
+                    HAVING MAX(effective_at) < ?
+                )
+                """,
+                (buyback_cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM market_event_revision
+                WHERE (monitor_id, event_key) IN (
+                    SELECT monitor_id, event_key
+                    FROM market_event_revision
+                    GROUP BY monitor_id, event_key
+                    HAVING MAX(scheduled_at) < ?
+                )
+                """,
+                (market_event_cutoff,),
+            )
+            removable = connection.execute(
+                """
+                SELECT relative_path
+                FROM buyback_document AS document
+                WHERE document.last_referenced_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM buyback_entity_revision AS revision
+                      WHERE revision.document_sha256 = document.sha256
+                  )
+                """,
+                (buyback_cutoff,),
+            ).fetchall()
+            removed_evidence_paths = [str(row["relative_path"]) for row in removable]
+            connection.executemany(
+                "DELETE FROM buyback_document WHERE relative_path = ?",
+                ((value,) for value in removed_evidence_paths),
+            )
+        root = self.buyback_evidence_root.resolve()
+        for relative_path in removed_evidence_paths:
+            candidate = self.path.parent / Path(relative_path)
+            if candidate.is_symlink():
+                raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+            path = candidate.resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                raise RuntimeError("BUYBACK_EVIDENCE_PATH_INVALID") from None
+            if path.exists():
+                if not path.is_file():
+                    raise RuntimeError("BUYBACK_EVIDENCE_TARGET_INVALID")
+                try:
+                    path.unlink()
+                except OSError:
+                    # The database row is already gone. A bounded orphan pass
+                    # below, and every later maintenance cycle, retries without
+                    # retaining an unbounded in-memory deletion queue.
+                    pass
+        self._prune_buyback_evidence_orphans(
+            cutoff=observed_now - timedelta(days=self.buyback_retention_days)
+        )
+        return removed_runs
+
+    def _prune_buyback_evidence_orphans(
+        self,
+        *,
+        cutoff: datetime,
+        maximum_entries: int = 20_000,
+    ) -> int:
+        """Remove old owned files that no longer have a durable database row."""
+
+        if maximum_entries < 1:
+            raise ValueError("maximum_entries must be positive")
+        root = self.buyback_evidence_root
+        if not root.exists():
+            return 0
+        with self._connect() as connection:
+            referenced = {
+                str(row["relative_path"])
+                for row in connection.execute(
+                    "SELECT relative_path FROM buyback_document"
+                ).fetchall()
+            }
+        cutoff_timestamp = cutoff.timestamp()
+        removed = 0
+        inspected = 0
+        pending = [root]
+        while pending and inspected < maximum_entries:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    inspected += 1
+                    if inspected > maximum_entries:
+                        break
+                    if entry.is_symlink():
+                        raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+                    stat_result = entry.stat(follow_symlinks=False)
+                    if getattr(stat_result, "st_file_attributes", 0) & 0x400:
+                        raise RuntimeError("BUYBACK_EVIDENCE_LINK_UNSUPPORTED")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        raise RuntimeError("BUYBACK_EVIDENCE_ENTRY_INVALID")
+                    path = Path(entry.path)
+                    relative_path = path.relative_to(self.path.parent).as_posix()
+                    if (
+                        relative_path in referenced
+                        or stat_result.st_mtime >= cutoff_timestamp
+                    ):
+                        continue
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        continue
+                    removed += 1
+        return removed
+
+    def market_event_history_started_at(
+        self,
+        monitor_id: str,
+    ) -> datetime | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT started_at
+                FROM market_event_history_state
+                WHERE monitor_id = ?
+                """,
+                (monitor_id,),
+            ).fetchone()
+        return parse_utc(str(row["started_at"])) if row is not None else None
+
+    def latest_market_event_revisions(
+        self,
+        monitor_id: str,
+        *,
+        limit: int = 1000,
+    ) -> tuple[StoredMarketEventRevision, ...]:
+        if not 1 <= limit <= 20_000:
+            raise ValueError("limit must be between 1 and 20000")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision_id, revision_no, monitor_id, event_key,
+                       scheduled_at, observed_at, state, payload_sha256,
+                       payload_json, source_run_id, created_at
+                FROM market_event_revision AS revision
+                WHERE revision.monitor_id = ?
+                  AND revision.revision_no = (
+                      SELECT MAX(candidate.revision_no)
+                      FROM market_event_revision AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.event_key = revision.event_key
+                  )
+                ORDER BY scheduled_at DESC, revision_id DESC
+                LIMIT ?
+                """,
+                (monitor_id, limit),
+            ).fetchall()
+        return tuple(self._market_event_revision_from_row(row) for row in rows)
 
     @staticmethod
     def _run_from_row(row: sqlite3.Row) -> StoredRun:
@@ -1105,6 +2355,161 @@ class SQLiteMonitorStore:
             occurred_at=parse_utc(str(row["occurred_at"])),
             scope=str(row["scope"]),
             reason_code=str(row["reason_code"]),
+        )
+
+    @staticmethod
+    def _market_event_revision_from_row(
+        row: sqlite3.Row,
+    ) -> StoredMarketEventRevision:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("MARKET_EVENT_REVISION_PAYLOAD_INVALID")
+        return StoredMarketEventRevision(
+            revision_id=int(row["revision_id"]),
+            revision_no=int(row["revision_no"]),
+            monitor_id=str(row["monitor_id"]),
+            event_key=str(row["event_key"]),
+            scheduled_at=parse_utc(str(row["scheduled_at"])),
+            observed_at=parse_utc(str(row["observed_at"])),
+            state=str(row["state"]),
+            payload_sha256=str(row["payload_sha256"]),
+            payload=payload,
+            source_run_id=int(row["source_run_id"]),
+            created_at=parse_utc(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _buyback_review_from_row(row: sqlite3.Row) -> StoredBuybackReview:
+        return StoredBuybackReview(
+            review_id=int(row["review_id"]),
+            monitor_id=str(row["monitor_id"]),
+            entity_key=str(row["entity_key"]),
+            base_revision_no=int(row["base_revision_no"]),
+            decision=str(row["decision"]),
+            corrected_event_type=(
+                str(row["corrected_event_type"])
+                if row["corrected_event_type"] is not None
+                else None
+            ),
+            program_key=(
+                str(row["program_key"])
+                if row["program_key"] is not None
+                else None
+            ),
+            program_status=(
+                str(row["program_status"])
+                if row["program_status"] is not None
+                else None
+            ),
+            note=str(row["note"]),
+            created_at=parse_utc(str(row["created_at"])),
+        )
+
+    @classmethod
+    def _buyback_entity_from_row(cls, row: sqlite3.Row) -> StoredBuybackEntity:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("BUYBACK_ENTITY_PAYLOAD_INVALID")
+        review = None
+        if row["latest_review_id"] is not None:
+            review = StoredBuybackReview(
+                review_id=int(row["latest_review_id"]),
+                monitor_id=str(row["monitor_id"]),
+                entity_key=str(row["entity_key"]),
+                base_revision_no=int(row["latest_review_base_revision_no"]),
+                decision=str(row["latest_review_decision"]),
+                corrected_event_type=(
+                    str(row["latest_review_event_type"])
+                    if row["latest_review_event_type"] is not None
+                    else None
+                ),
+                program_key=(
+                    str(row["latest_review_program_key"])
+                    if row["latest_review_program_key"] is not None
+                    else None
+                ),
+                program_status=(
+                    str(row["latest_review_program_status"])
+                    if row["latest_review_program_status"] is not None
+                    else None
+                ),
+                note=str(row["latest_review_note"]),
+                created_at=parse_utc(str(row["latest_review_created_at"])),
+            )
+        return StoredBuybackEntity(
+            revision_id=int(row["revision_id"]),
+            revision_no=int(row["revision_no"]),
+            monitor_id=str(row["monitor_id"]),
+            entity_key=str(row["entity_key"]),
+            entity_type=str(row["entity_type"]),
+            effective_at=parse_utc(str(row["effective_at"])),
+            observed_at=parse_utc(str(row["observed_at"])),
+            source_key=str(row["source_key"]),
+            document_sha256=(
+                str(row["document_sha256"])
+                if row["document_sha256"] is not None
+                else None
+            ),
+            payload_sha256=str(row["payload_sha256"]),
+            payload=payload,
+            review=review,
+        )
+
+    @staticmethod
+    def _buyback_source_from_row(row: sqlite3.Row) -> StoredBuybackSourceState:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("BUYBACK_SOURCE_PAYLOAD_INVALID")
+        return StoredBuybackSourceState(
+            monitor_id=str(row["monitor_id"]),
+            source_key=str(row["source_key"]),
+            source_label=str(row["source_label"]),
+            status=str(row["status"]),
+            checked_at=parse_utc(str(row["checked_at"])),
+            source_time=(
+                parse_utc(str(row["source_time"]))
+                if row["source_time"] is not None
+                else None
+            ),
+            next_due_at=parse_utc(str(row["next_due_at"])),
+            record_count=(
+                int(row["record_count"])
+                if row["record_count"] is not None
+                else None
+            ),
+            detail_code=(
+                str(row["detail_code"])
+                if row["detail_code"] is not None
+                else None
+            ),
+            payload=payload,
+            last_run_id=int(row["last_run_id"]),
+        )
+
+    @staticmethod
+    def _buyback_document_from_row(row: sqlite3.Row) -> StoredBuybackDocument:
+        metadata = json.loads(str(row["metadata_json"]))
+        if not isinstance(metadata, dict):
+            raise RuntimeError("BUYBACK_DOCUMENT_METADATA_INVALID")
+        return StoredBuybackDocument(
+            sha256=str(row["sha256"]),
+            monitor_id=str(row["monitor_id"]),
+            source_key=str(row["source_key"]),
+            source_label=str(row["source_label"]),
+            source_document_id=str(row["source_document_id"]),
+            source_url=str(row["source_url"]),
+            published_at=(
+                parse_utc(str(row["published_at"]))
+                if row["published_at"] is not None
+                else None
+            ),
+            observed_at=parse_utc(str(row["observed_at"])),
+            media_type=str(row["media_type"]),
+            size_bytes=int(row["size_bytes"]),
+            relative_path=str(row["relative_path"]),
+            quality_state=str(row["quality_state"]),
+            metadata=metadata,
+            last_referenced_at=parse_utc(str(row["last_referenced_at"])),
         )
 
     @staticmethod

@@ -1,4 +1,4 @@
-"""Bounded public-market radar for explainable altcoin pump-like anomalies.
+"""Bounded USDⓈ-M perpetual radar for explainable altcoin anomalies.
 
 The monitor intentionally reports observable stages and evidence scores.  It does
 not claim a calibrated probability, causal prediction, or trading instruction.
@@ -21,6 +21,7 @@ from urllib.request import OpenerDirector, ProxyHandler, Request, build_opener
 
 from halpha_monitor.contracts import (
     CollectionBatch,
+    CollectionCancelled,
     CollectionIssue,
     EvaluationView,
     FilterChoice,
@@ -36,12 +37,12 @@ from halpha_monitor.store import SQLiteMonitorStore, iso_utc
 from halpha_monitor.telemetry import NetworkRequestWindow
 
 
-BINANCE_SPOT_MARKET_BASE = "https://data-api.binance.vision"
 BINANCE_USDM_BASE = "https://fapi.binance.com"
 USER_AGENT = "Halpha-Monitor/0.1 public-market-read-only"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-MAX_ROLLING_SYMBOLS = 100
 KLINE_INTERVAL_MINUTES = 5
+MARKET_SCOPE = "USDM_PERPETUAL"
+EVALUATION_SOURCE = "BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES"
 EVALUATION_HORIZONS_MINUTES = (15, 60, 240)
 EVALUATION_REPEAT_AFTER = timedelta(hours=4)
 EVALUATION_GRACE = timedelta(hours=1)
@@ -114,7 +115,6 @@ STAGE_LABELS = {
     "EXHAUSTION": "尾声风险",
     "COOLDOWN": "回落确认",
     "NEUTRAL": "尚未形成",
-    "DATA_GAP": "数据不足",
 }
 STAGE_TONES = {
     "SETUP": "INFO",
@@ -123,7 +123,6 @@ STAGE_TONES = {
     "EXHAUSTION": "DANGER",
     "COOLDOWN": "MUTED",
     "NEUTRAL": "NEUTRAL",
-    "DATA_GAP": "MUTED",
 }
 STAGE_REVIEW_LABELS = {
     "SETUP": "下一根 5m K 复核",
@@ -132,7 +131,6 @@ STAGE_REVIEW_LABELS = {
     "EXHAUSTION": "当前即复核",
     "COOLDOWN": "每根 5m K 复核",
     "NEUTRAL": "下次采集重算",
-    "DATA_GAP": "不可判断",
 }
 
 
@@ -198,21 +196,6 @@ def _eligible_altcoin(base_asset: str) -> bool:
     )
 
 
-def rolling_symbol_batches(
-    symbols: Sequence[str], batch_size: int
-) -> tuple[tuple[str, ...], ...]:
-    """Keep non-ASCII symbols isolated for Binance's multi-symbol validator."""
-
-    ascii_symbols = [symbol for symbol in symbols if symbol.isascii()]
-    unicode_symbols = [symbol for symbol in symbols if not symbol.isascii()]
-    batches = [
-        tuple(ascii_symbols[offset : offset + batch_size])
-        for offset in range(0, len(ascii_symbols), batch_size)
-    ]
-    batches.extend((symbol,) for symbol in unicode_symbols)
-    return tuple(batch for batch in batches if batch)
-
-
 @dataclass(frozen=True)
 class RollingTicker:
     symbol: str
@@ -234,7 +217,7 @@ class RollingTicker:
 
 
 @dataclass(frozen=True)
-class SpotCandle:
+class ContractCandle:
     open_time: datetime
     close_time: datetime
     open_price: float
@@ -287,9 +270,6 @@ class CandidateSeed:
     symbol: str
     base_asset: str
     ticker_24h: RollingTicker
-    ticker_1h: RollingTicker
-    volume_acceleration_1h: float | None
-    priority_score: float
 
 
 @dataclass(frozen=True)
@@ -318,13 +298,9 @@ class AltcoinRadarProvider(Protocol):
 
     def ticker_24h(self) -> TimedValue: ...
 
-    def rolling_tickers(
-        self, symbols: Sequence[str], *, window_size: str
-    ) -> TimedValue: ...
+    def klines(self, symbol: str, *, limit: int) -> TimedValue: ...
 
-    def spot_klines(self, symbol: str, *, limit: int) -> TimedValue: ...
-
-    def spot_klines_between(
+    def klines_between(
         self,
         symbol: str,
         *,
@@ -352,6 +328,8 @@ def parse_exchange_symbols(payload: Any) -> tuple[dict[str, str], int]:
             base_asset = str(item["baseAsset"]).upper()
             quote_asset = str(item["quoteAsset"]).upper()
             status = str(item["status"]).upper()
+            contract_type = str(item["contractType"]).upper()
+            underlying_type = str(item["underlyingType"]).upper()
         except (KeyError, TypeError, ValueError):
             malformed += 1
             continue
@@ -360,7 +338,8 @@ def parse_exchange_symbols(payload: Any) -> tuple[dict[str, str], int]:
             or not base_asset
             or quote_asset != "USDT"
             or status != "TRADING"
-            or item.get("isSpotTradingAllowed") is False
+            or contract_type != "PERPETUAL"
+            or underlying_type != "COIN"
         ):
             continue
         parsed[symbol] = base_asset
@@ -429,14 +408,14 @@ def parse_tickers(payload: Any) -> tuple[dict[str, RollingTicker], int]:
     return parsed, malformed
 
 
-def parse_spot_klines(
+def parse_contract_klines(
     payload: Any,
     *,
     completed_at: datetime,
-) -> tuple[tuple[SpotCandle, ...], int]:
+) -> tuple[tuple[ContractCandle, ...], int]:
     if not isinstance(payload, list):
         raise RadarSourceError("RADAR_KLINES_SCHEMA_INVALID")
-    parsed: dict[int, SpotCandle] = {}
+    parsed: dict[int, ContractCandle] = {}
     malformed = 0
     completed_ms = int(completed_at.timestamp() * 1000)
     for row in payload:
@@ -471,7 +450,7 @@ def parse_spot_klines(
         except (OverflowError, TypeError, ValueError):
             malformed += 1
             continue
-        parsed[int(row[0])] = SpotCandle(
+        parsed[int(row[0])] = ContractCandle(
             open_time=open_time,
             close_time=close_time,
             open_price=open_price,
@@ -573,11 +552,20 @@ class BinanceAltcoinRadarClient:
         self._throttle_failures = 0
         self._backoff_lock = threading.Lock()
         self._network_requests = NetworkRequestWindow()
+        self._stop_event: threading.Event | None = None
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise CollectionCancelled("RADAR_COLLECTION_CANCELLED")
 
     def network_request_count(self, *, window_seconds: float = 60) -> int:
         return self._network_requests.count(window_seconds=window_seconds)
 
     def ensure_available(self) -> None:
+        self._raise_if_cancelled()
         with self._backoff_lock:
             if self._backoff_until is not None and self._now() < self._backoff_until:
                 raise RadarSourceError("RADAR_BACKOFF_ACTIVE", throttled=True)
@@ -589,58 +577,35 @@ class BinanceAltcoinRadarClient:
 
     def exchange_symbols(self) -> TimedValue:
         response = self._get_json(
-            BINANCE_SPOT_MARKET_BASE,
-            "/api/v3/exchangeInfo",
-            (("permissions", "SPOT"), ("symbolStatus", "TRADING")),
+            BINANCE_USDM_BASE,
+            "/fapi/v1/exchangeInfo",
+            (),
         )
         value, malformed = parse_exchange_symbols(response.value)
         return TimedValue(value, response.completed_at, malformed)
 
     def ticker_24h(self) -> TimedValue:
         response = self._get_json(
-            BINANCE_SPOT_MARKET_BASE,
-            "/api/v3/ticker/24hr",
-            (("type", "FULL"), ("symbolStatus", "TRADING")),
+            BINANCE_USDM_BASE,
+            "/fapi/v1/ticker/24hr",
+            (),
         )
         value, malformed = parse_tickers(response.value)
         return TimedValue(value, response.completed_at, malformed)
 
-    def rolling_tickers(
-        self, symbols: Sequence[str], *, window_size: str
-    ) -> TimedValue:
-        if not symbols or len(symbols) > MAX_ROLLING_SYMBOLS:
-            raise ValueError("RADAR_ROLLING_BATCH_INVALID")
+    def klines(self, symbol: str, *, limit: int) -> TimedValue:
         response = self._get_json(
-            BINANCE_SPOT_MARKET_BASE,
-            "/api/v3/ticker",
-            (
-                (
-                    "symbols",
-                    json.dumps(
-                        list(symbols), separators=(",", ":"), ensure_ascii=False
-                    ),
-                ),
-                ("windowSize", window_size),
-                ("type", "FULL"),
-                ("symbolStatus", "TRADING"),
-            ),
-        )
-        value, malformed = parse_tickers(response.value)
-        return TimedValue(value, response.completed_at, malformed)
-
-    def spot_klines(self, symbol: str, *, limit: int) -> TimedValue:
-        response = self._get_json(
-            BINANCE_SPOT_MARKET_BASE,
-            "/api/v3/klines",
+            BINANCE_USDM_BASE,
+            "/fapi/v1/klines",
             (("symbol", symbol), ("interval", "5m"), ("limit", str(limit))),
         )
-        value, malformed = parse_spot_klines(
+        value, malformed = parse_contract_klines(
             response.value,
             completed_at=response.completed_at,
         )
         return TimedValue(value, response.completed_at, malformed)
 
-    def spot_klines_between(
+    def klines_between(
         self,
         symbol: str,
         *,
@@ -651,8 +616,8 @@ class BinanceAltcoinRadarClient:
         if limit < 1 or limit > 1000 or end_at <= start_at:
             raise ValueError("RADAR_EVALUATION_RANGE_INVALID")
         response = self._get_json(
-            BINANCE_SPOT_MARKET_BASE,
-            "/api/v3/klines",
+            BINANCE_USDM_BASE,
+            "/fapi/v1/klines",
             (
                 ("symbol", symbol),
                 ("interval", "5m"),
@@ -661,7 +626,7 @@ class BinanceAltcoinRadarClient:
                 ("limit", str(limit)),
             ),
         )
-        value, malformed = parse_spot_klines(
+        value, malformed = parse_contract_klines(
             response.value,
             completed_at=response.completed_at,
         )
@@ -756,7 +721,7 @@ class BinanceAltcoinRadarSettings:
     jitter_seconds: float = 30
     min_quote_volume_24h: Decimal = Decimal("5000000")
     max_candidates: int = 30
-    rolling_batch_size: int = 100
+    max_screened_contracts: int = 240
     kline_limit: int = 48
     workers: int = 6
     timeout_seconds: float = 10
@@ -777,8 +742,8 @@ class BinanceAltcoinRadarSettings:
             raise ValueError("RADAR_MIN_QUOTE_VOLUME_INVALID")
         if not 5 <= self.max_candidates <= 50:
             raise ValueError("RADAR_MAX_CANDIDATES_INVALID")
-        if not 1 <= self.rolling_batch_size <= MAX_ROLLING_SYMBOLS:
-            raise ValueError("RADAR_ROLLING_BATCH_INVALID")
+        if not self.max_candidates <= self.max_screened_contracts <= 500:
+            raise ValueError("RADAR_MAX_SCREENED_CONTRACTS_INVALID")
         if not 30 <= self.kline_limit <= 100:
             raise ValueError("RADAR_KLINE_LIMIT_INVALID")
         if not 1 <= self.workers <= 8:
@@ -793,7 +758,7 @@ class BinanceAltcoinRadarSettings:
             raise ValueError("RADAR_FRESHNESS_INVALID")
 
 
-def analyze_candles(candles: Sequence[SpotCandle]) -> CandleFeatures:
+def analyze_candles(candles: Sequence[ContractCandle]) -> CandleFeatures:
     """Derive closed-candle features without interpolation or synthetic bars."""
 
     ordered = tuple(sorted(candles, key=lambda candle: candle.open_time))
@@ -847,7 +812,7 @@ def analyze_candles(candles: Sequence[SpotCandle]) -> CandleFeatures:
         else None
     )
 
-    def normalized_range(values: Sequence[SpotCandle]) -> float:
+    def normalized_range(values: Sequence[ContractCandle]) -> float:
         return sum(
             (candle.high_price - candle.low_price) / candle.close_price
             for candle in values
@@ -901,34 +866,30 @@ def open_interest_change_15m(
     return _percent_change(recent[-1].value, recent[0].value)
 
 
-def _candidate_priority(ticker_1h: RollingTicker, ticker_24h: RollingTicker) -> float:
-    volume_acceleration = _ratio(
-        ticker_1h.quote_volume,
-        ticker_24h.quote_volume / 24.0,
+def _screening_priority(ticker_24h: RollingTicker) -> float:
+    """Prioritize broad daily anomalies only when the bounded screen must truncate."""
+
+    daily_range_percent = (
+        (ticker_24h.high_price - ticker_24h.low_price)
+        / ticker_24h.open_price
+        * 100.0
     )
-    volume_points = _ramp(volume_acceleration or 0.0, 0.8, 4.0, 38.0)
-    momentum_points = _ramp(ticker_1h.price_change_percent, -0.5, 8.0, 30.0)
-    day_points = _ramp(ticker_24h.price_change_percent, 0.0, 25.0, 12.0)
-    range_points = _ramp(
-        ticker_1h.range_position_percent or 0.0,
-        45.0,
-        90.0,
-        20.0,
+    range_position = ticker_24h.range_position_percent
+    range_extremity = abs(
+        (range_position if range_position is not None else 50.0) - 50.0
     )
-    setup_bonus = (
-        15.0
-        if volume_acceleration is not None
-        and volume_acceleration >= 1.4
-        and -1.0 <= ticker_1h.price_change_percent <= 3.0
-        else 0.0
+    liquidity_scale = math.log10(max(ticker_24h.quote_volume, 1.0))
+    return _bounded(
+        _ramp(abs(ticker_24h.price_change_percent), 0.5, 20.0, 40.0)
+        + _ramp(daily_range_percent, 1.0, 30.0, 30.0)
+        + _ramp(range_extremity, 8.0, 45.0, 20.0)
+        + _ramp(liquidity_scale, 6.5, 9.5, 10.0)
     )
-    return _bounded(volume_points + momentum_points + day_points + range_points + setup_bonus)
 
 
 def select_candidate_seeds(
     symbols: dict[str, str],
     tickers_24h: dict[str, RollingTicker],
-    tickers_1h: dict[str, RollingTicker],
     *,
     min_quote_volume_24h: float,
     maximum: int,
@@ -938,30 +899,21 @@ def select_candidate_seeds(
         if not _eligible_altcoin(base_asset):
             continue
         ticker_24h = tickers_24h.get(symbol)
-        ticker_1h = tickers_1h.get(symbol)
         if (
             ticker_24h is None
-            or ticker_1h is None
             or ticker_24h.quote_volume < min_quote_volume_24h
         ):
             continue
-        volume_acceleration = _ratio(
-            ticker_1h.quote_volume,
-            ticker_24h.quote_volume / 24.0,
-        )
         seeds.append(
             CandidateSeed(
                 symbol=symbol,
                 base_asset=base_asset,
                 ticker_24h=ticker_24h,
-                ticker_1h=ticker_1h,
-                volume_acceleration_1h=volume_acceleration,
-                priority_score=_candidate_priority(ticker_1h, ticker_24h),
             )
         )
     seeds.sort(
         key=lambda seed: (
-            -seed.priority_score,
+            -_screening_priority(seed.ticker_24h),
             -seed.ticker_24h.quote_volume,
             seed.symbol,
         )
@@ -1143,8 +1095,10 @@ def _evidence_label(
 class BinanceAltcoinRadarMonitor:
     monitor_id = "binance-altcoin-radar"
     display_name = "山寨币异动雷达"
+    projection_kind = "altcoin_radar"
+    evaluation_source = EVALUATION_SOURCE
     description = (
-        "Binance 公开现货全市场初筛与候选详查；识别蓄势、启动、加速、"
+        "Binance USDⓈ-M 永续合约全市场初筛与候选详查；识别蓄势、启动、加速、"
         "尾声风险和回落确认。评分是可解释异常证据，不是上涨概率、买卖建议或拉盘定性。"
     )
     default_enabled = False
@@ -1179,7 +1133,6 @@ class BinanceAltcoinRadarMonitor:
                         FilterChoice("EXHAUSTION", "尾声风险"),
                         FilterChoice("COOLDOWN", "回落确认"),
                         FilterChoice("NEUTRAL", "尚未形成"),
-                        FilterChoice("DATA_GAP", "数据不足"),
                     ),
                 ),
             ),
@@ -1264,7 +1217,7 @@ class BinanceAltcoinRadarMonitor:
                     "percent",
                     priority="secondary",
                     description=(
-                        "同名USDⓈ-M合约未平仓量最近15m变化率；"
+                        "该USDⓈ-M永续合约未平仓量最近15m变化率；"
                         "需要连续4个5m OI点，否则保持为空。"
                     ),
                 ),
@@ -1274,8 +1227,8 @@ class BinanceAltcoinRadarMonitor:
                     "percent",
                     priority="secondary",
                     description=(
-                        "同名USDⓈ-M永续合约premiumIndex返回的最近资金费率；"
-                        "没有同名合约或来源未通过校验时保持为空。"
+                        "该USDⓈ-M永续合约premiumIndex返回的最近资金费率；"
+                        "来源未通过校验时保持为空。"
                     ),
                 ),
                 ViewColumn(
@@ -1285,7 +1238,10 @@ class BinanceAltcoinRadarMonitor:
                     priority="secondary",
                     maximum_fraction_digits=0,
                     use_grouping=True,
-                    description="Binance现货滚动24h的USDT计价成交额，用于流动性初筛。",
+                    description=(
+                        "Binance USDⓈ-M永续合约滚动24h的USDT计价成交额，"
+                        "用于流动性初筛。"
+                    ),
                 ),
                 ViewColumn(
                     "review_window_label",
@@ -1336,9 +1292,9 @@ class BinanceAltcoinRadarMonitor:
                     "coverage_label",
                     "本轮扫描",
                     (
-                        "本轮参与初筛的USDT现货数、达到24h流动性门槛的数量，"
-                        "以及实际读取5m K线详查的候选数量。该信息属于整轮采集，"
-                        "不在每个币种行内重复。"
+                        "本轮参与初筛的USDT永续合约数、达到24h流动性门槛的数量、"
+                        "实际完成5m K线分析的数量以及最终展示数量。该信息属于整轮采集，"
+                        "不在每个合约行内重复。"
                     ),
                 ),
             ),
@@ -1346,7 +1302,8 @@ class BinanceAltcoinRadarMonitor:
                 title="后续行情检验",
                 method_note=(
                     "阶段首次出现、发生变化或连续4小时未复建样本时，固定记录信号"
-                    "截止价，并在15分钟、1小时、4小时后用闭合5m K线检验。"
+                    "截止价，并在15分钟、1小时、4小时后用同一USDⓈ-M合约的闭合"
+                    "5m K线检验。"
                     "方向一致要求绝对方向正确且相对BTC超出±0.5个百分点；"
                     "该带宽是暂定噪声区间，不含手续费、滑点或可成交性。"
                     "每个阶段×期限完成少于30例时只显示样本积累，不报告一致率。"
@@ -1360,6 +1317,11 @@ class BinanceAltcoinRadarMonitor:
         if not callable(counter):
             return None
         return int(counter(window_seconds=window_seconds))
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        binder = getattr(self.client, "bind_stop_event", None)
+        if callable(binder):
+            binder(stop_event)
 
     def collect(self) -> CollectionBatch:
         try:
@@ -1415,39 +1377,13 @@ class BinanceAltcoinRadarMonitor:
                 ),
             )
 
-        tickers_1h: dict[str, RollingTicker] = {}
-        rolling_batches = rolling_symbol_batches(
-            liquid_symbols, self.settings.rolling_batch_size
-        )
-        for batch_number, batch_symbols in enumerate(rolling_batches, start=1):
-            scope = f"ticker-1h:{batch_number}"
-            try:
-                result = self.client.rolling_tickers(
-                    batch_symbols,
-                    window_size="1h",
-                )
-                self._append_malformed_issue(issues, scope, result)
-                tickers_1h.update(
-                    self._fresh_tickers(
-                        dict(result.value),
-                        observed_at=result.completed_at,
-                        scope=scope,
-                        issues=issues,
-                    )
-                )
-            except RadarSourceError as exc:
-                issues.append(CollectionIssue(scope, exc.reason_code))
-                if exc.throttled:
-                    break
-
-        seeds = select_candidate_seeds(
+        screening_seeds = select_candidate_seeds(
             symbols,
             tickers_24h,
-            tickers_1h,
             min_quote_volume_24h=float(self.settings.min_quote_volume_24h),
-            maximum=self.settings.max_candidates,
+            maximum=self.settings.max_screened_contracts,
         )
-        if not seeds:
+        if not screening_seeds:
             return CollectionBatch(
                 samples=(),
                 issues=tuple(
@@ -1458,7 +1394,7 @@ class BinanceAltcoinRadarMonitor:
 
         benchmark_features: CandleFeatures | None = None
         try:
-            benchmark = self.client.spot_klines(
+            benchmark = self.client.klines(
                 "BTCUSDT", limit=self.settings.kline_limit
             )
             benchmark_features = self._validated_features("BTCUSDT", benchmark)
@@ -1478,18 +1414,24 @@ class BinanceAltcoinRadarMonitor:
         except RadarSourceError as exc:
             issues.append(CollectionIssue("futures", exc.reason_code))
 
-        enrichments: list[CandidateEnrichment] = []
+        screened: list[CandidateEnrichment] = []
         with ThreadPoolExecutor(max_workers=self.settings.workers) as pool:
             futures = {
-                pool.submit(self._enrich, seed, funding_contexts.get(seed.symbol)): seed
-                for seed in seeds
+                pool.submit(
+                    self._screen_candidate,
+                    seed,
+                    funding_contexts.get(seed.symbol),
+                ): seed
+                for seed in screening_seeds
             }
             for future in as_completed(futures):
                 seed = futures[future]
                 try:
-                    enrichments.append(future.result())
+                    screened.append(future.result())
+                except CollectionCancelled:
+                    raise
                 except Exception:
-                    enrichments.append(
+                    screened.append(
                         CandidateEnrichment(
                             seed=seed,
                             features=None,
@@ -1502,8 +1444,59 @@ class BinanceAltcoinRadarMonitor:
                                 ),
                             ),
                             missing_reason=(
-                                "候选详查发生未分类失败；未生成阶段或评分，"
+                                "合约K线分析发生未分类失败；未生成阶段或评分，"
                                 "也未使用替代值。"
+                            ),
+                        )
+                    )
+
+        for enrichment in screened:
+            issues.extend(enrichment.issues)
+        analyzed = [
+            enrichment
+            for enrichment in screened
+            if enrichment.features is not None
+        ]
+        if not analyzed:
+            return CollectionBatch(
+                samples=(),
+                issues=tuple(
+                    issues
+                    or [CollectionIssue("universe", "RADAR_NO_CANDIDATES")]
+                ),
+            )
+        analyzed.sort(
+            key=lambda enrichment: self._candidate_sort_key(
+                enrichment,
+                benchmark_features=benchmark_features,
+            )
+        )
+        shortlist = analyzed[: self.settings.max_candidates]
+
+        enrichments: list[CandidateEnrichment] = []
+        with ThreadPoolExecutor(max_workers=self.settings.workers) as pool:
+            futures = {
+                pool.submit(self._enrich_open_interest, enrichment): enrichment
+                for enrichment in shortlist
+            }
+            for future in as_completed(futures):
+                enrichment = futures[future]
+                try:
+                    enrichments.append(future.result())
+                except CollectionCancelled:
+                    raise
+                except Exception:
+                    enrichments.append(
+                        CandidateEnrichment(
+                            seed=enrichment.seed,
+                            features=enrichment.features,
+                            funding=enrichment.funding,
+                            oi_change_15m_percent=None,
+                            issues=(
+                                CollectionIssue(
+                                    enrichment.seed.symbol,
+                                    "RADAR_OI_COLLECTION_FAILED",
+                                ),
                             ),
                         )
                     )
@@ -1512,17 +1505,6 @@ class BinanceAltcoinRadarMonitor:
         samples: list[MetricSample] = []
         for enrichment in enrichments:
             issues.extend(enrichment.issues)
-            if enrichment.features is None:
-                samples.append(
-                    self._missing_sample(
-                        enrichment,
-                        observed_at=observed_at,
-                        universe_size=len(symbols),
-                        liquid_size=len(liquid_symbols),
-                        shortlist_size=len(seeds),
-                    )
-                )
-                continue
             samples.append(
                 self._sample(
                     enrichment,
@@ -1530,7 +1512,9 @@ class BinanceAltcoinRadarMonitor:
                     observed_at=observed_at,
                     universe_size=len(symbols),
                     liquid_size=len(liquid_symbols),
-                    shortlist_size=len(seeds),
+                    screened_size=len(screening_seeds),
+                    analyzed_size=len(analyzed),
+                    shortlist_size=len(shortlist),
                 )
             )
 
@@ -1583,6 +1567,7 @@ class BinanceAltcoinRadarMonitor:
             for evaluation in self.evaluation_store.latest_forward_evaluations_by_entity(
                 self.monitor_id,
                 entity_keys,
+                source=self.evaluation_source,
             )
         }
         cases: list[ForwardEvaluationCase] = []
@@ -1595,6 +1580,7 @@ class BinanceAltcoinRadarMonitor:
             previous_stage = (
                 str(previous_sample.payload.get("stage"))
                 if previous_sample is not None
+                and previous_sample.payload.get("market_scope") == MARKET_SCOPE
                 else None
             )
             previous_evaluation = previous_evaluations.get(sample.entity_key)
@@ -1625,7 +1611,7 @@ class BinanceAltcoinRadarMonitor:
                         benchmark_entry_price_text=str(
                             sample.payload["benchmark_close_price"]
                         ),
-                        source="BINANCE_SPOT_PUBLIC_CLOSED_5M_KLINES",
+                        source=self.evaluation_source,
                     )
                 )
         return tuple(cases)
@@ -1641,10 +1627,26 @@ class BinanceAltcoinRadarMonitor:
         pending = tuple(cases)
         if not pending:
             return ()
+        incompatible = tuple(
+            case for case in pending if case.source != self.evaluation_source
+        )
+        pending = tuple(
+            case for case in pending if case.source == self.evaluation_source
+        )
+        resolved: list[ForwardEvaluationResult] = [
+            self._unavailable_evaluation(
+                case,
+                now=now,
+                reason_code="RADAR_EVALUATION_MARKET_SCOPE_CHANGED",
+            )
+            for case in incompatible
+        ]
+        if not pending:
+            return tuple(resolved)
         earliest = min(case.source_cutoff_at for case in pending)
         latest = max(case.due_at for case in pending)
         try:
-            benchmark_result = self.client.spot_klines_between(
+            benchmark_result = self.client.klines_between(
                 "BTCUSDT",
                 start_at=earliest,
                 end_at=latest,
@@ -1657,21 +1659,21 @@ class BinanceAltcoinRadarMonitor:
                 if isinstance(exc, RadarSourceError)
                 else "RADAR_EVALUATION_RANGE_INVALID"
             )
-            return tuple(
+            resolved.extend(
                 self._unavailable_evaluation(case, now=now, reason_code=reason)
                 for case in pending
                 if now >= case.due_at + EVALUATION_GRACE
             )
+            return tuple(resolved)
 
         by_entity: dict[str, list[ForwardEvaluationCase]] = {}
         for case in pending:
             by_entity.setdefault(case.entity_key, []).append(case)
-        resolved: list[ForwardEvaluationResult] = []
         for entity_key, entity_cases in by_entity.items():
             entity_start = min(case.source_cutoff_at for case in entity_cases)
             entity_end = max(case.due_at for case in entity_cases)
             try:
-                asset_result = self.client.spot_klines_between(
+                asset_result = self.client.klines_between(
                     entity_key,
                     start_at=entity_start,
                     end_at=entity_end,
@@ -1716,8 +1718,8 @@ class BinanceAltcoinRadarMonitor:
     @staticmethod
     def _evaluation_window(
         case: ForwardEvaluationCase,
-        candles: Sequence[SpotCandle],
-    ) -> tuple[SpotCandle, ...] | None:
+        candles: Sequence[ContractCandle],
+    ) -> tuple[ContractCandle, ...] | None:
         expected = case.horizon_minutes // KLINE_INTERVAL_MINUTES
         selected = tuple(
             candle
@@ -1746,8 +1748,8 @@ class BinanceAltcoinRadarMonitor:
         self,
         case: ForwardEvaluationCase,
         *,
-        asset_candles: Sequence[SpotCandle],
-        benchmark_candles: Sequence[SpotCandle],
+        asset_candles: Sequence[ContractCandle],
+        benchmark_candles: Sequence[ContractCandle],
         now: datetime,
     ) -> ForwardEvaluationResult | None:
         asset_window = self._evaluation_window(case, asset_candles)
@@ -1905,14 +1907,14 @@ class BinanceAltcoinRadarMonitor:
             raise RadarSourceError("RADAR_KLINES_STALE")
         return features
 
-    def _enrich(
+    def _screen_candidate(
         self,
         seed: CandidateSeed,
         funding: FundingContext | None,
     ) -> CandidateEnrichment:
         issues: list[CollectionIssue] = []
         try:
-            candles = self.client.spot_klines(
+            candles = self.client.klines(
                 seed.symbol, limit=self.settings.kline_limit
             )
             features = self._validated_features(seed.symbol, candles)
@@ -1925,31 +1927,83 @@ class BinanceAltcoinRadarMonitor:
                 oi_change_15m_percent=None,
                 issues=(CollectionIssue(seed.symbol, exc.reason_code),),
                 missing_reason=(
-                    "该候选没有连续、新鲜且通过校验的 5m 闭合 K 线；"
+                    "该合约没有连续、新鲜且通过校验的5m闭合K线；"
                     "未生成阶段或评分，也未使用旧值或替代值。"
                 ),
             )
-
-        oi_change: float | None = None
-        if funding is not None:
-            try:
-                oi = self.client.open_interest_history(seed.symbol, limit=6)
-                points = tuple(oi.value)
-                if not points:
-                    raise RadarSourceError("RADAR_OI_EMPTY")
-                age = (oi.completed_at - points[-1].source_time).total_seconds()
-                if age < -120 or age > self.settings.futures_stale_seconds:
-                    raise RadarSourceError("RADAR_OI_STALE")
-                oi_change = open_interest_change_15m(points)
-                if oi_change is None:
-                    raise RadarSourceError("RADAR_OI_INSUFFICIENT")
-                self._append_malformed_issue(issues, seed.symbol, oi)
-            except RadarSourceError as exc:
-                issues.append(CollectionIssue(seed.symbol, exc.reason_code))
         return CandidateEnrichment(
             seed=seed,
             features=features,
             funding=funding,
+            oi_change_15m_percent=None,
+            issues=tuple(issues),
+        )
+
+    def _candidate_sort_key(
+        self,
+        enrichment: CandidateEnrichment,
+        *,
+        benchmark_features: CandleFeatures | None,
+    ) -> tuple[float, float, float, str]:
+        features = enrichment.features
+        if features is None:
+            return (math.inf, math.inf, math.inf, enrichment.seed.symbol)
+        benchmark_return = (
+            benchmark_features.return_15m_percent
+            if benchmark_features is not None
+            else None
+        )
+        relative_return = (
+            features.return_15m_percent - benchmark_return
+            if benchmark_return is not None
+            else None
+        )
+        funding_rate = (
+            enrichment.funding.funding_rate_percent
+            if enrichment.funding is not None
+            else None
+        )
+        scoring = score_candidate(
+            features,
+            return_24h_percent=enrichment.seed.ticker_24h.price_change_percent,
+            relative_return_15m_percent=relative_return,
+            funding_rate_percent=funding_rate,
+            oi_change_15m_percent=None,
+        )
+        return (
+            -float(scoring["alert_score"]),
+            -abs(features.return_15m_percent),
+            -enrichment.seed.ticker_24h.quote_volume,
+            enrichment.seed.symbol,
+        )
+
+    def _enrich_open_interest(
+        self,
+        enrichment: CandidateEnrichment,
+    ) -> CandidateEnrichment:
+        issues: list[CollectionIssue] = []
+        oi_change: float | None = None
+        try:
+            oi = self.client.open_interest_history(
+                enrichment.seed.symbol,
+                limit=6,
+            )
+            points = tuple(oi.value)
+            if not points:
+                raise RadarSourceError("RADAR_OI_EMPTY")
+            age = (oi.completed_at - points[-1].source_time).total_seconds()
+            if age < -120 or age > self.settings.futures_stale_seconds:
+                raise RadarSourceError("RADAR_OI_STALE")
+            oi_change = open_interest_change_15m(points)
+            if oi_change is None:
+                raise RadarSourceError("RADAR_OI_INSUFFICIENT")
+            self._append_malformed_issue(issues, enrichment.seed.symbol, oi)
+        except RadarSourceError as exc:
+            issues.append(CollectionIssue(enrichment.seed.symbol, exc.reason_code))
+        return CandidateEnrichment(
+            seed=enrichment.seed,
+            features=enrichment.features,
+            funding=enrichment.funding,
             oi_change_15m_percent=oi_change,
             issues=tuple(issues),
         )
@@ -1961,6 +2015,8 @@ class BinanceAltcoinRadarMonitor:
         observed_at: datetime,
         universe_size: int,
         liquid_size: int,
+        screened_size: int,
+        analyzed_size: int,
         shortlist_size: int,
     ) -> dict[str, Any]:
         seed = enrichment.seed
@@ -1970,22 +2026,38 @@ class BinanceAltcoinRadarMonitor:
             "series_label": f"{seed.symbol} · 异动强度",
             "observed_at": iso_utc(observed_at),
             "ticker_24h_close_at": iso_utc(seed.ticker_24h.close_time),
-            "ticker_1h_close_at": iso_utc(seed.ticker_1h.close_time),
-            "return_1h_percent": _float_text(seed.ticker_1h.price_change_percent),
+            "ticker_1h_close_at": (
+                iso_utc(enrichment.features.cutoff_at)
+                if enrichment.features is not None
+                else None
+            ),
+            "return_1h_percent": (
+                _float_text(enrichment.features.return_1h_percent)
+                if enrichment.features is not None
+                else None
+            ),
             "return_24h_percent": _float_text(seed.ticker_24h.price_change_percent),
-            "volume_acceleration_1h": _float_text(seed.volume_acceleration_1h),
             "quote_volume_24h": _float_text(seed.ticker_24h.quote_volume, 2),
             "universe_size": universe_size,
             "liquid_universe_size": liquid_size,
+            "screened_contract_size": screened_size,
+            "analyzed_contract_size": analyzed_size,
             "shortlist_size": shortlist_size,
-            "data_scope_label": (
-                "现货 + 合约" if enrichment.funding is not None else "仅现货"
-            ),
+            "market_scope": MARKET_SCOPE,
+            "data_scope_label": "USDⓈ-M 永续合约",
             "coverage_label": (
-                f"全市场 {universe_size} 个 USDT 现货初筛（已排除内置名单）；"
-                f"{liquid_size} 个达到流动性阈值；详查 {shortlist_size} 个。"
+                f"全市场 {universe_size} 个 USDT 永续合约初筛"
+                "（已排除 BTC、稳定币、指数及内置名单）；"
+                f"{liquid_size} 个达到流动性阈值；"
+                f"{screened_size} 个读取5m K线，{analyzed_size} 个完成分析；"
+                f"展示 {shortlist_size} 个。"
+                + (
+                    " K线分析按24h异动与流动性排序达到本轮上限。"
+                    if screened_size < liquid_size
+                    else ""
+                )
             ),
-            "source": "BINANCE_SPOT_AND_USDM_PUBLIC_MARKET_DATA",
+            "source": "BINANCE_USDM_PUBLIC_MARKET_DATA",
             "interpretation_limit": (
                 "阶段与 0–100 分值是规则化异常证据，不是上涨概率、"
                 "拉盘主体定性、买卖建议或自动交易输入。"
@@ -1997,57 +2069,6 @@ class BinanceAltcoinRadarMonitor:
             ),
         }
 
-    def _missing_sample(
-        self,
-        enrichment: CandidateEnrichment,
-        *,
-        observed_at: datetime,
-        universe_size: int,
-        liquid_size: int,
-        shortlist_size: int,
-    ) -> MetricSample:
-        reason = enrichment.missing_reason or (
-            "候选详查未取得通过校验的结果；未生成阶段或评分，"
-            "也未使用替代值。"
-        )
-        missing_fields = (
-            "alert_score",
-            "valid_until",
-            "return_15m_percent",
-            "quote_volume_ratio_15m",
-            "taker_buy_percent",
-            "tail_risk_score",
-            "relative_return_15m_percent",
-            "oi_change_15m_percent",
-            "funding_rate_percent",
-            "data_cutoff_at",
-            "close_price",
-            "benchmark_close_price",
-        )
-        return MetricSample(
-            series_key=f"{enrichment.seed.symbol}|alert-score",
-            entity_key=enrichment.seed.symbol,
-            observed_at=observed_at,
-            value_text="",
-            unit="RADAR_SCORE",
-            payload={
-                **self._base_payload(
-                    enrichment,
-                    observed_at=observed_at,
-                    universe_size=universe_size,
-                    liquid_size=liquid_size,
-                    shortlist_size=shortlist_size,
-                ),
-                "stage": "DATA_GAP",
-                "stage_label": STAGE_LABELS["DATA_GAP"],
-                "row_tone": STAGE_TONES["DATA_GAP"],
-                "evidence_label": "候选详查数据不足",
-                "review_window_label": STAGE_REVIEW_LABELS["DATA_GAP"],
-                **{field: None for field in missing_fields},
-                "missing_reasons": {field: reason for field in missing_fields},
-            },
-        )
-
     def _sample(
         self,
         enrichment: CandidateEnrichment,
@@ -2056,6 +2077,8 @@ class BinanceAltcoinRadarMonitor:
         observed_at: datetime,
         universe_size: int,
         liquid_size: int,
+        screened_size: int,
+        analyzed_size: int,
         shortlist_size: int,
     ) -> MetricSample:
         features = enrichment.features
@@ -2095,8 +2118,7 @@ class BinanceAltcoinRadarMonitor:
             )
         if funding_rate is None:
             missing_reasons["funding_rate_percent"] = (
-                "未取得该现货的同名 USDⓈ-M 永续合约，"
-                "或本轮合约来源未返回通过校验的结果。"
+                "本轮该USDⓈ-M永续合约的资金费率来源未返回通过校验的结果。"
             )
         if enrichment.oi_change_15m_percent is None:
             missing_reasons["oi_change_15m_percent"] = (
@@ -2110,6 +2132,8 @@ class BinanceAltcoinRadarMonitor:
                 observed_at=observed_at,
                 universe_size=universe_size,
                 liquid_size=liquid_size,
+                screened_size=screened_size,
+                analyzed_size=analyzed_size,
                 shortlist_size=shortlist_size,
             ),
             "stage": stage,
@@ -2159,7 +2183,7 @@ class BinanceAltcoinRadarMonitor:
             "missing_reasons": missing_reasons,
         }
         return MetricSample(
-            series_key=f"{enrichment.seed.symbol}|alert-score",
+            series_key=f"{enrichment.seed.symbol}|usdm-perpetual-alert-score",
             entity_key=enrichment.seed.symbol,
             observed_at=observed_at,
             value_text=f"{alert_score:.3f}",

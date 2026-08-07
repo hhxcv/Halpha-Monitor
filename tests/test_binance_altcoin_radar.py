@@ -10,16 +10,17 @@ from halpha_monitor.monitors.binance_altcoin_radar import (
     BinanceAltcoinRadarMonitor,
     BinanceAltcoinRadarSettings,
     CandleFeatures,
+    ContractCandle,
+    EVALUATION_SOURCE,
     FundingContext,
     OpenInterestPoint,
     RadarSourceError,
     RollingTicker,
-    SpotCandle,
     TimedValue,
     open_interest_change_15m,
-    parse_spot_klines,
+    parse_contract_klines,
+    parse_exchange_symbols,
     parse_tickers,
-    rolling_symbol_batches,
     score_candidate,
     select_candidate_seeds,
 )
@@ -51,8 +52,8 @@ def ticker(
     )
 
 
-def candles(*, accelerating: bool = False) -> tuple[SpotCandle, ...]:
-    values: list[SpotCandle] = []
+def candles(*, accelerating: bool = False) -> tuple[ContractCandle, ...]:
+    values: list[ContractCandle] = []
     start = NOW - timedelta(minutes=48 * 5)
     previous_close = 100.0
     for index in range(48):
@@ -66,7 +67,7 @@ def candles(*, accelerating: bool = False) -> tuple[SpotCandle, ...]:
             taker_share = 0.72
         close = previous_close * multiplier
         values.append(
-            SpotCandle(
+            ContractCandle(
                 open_time=open_time,
                 close_time=open_time + timedelta(minutes=5) - timedelta(milliseconds=1),
                 open_price=previous_close,
@@ -87,13 +88,13 @@ def future_candles(
     *,
     entry_price: float,
     closes: tuple[float, ...],
-) -> tuple[SpotCandle, ...]:
-    values: list[SpotCandle] = []
+) -> tuple[ContractCandle, ...]:
+    values: list[ContractCandle] = []
     previous = entry_price
     for index, close in enumerate(closes):
         open_time = cutoff_at + timedelta(milliseconds=1, minutes=index * 5)
         values.append(
-            SpotCandle(
+            ContractCandle(
                 open_time=open_time,
                 close_time=open_time + timedelta(minutes=5) - timedelta(milliseconds=1),
                 open_price=previous,
@@ -109,7 +110,7 @@ def future_candles(
     return tuple(values)
 
 
-def test_parse_spot_klines_uses_only_closed_valid_rows() -> None:
+def test_parse_contract_klines_uses_only_closed_valid_rows() -> None:
     completed = datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
     closed_at = int(datetime(2026, 8, 6, 11, 59, 59, tzinfo=UTC).timestamp() * 1000)
     future_at = int(datetime(2026, 8, 6, 12, 4, 59, tzinfo=UTC).timestamp() * 1000)
@@ -145,7 +146,7 @@ def test_parse_spot_klines_uses_only_closed_valid_rows() -> None:
         ["malformed"],
     ]
 
-    parsed, malformed = parse_spot_klines(rows, completed_at=completed)
+    parsed, malformed = parse_contract_klines(rows, completed_at=completed)
 
     assert len(parsed) == 1
     assert parsed[0].close_price == 1.5
@@ -182,10 +183,40 @@ def test_parse_tickers_ignores_a_trading_market_with_no_trades() -> None:
     assert malformed == 0
 
 
-def test_rolling_batches_isolate_non_ascii_symbols() -> None:
-    assert rolling_symbol_batches(
-        ("AAAUSDT", "币安人生USDT", "BBBUSDT"), 100
-    ) == (("AAAUSDT", "BBBUSDT"), ("币安人生USDT",))
+def test_exchange_symbols_keeps_only_coin_backed_usdt_perpetuals() -> None:
+    parsed, malformed = parse_exchange_symbols(
+        {
+            "symbols": [
+                {
+                    "symbol": "FUTURESONLYUSDT",
+                    "baseAsset": "FUTURESONLY",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "underlyingType": "COIN",
+                },
+                {
+                    "symbol": "QUARTERUSDT",
+                    "baseAsset": "QUARTER",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                    "contractType": "CURRENT_QUARTER",
+                    "underlyingType": "COIN",
+                },
+                {
+                    "symbol": "INDEXUSDT",
+                    "baseAsset": "INDEX",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "underlyingType": "INDEX",
+                },
+            ]
+        }
+    )
+
+    assert parsed == {"FUTURESONLYUSDT": "FUTURESONLY"}
+    assert malformed == 0
 
 
 def test_http_throttle_backoff_is_bounded_and_recovers() -> None:
@@ -338,15 +369,9 @@ def test_candidate_selection_excludes_btc_stables_and_leveraged_tokens() -> None
         symbol: ticker(symbol, change=10, quote_volume=20_000_000)
         for symbol in symbols
     }
-    hour = {
-        symbol: ticker(symbol, change=3, quote_volume=3_000_000)
-        for symbol in symbols
-    }
-
     selected = select_candidate_seeds(
         symbols,
         day,
-        hour,
         min_quote_volume_24h=5_000_000,
         maximum=5,
     )
@@ -393,17 +418,7 @@ class FakeProvider:
             NOW,
         )
 
-    def rolling_tickers(self, symbols, *, window_size):  # type: ignore[no-untyped-def]
-        assert window_size == "1h"
-        return TimedValue(
-            {
-                symbol: ticker(symbol, change=5, quote_volume=4_000_000)
-                for symbol in symbols
-            },
-            NOW,
-        )
-
-    def spot_klines(self, symbol: str, *, limit: int) -> TimedValue:
+    def klines(self, symbol: str, *, limit: int) -> TimedValue:
         assert limit == 48
         if symbol == "BBBUSDT":
             raise RadarSourceError("RADAR_KLINES_STALE")
@@ -436,7 +451,7 @@ class FakeProvider:
         )
 
 
-def test_monitor_keeps_failed_candidate_explicit_and_preserves_valid_rows() -> None:
+def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
     provider = FakeProvider()
     monitor = BinanceAltcoinRadarMonitor(
         BinanceAltcoinRadarSettings(
@@ -450,13 +465,21 @@ def test_monitor_keeps_failed_candidate_explicit_and_preserves_valid_rows() -> N
     batch = monitor.collect()
 
     by_symbol = {sample.entity_key: sample for sample in batch.samples}
-    assert set(by_symbol) == {"AAAUSDT", "BBBUSDT"}
+    assert set(by_symbol) == {"AAAUSDT"}
     assert by_symbol["AAAUSDT"].value_text
     assert by_symbol["AAAUSDT"].payload["universe_size"] == 2
     assert by_symbol["AAAUSDT"].payload["onchain_state"] == (
         "NOT_INCLUDED_IN_MARKET_SCORE"
     )
-    assert by_symbol["AAAUSDT"].payload["data_scope_label"] == "现货 + 合约"
+    assert by_symbol["AAAUSDT"].payload["data_scope_label"] == (
+        "USDⓈ-M 永续合约"
+    )
+    assert by_symbol["AAAUSDT"].payload["market_scope"] == "USDM_PERPETUAL"
+    assert by_symbol["AAAUSDT"].payload["screened_contract_size"] == 2
+    assert by_symbol["AAAUSDT"].payload["analyzed_contract_size"] == 1
+    assert by_symbol["AAAUSDT"].series_key.endswith(
+        "|usdm-perpetual-alert-score"
+    )
     cutoff_at = datetime.fromisoformat(
         by_symbol["AAAUSDT"].payload["data_cutoff_at"].replace("Z", "+00:00")
     )
@@ -469,13 +492,6 @@ def test_monitor_keeps_failed_candidate_explicit_and_preserves_valid_rows() -> N
     )
     assert "evidence_strength" not in by_symbol["AAAUSDT"].payload
     assert "evidence_strength_label" not in by_symbol["AAAUSDT"].payload
-    assert by_symbol["BBBUSDT"].value_text == ""
-    assert by_symbol["BBBUSDT"].payload["stage"] == "DATA_GAP"
-    assert by_symbol["BBBUSDT"].payload["data_scope_label"] == "仅现货"
-    assert by_symbol["BBBUSDT"].payload["valid_until"] is None
-    assert by_symbol["BBBUSDT"].payload["review_window_label"] == "不可判断"
-    assert "evidence_strength" not in by_symbol["BBBUSDT"].payload
-    assert "evidence_strength_label" not in by_symbol["BBBUSDT"].payload
     assert any(
         issue.scope == "BBBUSDT" and issue.reason_code == "RADAR_KLINES_STALE"
         for issue in batch.issues
@@ -527,7 +543,7 @@ def test_monitor_keeps_failed_candidate_explicit_and_preserves_valid_rows() -> N
     assert monitor.view.show_description is False
     assert monitor.view.method_note is not None
     assert "不是期望盈利持仓期" in monitor.view.method_note
-    assert any(
+    assert not any(
         choice.value == "DATA_GAP"
         for choice in monitor.view.filters[0].choices
     )
@@ -562,7 +578,7 @@ def test_monitor_freezes_one_three_horizon_case_set_per_stage_episode(
 
 def test_due_case_uses_closed_asset_and_btc_candles_for_forward_result() -> None:
     class EvaluatingProvider(FakeProvider):
-        def spot_klines_between(
+        def klines_between(
             self,
             symbol: str,
             *,
@@ -598,7 +614,7 @@ def test_due_case_uses_closed_asset_and_btc_candles_for_forward_result() -> None
         due_at=cutoff + timedelta(minutes=15),
         entry_price_text="10",
         benchmark_entry_price_text="100",
-        source="BINANCE_SPOT_PUBLIC_CLOSED_5M_KLINES",
+        source=EVALUATION_SOURCE,
     )
     monitor = BinanceAltcoinRadarMonitor(
         BinanceAltcoinRadarSettings(max_candidates=5),
@@ -619,10 +635,10 @@ def test_due_case_uses_closed_asset_and_btc_candles_for_forward_result() -> None
 
 def test_partial_throttle_does_not_clear_shared_backoff() -> None:
     class PartiallyThrottledProvider(FakeProvider):
-        def spot_klines(self, symbol: str, *, limit: int) -> TimedValue:
+        def klines(self, symbol: str, *, limit: int) -> TimedValue:
             if symbol == "BBBUSDT":
                 raise RadarSourceError("RADAR_HTTP_THROTTLED_429", throttled=True)
-            return super().spot_klines(symbol, limit=limit)
+            return super().klines(symbol, limit=limit)
 
     provider = PartiallyThrottledProvider()
     monitor = BinanceAltcoinRadarMonitor(

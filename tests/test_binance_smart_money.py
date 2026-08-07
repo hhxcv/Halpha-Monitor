@@ -26,6 +26,13 @@ from halpha_monitor.monitors.binance_smart_money import (
 NOW = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
 
 
+def test_settings_bound_cli_symbol_fanout() -> None:
+    with pytest.raises(ValueError, match="SMART_MONEY_SYMBOLS_INVALID"):
+        BinanceSmartMoneySettings(
+            symbols=tuple(f"ASSET{index}USDT" for index in range(21))
+        )
+
+
 def timestamp(value: datetime) -> int:
     return int(value.timestamp() * 1000)
 

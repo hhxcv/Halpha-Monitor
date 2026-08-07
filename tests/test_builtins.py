@@ -1,9 +1,43 @@
 from decimal import Decimal
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from halpha_monitor.__main__ import build_parser, default_database_path
 from halpha_monitor.monitors import register_builtin_monitors
 from halpha_monitor.service import MONITOR_ID_PATTERN, MonitorRegistry
 from halpha_monitor.store import SQLiteMonitorStore
+
+
+def test_package_defaults_openblas_to_one_thread_but_respects_override() -> None:
+    command = [
+        sys.executable,
+        "-c",
+        "import os; import halpha_monitor; print(os.environ['OPENBLAS_NUM_THREADS'])",
+    ]
+    environment = os.environ.copy()
+    environment.pop("OPENBLAS_NUM_THREADS", None)
+    environment["PYTHONPATH"] = str(Path.cwd() / "src")
+
+    defaulted = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    environment["OPENBLAS_NUM_THREADS"] = "3"
+    overridden = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert defaulted.stdout.strip() == "1"
+    assert overridden.stdout.strip() == "3"
 
 
 def test_database_path_prefers_explicit_environment_override(
@@ -57,8 +91,17 @@ def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> 
         "binance-usdm-smart-money",
         "binance-altcoin-radar",
         "binance-btc-relationship",
+        "a-hk-buyback",
+        "market-event-calendar",
     )
-    c2c, smart_money, altcoin_radar, btc_relationship = registry.all()
+    (
+        c2c,
+        smart_money,
+        altcoin_radar,
+        btc_relationship,
+        buyback,
+        market_events,
+    ) = registry.all()
     assert c2c.settings.assets == ("USDT", "BTC")
     assert c2c.settings.target_fiat == Decimal("2500")
     assert smart_money.settings.symbols == ("BTCUSDT", "ETHUSDT")
@@ -68,6 +111,14 @@ def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> 
         btc_relationship.settings.cache_root
         == tmp_path / "cache" / "btc-relationship"
     )
+    assert buyback.default_enabled is False
+    assert buyback.settings.lookback_days == 7
+    assert buyback.settings.max_documents_per_run == 20
+    assert market_events.default_enabled is True
+    assert market_events.settings.lookahead_days == 60
+    assert market_events.interval_seconds == 21600
+    assert args.buyback_retention_days == 1095
+    assert args.buyback_evidence_max_mib == 2048
 
 
 def test_builtin_monitors_conform_to_shared_view_contract(tmp_path) -> None:

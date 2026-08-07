@@ -13,6 +13,7 @@ from halpha_monitor.monitors.binance_btc_relationship import (
     BinanceBtcRelationshipSettings,
     BinanceSpotDailyClient,
     DailySeriesResult,
+    MAX_KLINE_RESPONSE_BYTES,
     _price_series,
     analyze_pair,
     normalize_klines,
@@ -94,6 +95,39 @@ class ConcurrentThrottledOpenUrl(ThrottledOpenUrl):
             hdrs={"Retry-After": self.retry_after},
             fp=io.BytesIO(b'{"code":-1003,"msg":"rate limited"}'),
         )
+
+
+class OversizedResponse:
+    def __init__(self) -> None:
+        self.read_sizes: list[int] = []
+
+    def __enter__(self) -> "OversizedResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        return b"x" * size
+
+
+def test_spot_client_bounds_each_kline_response_read(tmp_path: Path) -> None:
+    response = OversizedResponse()
+    client = BinanceSpotDailyClient(
+        tmp_path,
+        attempts=1,
+        open_url=lambda *_args, **_kwargs: response,
+    )
+
+    result = client.fetch(
+        "BTCUSDT",
+        datetime(2026, 8, 4, tzinfo=UTC) - timedelta(milliseconds=1),
+    )
+
+    assert response.read_sizes == [MAX_KLINE_RESPONSE_BYTES + 1]
+    assert result.status == "FAILED"
+    assert result.reason_code == "BTC_RELATIONSHIP_RESPONSE_TOO_LARGE"
 
 
 def test_normalize_klines_keeps_only_valid_closed_rows() -> None:

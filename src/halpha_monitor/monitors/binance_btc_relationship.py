@@ -22,6 +22,7 @@ import pandas as pd
 
 from halpha_monitor.contracts import (
     CollectionBatch,
+    CollectionCancelled,
     CollectionIssue,
     MetricSample,
     MonitorView,
@@ -37,6 +38,7 @@ from halpha_monitor.telemetry import NetworkRequestWindow
 
 
 BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
+MAX_KLINE_RESPONSE_BYTES = 4 * 1024 * 1024
 REFERENCE_SYMBOL = "BTCUSDT"
 DAY_MS = 86_400_000
 FETCH_DAYS = 800
@@ -179,6 +181,14 @@ class BinanceSpotDailyClient:
         self._throttle_until = 0.0
         self._throttle_failures = 0
         self._network_requests = NetworkRequestWindow(monotonic=monotonic)
+        self._stop_event: threading.Event | None = None
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise CollectionCancelled("BTC_RELATIONSHIP_COLLECTION_CANCELLED")
 
     def network_request_count(self, *, window_seconds: float = 60) -> int:
         return self._network_requests.count(window_seconds=window_seconds)
@@ -229,6 +239,7 @@ class BinanceSpotDailyClient:
                 self._throttle_failures = 0
 
     def fetch(self, symbol: str, cutoff: datetime) -> DailySeriesResult:
+        self._raise_if_cancelled()
         cache_path = self.cache_root / f"{symbol}.csv.gz"
         current = _read_cache(cache_path)
         cutoff_ms = int(cutoff.timestamp() * 1000)
@@ -262,6 +273,7 @@ class BinanceSpotDailyClient:
         }
         last_reason = "BTC_RELATIONSHIP_UPSTREAM_UNAVAILABLE"
         for attempt in range(self.attempts):
+            self._raise_if_cancelled()
             if self._throttle_active():
                 last_reason = "BTC_RELATIONSHIP_HTTP_THROTTLED"
                 break
@@ -276,7 +288,10 @@ class BinanceSpotDailyClient:
                 )
                 self._network_requests.record()
                 with self._open_url(request, timeout=self.timeout_seconds) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
+                    body = response.read(MAX_KLINE_RESPONSE_BYTES + 1)
+                    if len(body) > MAX_KLINE_RESPONSE_BYTES:
+                        raise ValueError("BTC_RELATIONSHIP_RESPONSE_TOO_LARGE")
+                    payload = json.loads(body.decode("utf-8"))
                 normalized = normalize_klines(payload, cutoff_ms)
                 combined = (
                     normalized
@@ -328,7 +343,14 @@ class BinanceSpotDailyClient:
                 last_reason = str(exc)
             if not retryable or attempt + 1 >= self.attempts:
                 break
-            self._sleep(0.5 * (2**attempt))
+            delay = 0.5 * (2**attempt)
+            if self._stop_event is not None:
+                if self._stop_event.wait(delay):
+                    raise CollectionCancelled(
+                        "BTC_RELATIONSHIP_COLLECTION_CANCELLED"
+                    )
+            else:
+                self._sleep(delay)
 
         if current_latest_ms is not None and current_latest_ms >= cutoff_ms:
             return DailySeriesResult(
@@ -593,6 +615,11 @@ class BinanceBtcRelationshipMonitor:
             return None
         return int(counter(window_seconds=window_seconds))
 
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        binder = getattr(self.client, "bind_stop_event", None)
+        if callable(binder):
+            binder(stop_event)
+
     def collect(self) -> CollectionBatch:
         cutoff = latest_closed_cutoff()
         reference = self.client.fetch(REFERENCE_SYMBOL, cutoff)
@@ -623,6 +650,8 @@ class BinanceBtcRelationshipMonitor:
                 symbol = futures[future]
                 try:
                     fetched[symbol] = future.result()
+                except CollectionCancelled:
+                    raise
                 except Exception:
                     fetched[symbol] = DailySeriesResult(
                         symbol=symbol,

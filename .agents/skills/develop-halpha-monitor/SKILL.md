@@ -49,6 +49,27 @@ Select the smallest relevant set and expand when failures could be hidden or per
 - projection: API semantics, source/time labels, unknown states, and localhost UI behavior;
 - operation: install/package, startup, health, one real public read when appropriate, clean shutdown, and no owned process leak.
 
+For user-facing projections, apply the UI fact contract in `docs/PROJECT-PRINCIPLES.md`: render contract-satisfying facts without routine validity badges, columns, or filters; keep candidates and incomplete records out of the primary decision view; label only concrete exceptions; keep source health and collection diagnostics secondary; and make human input an optional correction path rather than a prerequisite for usable results. Review every changed visible string for plain, concrete meaning: replace internal state names, metaphors, workflow jargon, and ambiguous parenthetical qualifiers; state the condition and its visible impact; and explain any unavoidable technical term in place. Remove persistent banners or method notes that merely repeat source provenance, baseline quality behavior, generic disclaimers, obvious control behavior, or other default design expectations; put a necessary rule next to the field or category it explains and make it available on hover and keyboard focus. Add projection or UI checks that prevent a regression when this distinction is material to the change.
+
+### Deliver the running web result
+
+For any new or changed page, API, or web projection:
+
+- Distinguish the temporary QA endpoint from the normal delivery endpoint before starting either one. A temporary port, `TestClient`, screenshot, or passing browser script proves behavior but is not the delivered web result.
+- Before claiming completion, run the current code on the user-agreed normal service endpoint, preserve its existing externalized database configuration, and ensure there is exactly one intended scheduler/service instance. Do not leave an old process serving the normal URL or run a second collector against the real database.
+- Verify the delivered URL itself: health succeeds, the changed monitor or route is registered, the direct user URL loads, and the visible page is the current version. Give that exact URL to the user.
+- If authority, tooling, or the runtime prevents updating the normal service, report the work as blocked on that concrete action. State which temporary endpoint was used for QA and do not describe the web change as delivered.
+
+### Release temporary resources
+
+Treat every validation server, listener, process, thread, browser session, database, log, download, screenshot, cache, and temporary directory as an owned resource:
+
+- Record its purpose, exact path or identifier, PID/session when applicable, port, and intended lifetime. Use a unique task directory and synthetic database for destructive or browser acceptance tests; never repurpose the real monitor database for fixtures.
+- Put shutdown and cleanup in `finally` behavior where code controls the lifecycle. Otherwise close browser sessions, stop the exact validated process, wait for the port to clear, release files, and delete or recycle task-owned artifacts before handoff.
+- Recheck the process list, listening ports, browser sessions, and exact paths after cleanup. A successful stop/delete command without this absence check is insufficient.
+- Do not delete shared caches, user evidence, normal service data, or resources whose ownership is uncertain. Any retained validation artifact must be an explicit durable deliverable; otherwise remove it.
+- In the final report, name the verified delivery URL, the persistent service intentionally left running, the temporary resources removed, and any cleanup or runtime blocker that remains.
+
 At the current project stage, do not add GitHub CI or GitHub Actions. Run deterministic tests, static checks, privacy gates, broad regressions, live-network, startup, restart, UI, long-duration, and expensive checks locally in proportion to impact, and report exactly what ran. Reconsider remote CI only after the recurring-failure threshold in `docs/PROJECT-PRINCIPLES.md` is demonstrably met; if it is reintroduced, keep it short, deterministic, and network-free.
 
 ## Integrate cleanly

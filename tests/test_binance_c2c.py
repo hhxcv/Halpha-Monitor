@@ -23,6 +23,13 @@ from halpha_monitor.monitors.binance_c2c import (
 NOW = datetime(2026, 7, 22, 5, 0, tzinfo=UTC)
 
 
+def test_settings_bound_cli_asset_fanout_and_timeout() -> None:
+    with pytest.raises(ValueError, match="C2C_ASSETS_INVALID"):
+        BinanceC2CSettings(assets=tuple(f"A{index}" for index in range(20)))
+    with pytest.raises(ValueError, match="C2C_TIMEOUT_INVALID"):
+        BinanceC2CSettings(timeout_seconds=float("inf"))
+
+
 def ad(
     asset: str,
     price: str,

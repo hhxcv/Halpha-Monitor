@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from halpha_monitor.contracts import (
+    AutomaticCollectionState,
     CollectionBatch,
+    CollectionCancelled,
     ForwardEvaluationCase,
     ForwardEvaluationResult,
     MetricSample,
@@ -104,6 +106,113 @@ def test_request_run_wakes_only_requested_monitor(tmp_path: Path) -> None:
 
     assert requested.calls == 2
     assert untouched.calls == 1
+
+
+def test_scheduled_monitor_is_static_when_closed_but_manual_run_bypasses_gate(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class ScheduledMonitor(FakeMonitor):
+        monitor_id: str = "scheduled-monitor"
+
+        def automatic_collection_state(
+            self,
+            *,
+            now: datetime,
+        ) -> AutomaticCollectionState:
+            return AutomaticCollectionState(
+                allowed=False,
+                status="CLOSED",
+                reason_code="FIXTURE_CLOSED",
+                label="closed",
+                detail="fixture closed",
+                next_open_at=now + timedelta(hours=8),
+            )
+
+    monitor = ScheduledMonitor(interval_seconds=3600)
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    scheduler = MonitorScheduler(registry, make_store(tmp_path))
+    scheduler.start()
+    time.sleep(0.05)
+
+    assert monitor.calls == 0
+    assert scheduler.request_run(monitor.monitor_id) is True
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and monitor.calls < 1:
+        time.sleep(0.02)
+    scheduler.stop()
+
+    assert monitor.calls == 1
+
+
+def test_transient_control_read_failure_does_not_kill_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monitor = FakeMonitor("resilient-monitor", interval_seconds=3600)
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    store = make_store(tmp_path)
+    original_is_enabled = store.is_enabled
+    failure_seen = threading.Event()
+
+    def flaky_is_enabled(monitor_id: str) -> bool:
+        if not failure_seen.is_set():
+            failure_seen.set()
+            raise OSError("fixture transient read failure")
+        return original_is_enabled(monitor_id)
+
+    monkeypatch.setattr(store, "is_enabled", flaky_is_enabled)
+    scheduler = MonitorScheduler(registry, store)
+    scheduler.start()
+    assert failure_seen.wait(timeout=1)
+    scheduler.set_enabled(monitor.monitor_id, True)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and monitor.calls < 1:
+        time.sleep(0.02)
+
+    states = scheduler.worker_states()
+    scheduler.stop()
+
+    assert monitor.calls == 1
+    assert states[0].alive is True
+    assert states[0].last_error == "OSError"
+
+
+def test_cooperative_collection_exits_within_global_stop_deadline(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+
+    @dataclass
+    class CooperativeFixture(FakeMonitor):
+        monitor_id: str = "cooperative-monitor"
+        stop_event: threading.Event | None = None
+
+        def bind_stop_event(self, stop_event: threading.Event) -> None:
+            self.stop_event = stop_event
+
+        def collect(self) -> CollectionBatch:
+            entered.set()
+            if self.stop_event is not None and self.stop_event.wait(timeout=2):
+                raise CollectionCancelled("fixture stop")
+            return super().collect()
+
+    monitor = CooperativeFixture()
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    store = make_store(tmp_path)
+    scheduler = MonitorScheduler(registry, store, stop_timeout_seconds=0.5)
+    scheduler.start()
+    assert entered.wait(timeout=1)
+
+    scheduler.stop()
+
+    latest = store.latest_run(monitor.monitor_id)
+    assert latest is not None
+    assert latest.status == "FAILED"
+    assert latest.error_code == "COLLECTION_CANCELLED"
 
 
 def test_disabled_monitor_waits_until_enabled_and_then_collects(
@@ -235,6 +344,27 @@ def test_maintenance_failure_does_not_change_a_completed_monitor_run(
     assert latest is not None
     assert latest.status == "SUCCESS"
     assert calls == 1
+
+
+def test_broken_stdout_does_not_break_collection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_print(*_args: object, **_kwargs: object) -> None:
+        raise BrokenPipeError("fixture stdout pipe closed")
+
+    monitor = FakeMonitor("healthy-monitor")
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    store = make_store(tmp_path)
+    scheduler = MonitorScheduler(registry, store)
+    monkeypatch.setattr("builtins.print", broken_print)
+
+    scheduler.run_once(monitor)
+
+    latest = store.latest_run(monitor.monitor_id)
+    assert latest is not None
+    assert latest.status == "SUCCESS"
 
 
 def test_scheduler_resolves_due_evaluations_without_changing_current_samples(

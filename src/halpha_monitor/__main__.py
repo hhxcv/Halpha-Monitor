@@ -13,7 +13,12 @@ from halpha_monitor.monitors import (
     register_builtin_monitors,
 )
 from halpha_monitor.service import MonitorRegistry, MonitorScheduler
-from halpha_monitor.store import SQLiteMonitorStore
+from halpha_monitor.store import (
+    DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES,
+    DEFAULT_BUYBACK_RETENTION_DAYS,
+    DEFAULT_MARKET_EVENT_RETENTION_DAYS,
+    SQLiteMonitorStore,
+)
 from halpha_monitor.web import create_app
 
 
@@ -37,6 +42,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--db-path", type=Path, default=default_database_path())
     parser.add_argument("--retention-days", type=int, default=90)
+    parser.add_argument(
+        "--buyback-retention-days",
+        type=int,
+        default=DEFAULT_BUYBACK_RETENTION_DAYS,
+    )
+    parser.add_argument(
+        "--buyback-evidence-max-mib",
+        type=int,
+        default=DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES // (1024 * 1024),
+    )
+    parser.add_argument(
+        "--market-event-retention-days",
+        type=int,
+        default=DEFAULT_MARKET_EVENT_RETENTION_DAYS,
+    )
     add_builtin_monitor_arguments(parser)
     return parser
 
@@ -47,7 +67,18 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("port must be between 1024 and 65535")
     if args.retention_days < 1:
         raise SystemExit("retention-days must be positive")
-    store = SQLiteMonitorStore(args.db_path)
+    if args.buyback_retention_days < 1:
+        raise SystemExit("buyback-retention-days must be positive")
+    if args.buyback_evidence_max_mib < 1:
+        raise SystemExit("buyback-evidence-max-mib must be positive")
+    if args.market_event_retention_days < 1:
+        raise SystemExit("market-event-retention-days must be positive")
+    store = SQLiteMonitorStore(
+        args.db_path,
+        buyback_retention_days=args.buyback_retention_days,
+        buyback_evidence_max_bytes=args.buyback_evidence_max_mib * 1024 * 1024,
+        market_event_retention_days=args.market_event_retention_days,
+    )
     registry = MonitorRegistry()
     register_builtin_monitors(
         registry,

@@ -25,6 +25,14 @@ from halpha_monitor.monitors.binance_btc_relationship import (
     BinanceBtcRelationshipMonitor,
     BinanceBtcRelationshipSettings,
 )
+from halpha_monitor.monitors.a_hk_buyback import (
+    AHKBuybackMonitor,
+    BuybackSettings,
+)
+from halpha_monitor.monitors.market_events import (
+    MarketEventMonitor,
+    MarketEventSettings,
+)
 from halpha_monitor.service import MonitorRegistry
 from halpha_monitor.store import SQLiteMonitorStore
 
@@ -60,10 +68,22 @@ def add_builtin_monitor_arguments(parser: argparse.ArgumentParser) -> None:
         default=Decimal("5000000"),
     )
     parser.add_argument("--altcoin-radar-max-candidates", type=int, default=30)
+    parser.add_argument(
+        "--altcoin-radar-max-screened-contracts",
+        type=int,
+        default=240,
+    )
     parser.add_argument("--altcoin-radar-workers", type=int, default=6)
     parser.add_argument("--btc-relationship-interval-seconds", type=float, default=3600)
     parser.add_argument("--btc-relationship-jitter-seconds", type=float, default=120)
     parser.add_argument("--btc-relationship-workers", type=int, default=8)
+    parser.add_argument("--buyback-interval-seconds", type=float, default=3600)
+    parser.add_argument("--buyback-jitter-seconds", type=float, default=300)
+    parser.add_argument("--buyback-lookback-days", type=int, default=7)
+    parser.add_argument("--buyback-max-documents-per-run", type=int, default=20)
+    parser.add_argument("--market-events-interval-seconds", type=float, default=21600)
+    parser.add_argument("--market-events-jitter-seconds", type=float, default=900)
+    parser.add_argument("--market-events-lookahead-days", type=int, default=60)
     parser.add_argument("--fiat", default="CNY")
     parser.add_argument("--assets", default="USDT,USDC,BTC,ETH,BNB,SOL")
     parser.add_argument(
@@ -115,6 +135,7 @@ def register_builtin_monitors(
                 jitter_seconds=args.altcoin_radar_jitter_seconds,
                 min_quote_volume_24h=args.altcoin_radar_min_quote_volume,
                 max_candidates=args.altcoin_radar_max_candidates,
+                max_screened_contracts=args.altcoin_radar_max_screened_contracts,
                 workers=args.altcoin_radar_workers,
                 timeout_seconds=args.timeout_seconds,
                 proxy_url=args.proxy_url,
@@ -135,9 +156,44 @@ def register_builtin_monitors(
             )
         )
     )
+    registry.register(
+        AHKBuybackMonitor(
+            BuybackSettings(
+                interval_seconds=args.buyback_interval_seconds,
+                jitter_seconds=args.buyback_jitter_seconds,
+                lookback_days=args.buyback_lookback_days,
+                timeout_seconds=args.timeout_seconds,
+                max_documents_per_run=args.buyback_max_documents_per_run,
+                hkex_refresh_seconds=max(
+                    args.buyback_interval_seconds,
+                    6 * 3600,
+                ),
+                connect_refresh_seconds=max(
+                    args.buyback_interval_seconds,
+                    24 * 3600,
+                ),
+                proxy_url=args.proxy_url,
+            ),
+            store=store,
+        )
+    )
+    registry.register(
+        MarketEventMonitor(
+            MarketEventSettings(
+                interval_seconds=args.market_events_interval_seconds,
+                jitter_seconds=args.market_events_jitter_seconds,
+                lookahead_days=args.market_events_lookahead_days,
+                timeout_seconds=args.timeout_seconds,
+                proxy_url=args.proxy_url,
+            ),
+            store=store,
+        )
+    )
 
 
 __all__ = [
+    "AHKBuybackMonitor",
+    "BuybackSettings",
     "BinanceAltcoinRadarMonitor",
     "BinanceAltcoinRadarSettings",
     "BinanceC2CMonitor",
@@ -146,6 +202,8 @@ __all__ = [
     "BinanceBtcRelationshipSettings",
     "BinanceSmartMoneyMonitor",
     "BinanceSmartMoneySettings",
+    "MarketEventMonitor",
+    "MarketEventSettings",
     "add_builtin_monitor_arguments",
     "register_builtin_monitors",
 ]

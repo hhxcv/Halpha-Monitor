@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Halpha Monitor</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260806-11">
-    <script src="/static/app.js?v=20260806-11" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260807-16">
+    <script src="/static/app.js?v=20260807-16" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -26,19 +26,22 @@
 
     <div class="app-shell">
       <aside class="monitor-rail" aria-labelledby="monitor-list-title">
-        <h1 id="monitor-list-title">监控列表</h1>
-        <nav id="monitor-list" aria-label="已注册监控"></nav>
-        <section class="rail-summary" aria-labelledby="summary-title">
-          <h2 id="summary-title">监控状态</h2>
-          <dl>
-            <div><dt>监控中</dt><dd id="monitoring-count">0</dd></div>
-            <div><dt>最新结果</dt><dd id="healthy-count">0</dd></div>
-            <div><dt>历史快照</dt><dd id="stale-count">0</dd></div>
-            <div><dt>尚无结果</dt><dd id="failed-count">0</dd></div>
-            <div><dt>已关闭</dt><dd id="disabled-count">0</dd></div>
-          </dl>
-          <p id="summary-cutoff">状态统计截止：未知</p>
-        </section>
+        <div class="monitor-rail-sticky">
+          <div class="monitor-rail-heading">
+            <h1 id="monitor-list-title">监控列表</h1>
+            <button
+              id="monitor-rail-toggle"
+              class="monitor-rail-toggle"
+              type="button"
+              aria-controls="monitor-list"
+              aria-expanded="true"
+              aria-label="收起监控列表"
+            >
+              <span id="monitor-rail-toggle-icon" aria-hidden="true">‹</span>
+            </button>
+          </div>
+          <nav id="monitor-list" aria-label="已注册监控"></nav>
+        </div>
       </aside>
 
       <main class="workspace" id="workspace" aria-busy="true">
@@ -50,6 +53,17 @@
           <div class="monitor-status-summary">
             <div class="monitor-state" id="monitor-state">状态未知</div>
             <div class="monitor-control">
+              <button
+                id="diagnostics-open"
+                class="diagnostics-open"
+                type="button"
+                aria-haspopup="dialog"
+                aria-controls="diagnostics-dialog"
+              >
+                诊断日志
+                <span id="diagnostics-open-count" class="diagnostics-open-count" hidden>0</span>
+              </button>
+              <button id="monitor-refresh-button" type="button" hidden>手动刷新</button>
               <button id="monitor-control-button" type="button">正在读取</button>
               <span id="monitor-control-status" role="status" aria-live="polite"></span>
             </div>
@@ -71,7 +85,40 @@
         </section>
 
         <section class="filters" id="filters" aria-label="查看条件">
-          <div id="dynamic-filters" class="dynamic-filters"></div>
+          <div id="dynamic-filters" class="dynamic-filters">
+            <label
+              id="buyback-stock-search-field"
+              class="filter-field buyback-stock-search-field"
+              hidden
+            >
+              <span id="buyback-stock-search-label" class="filter-label">股票搜索</span>
+              <input
+                id="buyback-stock-search"
+                type="search"
+                maxlength="64"
+                placeholder="输入代码或名称"
+                autocomplete="off"
+                spellcheck="false"
+                aria-labelledby="buyback-stock-search-label"
+              >
+            </label>
+            <label
+              id="event-search-field"
+              class="filter-field event-search-field"
+              hidden
+            >
+              <span id="event-search-label" class="filter-label">事件搜索</span>
+              <input
+                id="event-search"
+                type="search"
+                maxlength="64"
+                placeholder="输入事件或类别"
+                autocomplete="off"
+                spellcheck="false"
+                aria-labelledby="event-search-label"
+              >
+            </label>
+          </div>
           <label
             class="filter-field history-window-field"
             title="只控制下方历史曲线回看多久，不参与本轮异动阶段或评分计算。当前评分使用固定的5m、15m、1h、约2小时15分和24h市场窗口。"
@@ -93,7 +140,101 @@
 
         <p id="monitor-method-note" class="monitor-method-note" hidden></p>
 
-        <section class="table-region" aria-labelledby="quote-table-title">
+        <section class="buyback-overview-region" id="buyback-overview-region" aria-label="回购情报概览" hidden>
+          <dl class="buyback-overview" id="buyback-overview"></dl>
+        </section>
+
+        <details class="buyback-source-region" id="buyback-source-region" hidden>
+          <summary>
+            <strong id="buyback-source-title">数据来源与问题</strong>
+            <span id="buyback-source-summary">等待首次数据来源检查。</span>
+          </summary>
+          <div class="buyback-source-grid" id="buyback-source-grid"></div>
+        </details>
+
+        <details class="event-source-region" id="event-source-region" hidden>
+          <summary>
+            <strong>本轮数据覆盖变化</strong>
+            <span id="event-source-summary"></span>
+          </summary>
+          <div id="event-source-details" class="event-source-details"></div>
+        </details>
+
+        <nav class="monitor-view-tabs event-view-tabs" id="event-view-tabs" role="tablist" aria-label="事件数据视图" hidden>
+          <button id="event-upcoming-tab" type="button" role="tab" aria-selected="true">未来事件</button>
+          <button id="event-history-tab" type="button" role="tab" aria-selected="false">
+            历史事件 <span id="event-history-count">0</span>
+          </button>
+        </nav>
+
+        <nav class="monitor-view-tabs radar-view-tabs" id="radar-view-tabs" role="tablist" aria-label="异动雷达数据视图" hidden>
+          <button id="radar-table-tab" type="button" role="tab" aria-controls="table-region" aria-selected="true">异动候选</button>
+          <button id="radar-history-tab" type="button" role="tab" aria-controls="history-region" aria-selected="false">异动强度历史</button>
+          <button id="radar-evaluation-tab" type="button" role="tab" aria-controls="evaluation-region" aria-selected="false">后续行情检验</button>
+        </nav>
+
+        <section class="event-attention-region" id="event-attention-region" aria-labelledby="event-attention-title" hidden>
+          <div class="section-head event-section-head">
+            <div>
+              <h2 id="event-attention-title">当前需提前考虑</h2>
+              <p id="event-attention-summary"></p>
+            </div>
+            <p id="event-source-cutoff"></p>
+          </div>
+          <div id="event-attention-cards" class="event-attention-cards"></div>
+          <p id="event-attention-empty" class="event-attention-empty" hidden></p>
+        </section>
+
+        <section class="macro-indicator-region" id="macro-indicator-region" aria-labelledby="macro-indicator-title" hidden>
+          <div class="section-head event-section-head">
+            <div>
+              <h2 id="macro-indicator-title">最近宏观数据</h2>
+              <p>官方已发布的最近一期通胀与就业结果</p>
+            </div>
+          </div>
+          <div id="macro-indicator-cards" class="macro-indicator-cards"></div>
+        </section>
+
+        <section class="event-calendar-region" id="event-calendar-region" aria-labelledby="event-calendar-title" hidden>
+          <div class="section-head event-section-head">
+            <div>
+              <h2 id="event-calendar-title">未来两周日历</h2>
+              <p>精确时间按北京时间归入日期；仅有官方日期的事件按美国日期展示</p>
+            </div>
+          </div>
+          <div id="event-calendar-grid" class="event-calendar-grid"></div>
+        </section>
+
+        <section class="event-history-region" id="event-history-region" aria-labelledby="event-history-title" hidden>
+          <div class="section-head event-section-head">
+            <div>
+              <h2 id="event-history-title">历史事件</h2>
+              <p id="event-history-summary"></p>
+            </div>
+          </div>
+          <div class="table-scroll event-history-scroll" tabindex="0" aria-label="历史事件，可横向滚动">
+            <table>
+              <thead>
+                <tr>
+                  <th>发布时间</th><th>事件</th><th>市场预期</th><th>官方公布</th>
+                  <th>预期差</th><th>风险资产短线方向</th>
+                </tr>
+              </thead>
+              <tbody id="event-history-body"></tbody>
+            </table>
+          </div>
+          <nav class="table-pagination" id="event-history-pagination" aria-label="历史事件分页" hidden>
+            <p id="event-history-page-summary" aria-live="polite"></p>
+            <div class="table-pagination-controls">
+              <button id="event-history-previous" type="button">上一页</button>
+              <span id="event-history-page-status"></span>
+              <button id="event-history-next" type="button">下一页</button>
+            </div>
+          </nav>
+          <p class="empty-state" id="event-history-empty" hidden></p>
+        </section>
+
+        <section class="table-region" id="table-region" aria-labelledby="quote-table-title">
           <div class="section-head table-section-head">
             <h2 id="quote-table-title">最新监控数据</h2>
             <p id="data-cutoff">采集完成：未知</p>
@@ -105,10 +246,22 @@
               <tbody id="quote-body"></tbody>
             </table>
           </div>
+          <nav class="table-pagination" id="table-pagination" aria-label="清单分页" hidden>
+            <p id="table-page-summary" aria-live="polite"></p>
+            <div class="table-pagination-controls">
+              <button id="table-page-previous" type="button">上一页</button>
+              <label class="table-page-field">
+                <span>第</span>
+                <select id="table-page-select" aria-label="选择页码"></select>
+                <span id="table-page-total">/ 1 页</span>
+              </label>
+              <button id="table-page-next" type="button">下一页</button>
+            </div>
+          </nav>
           <p class="empty-state" id="quote-empty" hidden>当前筛选没有匹配结果。</p>
         </section>
 
-        <div class="lower-grid">
+        <div class="lower-grid" id="history-region">
           <section class="history-region" aria-labelledby="history-title">
             <div class="section-head">
               <h2 id="history-title">USDT 核算价历史</h2>
@@ -171,26 +324,157 @@
           </div>
         </section>
 
-        <details class="diagnostics-region" id="diagnostics-region" hidden>
-          <summary>
-            <span id="issues-title">采集诊断</span>
-            <span id="issue-count">0 条</span>
-          </summary>
-          <div class="diagnostics-body">
-            <div class="table-scroll issue-scroll" tabindex="0" aria-label="采集诊断记录">
-              <table>
-                <thead>
-                  <tr><th>范围</th><th>失败时间</th><th>原因</th></tr>
-                </thead>
-                <tbody id="issue-body"></tbody>
-              </table>
-            </div>
-            <p class="empty-state" id="issue-empty">当前没有采集失败。</p>
-          </div>
-        </details>
-
         <div class="page-error" id="page-error" role="alert" hidden></div>
       </main>
     </div>
+
+    <div
+      id="quote-horizontal-scrollbar"
+      class="quote-horizontal-scrollbar"
+      role="region"
+      tabindex="0"
+      aria-label="数据清单横向滚动"
+      hidden
+    >
+      <div id="quote-horizontal-scrollbar-track" class="quote-horizontal-scrollbar-track"></div>
+    </div>
+
+    <button id="back-to-top" class="back-to-top" type="button" aria-label="回到页面顶部" hidden>
+      <span aria-hidden="true">↑</span><span>顶部</span>
+    </button>
+
+    <dialog class="diagnostics-dialog" id="diagnostics-dialog" aria-labelledby="diagnostics-dialog-title">
+      <div class="diagnostics-dialog-shell">
+        <header class="diagnostics-dialog-header">
+          <div>
+            <p class="diagnostics-dialog-eyebrow">当前监控</p>
+            <h2 id="diagnostics-dialog-title">
+              诊断日志 <span id="issue-count" class="diagnostics-dialog-count">0 条</span>
+            </h2>
+            <p id="diagnostics-dialog-subtitle">正在读取采集记录</p>
+          </div>
+          <button id="diagnostics-dialog-close" class="diagnostics-dialog-close" type="button">关闭</button>
+        </header>
+        <div class="diagnostics-dialog-content">
+          <div id="issue-scroll" class="table-scroll issue-scroll" tabindex="0" aria-label="采集诊断记录">
+            <table>
+              <thead>
+                <tr><th>范围</th><th>失败时间</th><th>原因</th></tr>
+              </thead>
+              <tbody id="issue-body"></tbody>
+            </table>
+          </div>
+          <p class="empty-state" id="issue-empty">当前没有采集失败。</p>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog class="buyback-detail-dialog" id="buyback-detail-dialog" aria-labelledby="buyback-detail-title">
+      <div class="buyback-dialog-shell">
+        <header class="buyback-dialog-header">
+          <div>
+            <p class="buyback-dialog-eyebrow">回购情报详情</p>
+            <h2 id="buyback-detail-title">正在读取证据</h2>
+            <p id="buyback-detail-subtitle"></p>
+          </div>
+          <button id="buyback-detail-close" class="buyback-dialog-close" type="button" aria-label="关闭回购详情">关闭</button>
+        </header>
+        <p id="buyback-detail-status" class="buyback-detail-status" role="status" aria-live="polite"></p>
+        <div id="buyback-detail-content" class="buyback-detail-content" hidden>
+          <section aria-labelledby="buyback-facts-title">
+            <h3 id="buyback-facts-title">情报摘要</h3>
+            <dl id="buyback-facts" class="buyback-facts"></dl>
+          </section>
+          <section class="buyback-evidence" aria-labelledby="buyback-evidence-title">
+            <div class="buyback-evidence-head">
+              <h3 id="buyback-evidence-title">官方证据</h3>
+              <div id="buyback-evidence-links" class="buyback-evidence-links"></div>
+            </div>
+            <p id="buyback-evidence-meta" class="buyback-evidence-meta"></p>
+            <blockquote id="buyback-evidence-excerpt" hidden></blockquote>
+          </section>
+          <details class="buyback-correction">
+            <summary id="buyback-review-title">发现事实错误？提交人工校正</summary>
+            <p class="buyback-correction-note">正常使用无需人工处理；此入口仅用于纠正误分类、排除非目标事件或标记待补充核对。</p>
+            <form id="buyback-review-form" class="buyback-review-form" aria-labelledby="buyback-review-title">
+              <label>
+                <span>校正结论</span>
+                <select id="buyback-review-decision" required>
+                  <option value="">请选择</option>
+                  <option value="CONFIRMED_EVENT">确认或校正为回购事件</option>
+                  <option value="REJECTED_EVENT">排除为非目标事件</option>
+                  <option value="NEEDS_FOLLOW_UP">标记为待补充核对</option>
+                </select>
+              </label>
+              <label>
+                <span>事件类型</span>
+                <select id="buyback-review-event-type"></select>
+              </label>
+              <label>
+                <span>Program 标识（可选）</span>
+                <input id="buyback-review-program-key" maxlength="120" placeholder="例如 600000-2026-08">
+              </label>
+              <label>
+                <span>Program 状态</span>
+                <select id="buyback-review-program-status">
+                  <option value="">保持未知</option>
+                  <option value="PROPOSED">PROPOSED</option>
+                  <option value="APPROVED">APPROVED</option>
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="COMPLETED">COMPLETED</option>
+                  <option value="TERMINATED">TERMINATED</option>
+                  <option value="UNKNOWN">UNKNOWN</option>
+                </select>
+              </label>
+              <label class="buyback-review-note-field">
+                <span>校正说明</span>
+                <textarea id="buyback-review-note" maxlength="1000" rows="3" placeholder="记录错误、校正依据或需要补充的事项"></textarea>
+              </label>
+              <button id="buyback-review-submit" type="submit">提交校正</button>
+            </form>
+            <div id="buyback-review-history" class="buyback-review-history"></div>
+          </details>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog class="market-event-detail-dialog" id="market-event-detail-dialog" aria-labelledby="market-event-detail-title">
+      <div class="market-event-dialog-shell">
+        <header class="market-event-dialog-header">
+          <div>
+            <p class="market-event-dialog-eyebrow">关键事件详情</p>
+            <h2 id="market-event-detail-title">事件</h2>
+            <p id="market-event-detail-subtitle"></p>
+          </div>
+          <button id="market-event-detail-close" class="market-event-dialog-close" type="button">关闭</button>
+        </header>
+        <div class="market-event-detail-content">
+          <dl id="market-event-detail-facts" class="market-event-detail-facts"></dl>
+          <section>
+            <h3>为何需要提前考虑</h3>
+            <p id="market-event-impact-reason"></p>
+          </section>
+          <section>
+            <h3>事件说明</h3>
+            <p id="market-event-description"></p>
+          </section>
+          <section>
+            <h3>如何解读与判断方向</h3>
+            <p id="market-event-how-to-read"></p>
+            <p id="market-event-decision-rule" class="market-event-decision-rule"></p>
+          </section>
+          <section id="market-event-direction-section" hidden>
+            <div class="market-event-direction-head">
+              <h3>公式判断</h3>
+              <strong id="market-event-direction-label"></strong>
+            </div>
+            <p id="market-event-direction-action"></p>
+            <p id="market-event-direction-formula" class="market-event-direction-formula"></p>
+            <div id="market-event-direction-inputs" class="market-event-direction-inputs"></div>
+          </section>
+          <div id="market-event-source-links" class="market-event-source-links"></div>
+        </div>
+      </div>
+    </dialog>
   </body>
 </html>

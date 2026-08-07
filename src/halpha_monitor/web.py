@@ -3,27 +3,41 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, time as datetime_time, timedelta
 import math
 from pathlib import Path
+import threading
 from typing import Any, Literal
+import unicodedata
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from halpha_monitor.contracts import (
+    AutomaticCollectionMonitor,
+    AutomaticCollectionState,
     ConfigurableMonitor,
     NetworkObservableMonitor,
     RegisteredMonitor,
     ViewColumn,
 )
+from halpha_monitor.buyback_metrics import project_buyback_metrics
+from halpha_monitor.monitors.a_hk_buyback import (
+    classify_buyback_attention,
+    classify_buyback_title,
+    is_target_a_share_security,
+)
 from halpha_monitor.service import MonitorRegistry, MonitorScheduler
 from halpha_monitor.store import (
     SQLiteMonitorStore,
     StoredForwardEvaluation,
+    StoredBuybackEntity,
+    StoredBuybackReview,
+    StoredBuybackSourceState,
     StoredIssue,
     StoredRun,
     StoredSample,
@@ -41,9 +55,14 @@ MonitorStatus = Literal[
     "UNKNOWN",
     "DISABLED",
 ]
+
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+NEW_YORK_TZ = ZoneInfo("America/New_York")
 ALLOWED_WINDOWS = (1, 3, 6, 12, 24, 72, 168, 336, 720)
 EXPECTED_ABSENCE_REASON_CODES = frozenset({"NO_ELIGIBLE_C2C_AD"})
 REQUEST_WINDOW_SECONDS = 60.0
+BUYBACK_MONITOR_ID = "a-hk-buyback"
+MARKET_EVENT_MONITOR_ID = "market-event-calendar"
 
 
 class ConfigurationRequest(BaseModel):
@@ -52,6 +71,36 @@ class ConfigurationRequest(BaseModel):
 
 class ControlRequest(BaseModel):
     enabled: bool
+
+
+class BuybackReviewRequest(BaseModel):
+    base_revision_no: int = Field(ge=1)
+    decision: Literal[
+        "CONFIRMED_EVENT",
+        "REJECTED_EVENT",
+        "NEEDS_FOLLOW_UP",
+    ]
+    corrected_event_type: Literal[
+        "PLAN_OR_APPROVAL",
+        "FIRST_EXECUTION",
+        "PROGRESS",
+        "MODIFICATION",
+        "COMPLETION_OR_TERMINATION",
+        "POST_BUYBACK_CANCELLATION",
+        "POST_BUYBACK_DISPOSAL",
+        "AMBIGUOUS_BUYBACK",
+        "HKEX_EXECUTION",
+    ] | None = None
+    program_key: str | None = Field(default=None, max_length=120)
+    program_status: Literal[
+        "PROPOSED",
+        "APPROVED",
+        "ACTIVE",
+        "COMPLETED",
+        "TERMINATED",
+        "UNKNOWN",
+    ] | None = None
+    note: str = Field(default="", max_length=1000)
 
 
 def monitor_status(
@@ -256,14 +305,89 @@ def _monitor_summary(
     store: SQLiteMonitorStore,
     *,
     now: datetime,
+    scheduler: MonitorScheduler | None = None,
 ) -> dict[str, Any]:
     latest = store.latest_run(monitor.monitor_id)
-    data_run = store.latest_sample_run(monitor.monitor_id)
-    latest_issues = store.issues_for_run(latest.run_id) if latest is not None else ()
-    control = store.ensure_control(
-        monitor.monitor_id,
-        default_enabled=bool(getattr(monitor, "default_enabled", True)),
+    projection_kind = getattr(monitor, "projection_kind", None)
+    is_buyback = projection_kind == "buyback"
+    is_snapshot = projection_kind in {"buyback", "market_events"}
+    data_run = (
+        store.latest_completed_run(monitor.monitor_id)
+        if is_snapshot
+        else store.latest_sample_run(monitor.monitor_id)
     )
+    latest_issues = store.issues_for_run(latest.run_id) if latest is not None else ()
+    control = store.load_control(monitor.monitor_id)
+    if control is None:
+        control = store.ensure_control(
+            monitor.monitor_id,
+            default_enabled=bool(getattr(monitor, "default_enabled", True)),
+        )
+    automatic_state = _automatic_collection_state(
+        monitor,
+        scheduler=scheduler,
+        now=now,
+    )
+    data_status = _data_status(
+        latest,
+        data_run,
+        interval_seconds=monitor.interval_seconds,
+        now=now,
+        user_can_configure=isinstance(monitor, ConfigurableMonitor),
+        enabled=control.enabled,
+        latest_issues=latest_issues,
+    )
+    if is_buyback and data_status["kind"] in {
+        "CURRENT",
+        "CURRENT_WITH_NOTICES",
+        "CURRENT_WITH_GAPS",
+    }:
+        data_status = {
+            **data_status,
+            "label": "最近来源检查已完成",
+            "detail": "公开来源最近一轮检查已结束。",
+            "cutoff_label": "最近来源检查",
+        }
+    if projection_kind == "market_events" and data_status["kind"] in {
+        "CURRENT",
+        "CURRENT_WITH_NOTICES",
+        "CURRENT_WITH_GAPS",
+    }:
+        data_status = {
+            **data_status,
+            "label": "最近事件检查已完成",
+            "detail": "宏观发布与央行日历最近一轮检查已结束。",
+            "cutoff_label": "最近事件检查",
+        }
+    operational_status = _operational_status(latest, enabled=control.enabled)
+    if (
+        control.enabled
+        and automatic_state is not None
+        and not (latest is not None and latest.status == "RUNNING")
+    ):
+        if automatic_state.status == "CLOSED":
+            operational_status = {
+                "kind": "SCHEDULED_IDLE",
+                "tone": "IDLE",
+                "label": "已收市 · 静态",
+            }
+            if data_run is not None:
+                data_status = {
+                    "kind": "STATIC_CLOSED",
+                    "tone": "HEALTHY",
+                    "label": "收市后静态历史数据",
+                    "detail": (
+                        "闭市期间不会自动采集；展示最近已提交的历史事实，"
+                        "可使用手动刷新显式检查一次。"
+                    ),
+                    "cutoff_label": "最近来源检查",
+                }
+        elif automatic_state.status == "UNAVAILABLE":
+            operational_status = {
+                "kind": "SCHEDULE_BLOCKED",
+                "tone": "WARNING",
+                "label": "自动刷新已暂停",
+            }
     return {
         "monitor_id": monitor.monitor_id,
         "display_name": monitor.display_name,
@@ -279,15 +403,50 @@ def _monitor_summary(
         ),
         "latest_run": _run_payload(latest),
         "data_run": _run_payload(data_run),
-        "operational_status": _operational_status(latest, enabled=control.enabled),
-        "data_status": _data_status(
-            latest,
-            data_run,
-            interval_seconds=monitor.interval_seconds,
-            now=now,
-            user_can_configure=isinstance(monitor, ConfigurableMonitor),
-            enabled=control.enabled,
-            latest_issues=latest_issues,
+        "operational_status": operational_status,
+        "data_status": data_status,
+        "automatic_collection": _automatic_collection_payload(automatic_state),
+    }
+
+
+def _automatic_collection_state(
+    monitor: RegisteredMonitor,
+    *,
+    scheduler: MonitorScheduler | None,
+    now: datetime,
+) -> AutomaticCollectionState | None:
+    if scheduler is not None:
+        return scheduler.automatic_collection_state(monitor.monitor_id, now=now)
+    if not isinstance(monitor, AutomaticCollectionMonitor):
+        return None
+    try:
+        return monitor.automatic_collection_state(now=now)
+    except Exception as exc:
+        return AutomaticCollectionState(
+            allowed=False,
+            status="UNAVAILABLE",
+            reason_code=f"AUTOMATIC_SCHEDULE_FAILED_{type(exc).__name__.upper()}",
+            label="交易日历不可判定 · 自动刷新暂停",
+            detail="无法确认交易时段；当前只允许手动刷新。",
+        )
+
+
+def _automatic_collection_payload(
+    state: AutomaticCollectionState | None,
+) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return {
+        "allowed": state.allowed,
+        "status": state.status,
+        "reason_code": state.reason_code,
+        "label": state.label,
+        "detail": state.detail,
+        "next_open_at": (
+            iso_utc(state.next_open_at) if state.next_open_at is not None else None
+        ),
+        "active_until": (
+            iso_utc(state.active_until) if state.active_until is not None else None
         ),
     }
 
@@ -301,6 +460,12 @@ def _overall_data_status(summaries: list[dict[str, Any]]) -> tuple[str, str]:
         for item in active
     ):
         return "RUNNING", "采集中"
+    if active and all(
+        item.get("automatic_collection", {}).get("status") == "CLOSED"
+        for item in active
+        if item.get("automatic_collection") is not None
+    ) and all(item.get("automatic_collection") is not None for item in active):
+        return "IDLE", "闭市静态"
     kinds = [str(item["data_status"]["kind"]) for item in active]
     if kinds and all(kind == "EMPTY" for kind in kinds):
         return "RUNNING", "监控已启动"
@@ -346,6 +511,15 @@ def _collection_load(
         for monitor in monitors
         if bool(by_id[monitor.monitor_id]["enabled"])
     ]
+    automatically_running = [
+        (monitor, summary)
+        for monitor, summary in active
+        if summary.get("automatic_collection") is None
+        or bool(summary["automatic_collection"].get("allowed"))
+    ]
+    automatically_running_ids = {
+        monitor.monitor_id for monitor, _summary in automatically_running
+    }
     utilization = 0.0
     latest_completed_at: datetime | None = None
     collecting_count = 0
@@ -362,7 +536,10 @@ def _collection_load(
             )
         else:
             work_seconds = _run_work_seconds(latest, now=now)
-        utilization += work_seconds / max(float(monitor.interval_seconds), 1.0)
+        if monitor.monitor_id in automatically_running_ids or (
+            latest and latest.get("status") == "RUNNING"
+        ):
+            utilization += work_seconds / max(float(monitor.interval_seconds), 1.0)
 
         for run in (latest, data_run):
             if not run:
@@ -406,7 +583,10 @@ def _collection_load(
         "enabled_count": len(active),
         "collecting_count": collecting_count,
         "planned_runs_per_minute": round(
-            sum(60.0 / float(monitor.interval_seconds) for monitor, _ in active),
+            sum(
+                60.0 / float(monitor.interval_seconds)
+                for monitor, _ in automatically_running
+            ),
             2,
         ),
         "network_requests": (
@@ -492,6 +672,824 @@ def _sample_payload(sample: StoredSample) -> dict[str, Any]:
         "observed_at": iso_utc(sample.observed_at),
         "value": sample.value_text,
         "unit": sample.unit,
+    }
+
+
+BUYBACK_EVENT_LABELS = {
+    "PLAN_OR_APPROVAL": "方案 / 审议",
+    "FIRST_EXECUTION": "首次实施",
+    "PROGRESS": "实施进展",
+    "MODIFICATION": "方案变更",
+    "COMPLETION_OR_TERMINATION": "完成 / 终止",
+    "POST_BUYBACK_CANCELLATION": "注销",
+    "POST_BUYBACK_DISPOSAL": "出售已回购股份",
+    "AMBIGUOUS_BUYBACK": "待确认回购事件",
+    "HKEX_EXECUTION": "港股实际回购",
+}
+BUYBACK_REVIEW_LABELS = {
+    "UNREVIEWED": "尚无人工校正",
+    "CONFIRMED_EVENT": "人工校正确认",
+    "REJECTED_EVENT": "人工校正排除",
+    "NEEDS_FOLLOW_UP": "人工标记待补全",
+}
+BUYBACK_SYSTEM_VERIFIED_A_EVENTS = frozenset(
+    {
+        "PLAN_OR_APPROVAL",
+        "FIRST_EXECUTION",
+        "PROGRESS",
+        "MODIFICATION",
+        "COMPLETION_OR_TERMINATION",
+        "POST_BUYBACK_CANCELLATION",
+        "POST_BUYBACK_DISPOSAL",
+    }
+)
+BUYBACK_EXECUTION_EVENTS = frozenset(
+    {"FIRST_EXECUTION", "PROGRESS", "HKEX_EXECUTION"}
+)
+
+
+def _normalize_buyback_stock_query(value: str) -> str:
+    return "".join(
+        unicodedata.normalize("NFKC", value).casefold().split()
+    )
+
+
+def _buyback_stock_matches(payload: dict[str, Any], query: str) -> bool:
+    normalized_query = _normalize_buyback_stock_query(query)
+    if not normalized_query:
+        return True
+    return any(
+        normalized_query in _normalize_buyback_stock_query(str(value or ""))
+        for value in (payload.get("stock_code"), payload.get("issuer_name"))
+    )
+
+
+def _row_matches_filters(
+    payload: dict[str, Any],
+    selected_filters: dict[str, str | list[str]],
+) -> bool:
+    for key, selected in selected_filters.items():
+        current = str(payload.get(key, ""))
+        if isinstance(selected, list):
+            if current not in selected:
+                return False
+        elif selected != "*" and current != selected:
+            return False
+    return True
+
+
+MARKET_EVENT_MARKET_LABELS = {
+    "CRYPTO": "加密资产",
+    "US_STOCKS": "美股",
+    "A_HK_STOCKS": "A股 / 港股",
+}
+
+
+def _normalize_event_query(value: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _market_event_exact_time(payload: dict[str, Any]) -> datetime | None:
+    value = payload.get("scheduled_at")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _market_event_date(payload: dict[str, Any]) -> date | None:
+    try:
+        return date.fromisoformat(str(payload.get("scheduled_date") or ""))
+    except ValueError:
+        return None
+
+
+def _market_event_sort_time(payload: dict[str, Any]) -> datetime | None:
+    exact = _market_event_exact_time(payload)
+    if exact is not None:
+        return exact
+    scheduled_date = _market_event_date(payload)
+    if scheduled_date is None:
+        return None
+    return datetime.combine(
+        scheduled_date,
+        datetime_time(hour=12),
+        tzinfo=NEW_YORK_TZ,
+    ).astimezone(UTC)
+
+
+def _market_event_is_upcoming(payload: dict[str, Any], *, now: datetime) -> bool:
+    exact = _market_event_exact_time(payload)
+    if exact is not None:
+        return exact >= now
+    scheduled_date = _market_event_date(payload)
+    return (
+        scheduled_date is not None
+        and scheduled_date >= now.astimezone(NEW_YORK_TZ).date()
+    )
+
+
+def _market_event_within_days(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+    days: int,
+) -> bool:
+    exact = _market_event_exact_time(payload)
+    if exact is not None:
+        return now <= exact <= now + timedelta(days=days)
+    scheduled_date = _market_event_date(payload)
+    if scheduled_date is None:
+        return False
+    today = now.astimezone(NEW_YORK_TZ).date()
+    return today <= scheduled_date <= today + timedelta(days=days)
+
+
+def _market_event_time_matches(
+    payload: dict[str, Any],
+    selected: str,
+    *,
+    now: datetime,
+) -> bool:
+    if not _market_event_is_upcoming(payload, now=now):
+        return False
+    if selected == "NEXT_24H":
+        exact = _market_event_exact_time(payload)
+        if exact is not None:
+            return exact <= now + timedelta(hours=24)
+        scheduled_date = _market_event_date(payload)
+        today = now.astimezone(NEW_YORK_TZ).date()
+        return scheduled_date is not None and scheduled_date <= today + timedelta(days=1)
+    if selected == "NEXT_7D":
+        return _market_event_within_days(payload, now=now, days=7)
+    if selected == "NEXT_30D":
+        return _market_event_within_days(payload, now=now, days=30)
+    return selected == "ALL_UPCOMING"
+
+
+def _market_event_matches(
+    payload: dict[str, Any],
+    selected_filters: dict[str, str | list[str]],
+    query: str,
+    *,
+    now: datetime,
+) -> bool:
+    normalized_query = _normalize_event_query(query)
+    if normalized_query and not any(
+        normalized_query in _normalize_event_query(str(value or ""))
+        for value in (
+            payload.get("event_title"),
+            payload.get("category_label"),
+            payload.get("source_label"),
+        )
+    ):
+        return False
+    for key, selected_value in selected_filters.items():
+        selected = str(selected_value)
+        if key == "time_range":
+            if not _market_event_time_matches(payload, selected, now=now):
+                return False
+        elif key == "affected_market":
+            if selected != "*" and selected not in payload.get("market_scopes", []):
+                return False
+        elif selected != "*" and str(payload.get(key) or "") != selected:
+            return False
+    return True
+
+
+def _market_event_countdown(payload: dict[str, Any], *, now: datetime) -> str:
+    exact = _market_event_exact_time(payload)
+    if exact is None:
+        scheduled_date = _market_event_date(payload)
+        if scheduled_date is None:
+            return "时间待公布"
+        days = (scheduled_date - now.astimezone(NEW_YORK_TZ).date()).days
+        if days <= 0:
+            return "今天 · 时间待公布"
+        if days == 1:
+            return "明天 · 时间待公布"
+        return f"{days}天后 · 时间待公布"
+    seconds = (exact - now).total_seconds()
+    if seconds < 0:
+        return str(payload.get("release_state_label") or "已发生")
+    if seconds < 3600:
+        return f"{max(1, math.ceil(seconds / 60))}分钟后"
+    if seconds < 24 * 3600:
+        return f"{math.ceil(seconds / 3600)}小时后"
+    if seconds < 48 * 3600:
+        return "明天"
+    return f"{math.ceil(seconds / 86400)}天后"
+
+
+def _market_event_recent_change(payload: dict[str, Any], *, now: datetime) -> bool:
+    changed_at = _payload_time(
+        str(payload.get("last_schedule_changed_at") or "")
+    )
+    return changed_at is not None and changed_at >= now - timedelta(days=7)
+
+
+def _market_event_priority(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> tuple[int, str, str]:
+    high = payload.get("importance") == "HIGH"
+    changed = _market_event_recent_change(payload, now=now)
+    exact = _market_event_exact_time(payload)
+    if exact is not None:
+        hours = max(0.0, (exact - now).total_seconds() / 3600)
+        if high and hours <= 24:
+            return 1, "立即准备", "高影响事件将在24小时内发布。"
+        if (high and hours <= 72) or (not high and hours <= 24):
+            return 2, "提前准备", "发布时间已进入需要预留风险空间的窗口。"
+        if changed and hours <= 7 * 24:
+            return 2, "时间有调整", "发布时间最近发生调整，需更新交易计划。"
+        if high and hours <= 7 * 24:
+            return 3, "本周关注", "高影响事件将在未来7天内发布。"
+    else:
+        scheduled_date = _market_event_date(payload)
+        if scheduled_date is not None:
+            days = (
+                scheduled_date - now.astimezone(NEW_YORK_TZ).date()
+            ).days
+            if changed and days <= 7:
+                return 2, "时间有调整", "官方日期最近发生调整，具体时间仍待公布。"
+            if high and days <= 2:
+                return 2, "提前准备", "高影响事件日期临近，具体发布时间尚未公布。"
+            if high and days <= 7:
+                return 3, "本周关注", "高影响事件将在未来7天内发生。"
+    return 4, "日历关注", "尚未进入优先准备窗口。"
+
+
+def _market_event_enriched(
+    payload: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    rank, label, reason = _market_event_priority(payload, now=now)
+    exact = _market_event_exact_time(payload)
+    scheduled_date = _market_event_date(payload)
+    local_date = (
+        exact.astimezone(SHANGHAI_TZ).date()
+        if exact is not None
+        else scheduled_date
+    )
+    scopes = [
+        str(value)
+        for value in payload.get("market_scopes", [])
+        if str(value) in MARKET_EVENT_MARKET_LABELS
+    ]
+    return {
+        **payload,
+        "priority_rank": rank,
+        "priority_label": label,
+        "priority_reason": reason,
+        "countdown_label": _market_event_countdown(payload, now=now),
+        "importance_label": (
+            "高" if payload.get("importance") == "HIGH" else "中"
+        ),
+        "markets_label": "、".join(
+            MARKET_EVENT_MARKET_LABELS[scope] for scope in scopes
+        ),
+        "calendar_date": local_date.isoformat() if local_date is not None else None,
+        "calendar_timezone_label": (
+            "北京时间" if exact is not None else "美国东部日期"
+        ),
+        "schedule_changed_recently": _market_event_recent_change(payload, now=now),
+    }
+
+
+def _market_event_coverage_messages(
+    issues: tuple[StoredIssue, ...],
+) -> list[str]:
+    scopes = {issue.scope for issue in issues}
+    messages: list[str] = []
+    if "bea-schedule" in scopes:
+        messages.append("美国GDP、PCE与贸易发布日程暂时无法更新")
+    if any(scope.startswith("nyfed-calendar:") for scope in scopes):
+        messages.append("部分美国经济指标月份暂时无法更新")
+    if "fomc-calendar" in scopes:
+        messages.append("美联储议息日期暂时无法更新")
+    if "bls-macro-data" in scopes:
+        messages.append("最近CPI与就业数据暂时无法更新，事件时间仍可使用")
+    if "market-consensus" in scopes:
+        messages.append("本周市场一致预期暂时无法更新；没有匹配预期时不计算预期差与方向")
+    return messages
+
+
+def _market_event_projection(
+    samples: tuple[StoredSample, ...],
+    selected_filters: dict[str, str | list[str]],
+    query: str,
+    *,
+    now: datetime,
+    current_issues: tuple[StoredIssue, ...],
+    history_payloads: tuple[dict[str, Any], ...] = (),
+    history_started_at: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    event_rows = [
+        _market_event_enriched(_sample_payload(sample), now=now)
+        for sample in samples
+        if sample.payload.get("row_type") == "EVENT"
+    ]
+    indicator_rows = [
+        _sample_payload(sample)
+        for sample in samples
+        if sample.payload.get("row_type") == "INDICATOR"
+    ]
+    upcoming_rows = [
+        row for row in event_rows if _market_event_is_upcoming(row, now=now)
+    ]
+    rows = [
+        row
+        for row in upcoming_rows
+        if _market_event_matches(
+            row,
+            selected_filters,
+            query,
+            now=now,
+        )
+    ]
+    rows.sort(
+        key=lambda row: (
+            _market_event_sort_time(row) or datetime.max.replace(tzinfo=UTC),
+            int(row.get("priority_rank") or 99),
+            str(row.get("event_title") or ""),
+        )
+    )
+    attention_rows = [
+        row
+        for row in rows
+        if int(row.get("priority_rank") or 99) <= 3
+        and _market_event_within_days(row, now=now, days=7)
+    ][:6]
+
+    today = now.astimezone(SHANGHAI_TZ).date()
+    calendar_days: list[dict[str, Any]] = []
+    for offset in range(14):
+        day = today + timedelta(days=offset)
+        day_events = [row for row in rows if row.get("calendar_date") == day.isoformat()]
+        calendar_days.append(
+            {
+                "date": day.isoformat(),
+                "day_offset": offset,
+                "events": day_events[:3],
+                "additional_count": max(0, len(day_events) - 3),
+            }
+        )
+
+    checked_times = [
+        parsed
+        for row in (*event_rows, *indicator_rows)
+        if (parsed := _payload_time(str(row.get("source_checked_at") or "")))
+        is not None
+    ]
+    history_rows = [
+        _market_event_enriched(dict(row), now=now)
+        for row in history_payloads
+        if (
+            (sort_at := _market_event_sort_time(row)) is not None
+            and sort_at < now
+        )
+    ]
+    history_rows.sort(
+        key=lambda row: (
+            _market_event_sort_time(row) or datetime.min.replace(tzinfo=UTC),
+            str(row.get("event_title") or ""),
+        ),
+        reverse=True,
+    )
+    payload = {
+        "projection_kind": "market_events",
+        "event_query": query.strip(),
+        "event_count": len(rows),
+        "next_24h_count": sum(
+            _market_event_within_days(row, now=now, days=1) for row in rows
+        ),
+        "next_7d_high_count": sum(
+            row.get("importance") == "HIGH"
+            and _market_event_within_days(row, now=now, days=7)
+            for row in rows
+        ),
+        "attention_count": len(attention_rows),
+        "recent_schedule_change_count": sum(
+            bool(row.get("schedule_changed_recently")) for row in rows
+        ),
+        "attention_events": attention_rows,
+        "calendar_days": calendar_days,
+        "indicators": sorted(
+            indicator_rows,
+            key=lambda row: str(row.get("indicator_key") or ""),
+        ),
+        "coverage_messages": _market_event_coverage_messages(current_issues),
+        "coverage_problem_count": len(current_issues),
+        "source_checked_at": (
+            iso_utc(max(checked_times)) if checked_times else None
+        ),
+        "list_title": "事件日历",
+        "history_started_at": (
+            iso_utc(history_started_at)
+            if history_started_at is not None
+            else None
+        ),
+        "history_event_count": len(history_rows),
+        "history_events": history_rows,
+    }
+    return rows, payload
+
+
+def _buyback_effective_at(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _buyback_review_payload(review: StoredBuybackReview) -> dict[str, Any]:
+    return {
+        "review_id": review.review_id,
+        "entity_key": review.entity_key,
+        "base_revision_no": review.base_revision_no,
+        "decision": review.decision,
+        "decision_label": BUYBACK_REVIEW_LABELS.get(
+            review.decision, review.decision
+        ),
+        "corrected_event_type": review.corrected_event_type,
+        "program_key": review.program_key,
+        "program_status": review.program_status,
+        "note": review.note,
+        "created_at": iso_utc(review.created_at),
+    }
+
+
+def _compact_buyback_number(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    absolute = abs(number)
+    if absolute >= 100_000_000:
+        scaled, suffix = number / 100_000_000, "亿"
+    elif absolute >= 10_000:
+        scaled, suffix = number / 10_000, "万"
+    else:
+        return f"{number:,.2f}".rstrip("0").rstrip(".")
+    return f"{scaled:,.2f}".rstrip("0").rstrip(".") + suffix
+
+
+def _buyback_scale_label(payload: dict[str, Any]) -> str:
+    shares = _compact_buyback_number(payload.get("shares"))
+    amount = _compact_buyback_number(payload.get("amount"))
+    parts: list[str] = []
+    if shares is not None:
+        parts.append(f"{shares}股")
+    if amount is not None:
+        currency = str(payload.get("currency") or "").strip()
+        parts.append(f"{currency} {amount}".strip())
+    if shares is not None and amount is None:
+        parts.append("金额缺失")
+    elif amount is not None and shares is None:
+        parts.append("股数缺失")
+    return " · ".join(parts) if parts else "规模未结构化"
+
+
+def _buyback_scale_status(payload: dict[str, Any]) -> tuple[str, str | None]:
+    has_shares = _compact_buyback_number(payload.get("shares")) is not None
+    has_amount = _compact_buyback_number(payload.get("amount")) is not None
+    if has_shares and has_amount:
+        return "COMPLETE", None
+    if has_shares or has_amount:
+        return (
+            "PARTIAL",
+            "回购股数或金额字段缺失；页面未使用替代值。",
+        )
+    return (
+        "MISSING",
+        "该记录没有可展示的结构化回购股数或金额；页面未使用替代值。",
+    )
+
+
+def _buyback_intelligence_summary(payload: dict[str, Any], headline: str) -> str:
+    title = str(payload.get("title") or headline).strip()
+    issuer_name = str(payload.get("issuer_name") or "").strip()
+    if issuer_name:
+        for prefix in (f"{issuer_name}：", f"{issuer_name}:"):
+            while title.startswith(prefix):
+                title = title[len(prefix):].lstrip()
+    return title or headline
+
+
+def _buyback_system_verification(
+    entity_type: str,
+    payload: dict[str, Any],
+) -> tuple[str, str, str]:
+    event_type = str(payload.get("event_type") or "")
+    document_quality = str(payload.get("document_quality") or "")
+    if entity_type == "HKEX_EXECUTION" and document_quality == "VALID_HKEX_XLS":
+        return (
+            "VERIFIED",
+            "SYSTEM_VERIFIED",
+            "港交所官方回购日报表头、执行场所与结构化字段已通过契约校验。",
+        )
+    if (
+        entity_type == "DISCLOSURE_CANDIDATE"
+    ):
+        current_classification = str(
+            payload.get("current_title_classification") or event_type
+        )
+        if not is_target_a_share_security(
+            str(payload.get("market") or ""),
+            str(payload.get("stock_code") or ""),
+        ):
+            return (
+                "EXCLUDED",
+                "SYSTEM_EXCLUDED",
+                "证券代码属于非目标股份类别，未进入 A 股回购情报范围。",
+            )
+        if current_classification in {
+            "ANCILLARY",
+            "OUT_OF_SCOPE_OTHER_REPURCHASE",
+            "OUT_OF_SCOPE_SHARE_CLASS",
+            "OUT_OF_SCOPE_OR_UNCLASSIFIED",
+        }:
+            return (
+                "EXCLUDED",
+                "SYSTEM_EXCLUDED",
+                "公告属于辅助材料或非目标回购类型，未进入主清单。",
+            )
+        if (
+            document_quality == "VALID_PDF_TEXT"
+            and event_type in BUYBACK_SYSTEM_VERIFIED_A_EVENTS
+        ):
+            return (
+                "VERIFIED",
+                "SYSTEM_VERIFIED",
+                "交易所官方披露索引、明确事件标题与可读 PDF 原文已通过质量门。",
+            )
+    if event_type == "AMBIGUOUS_BUYBACK":
+        reason = "官方标题尚不能确定回购事件阶段，系统暂不交付为情报。"
+    elif document_quality == "VALID_PDF_NO_TEXT":
+        reason = "官方 PDF 已取得但无可校验文本，等待补充读取能力。"
+    elif document_quality == "INDEX_ONLY":
+        reason = "仅取得官方公告索引，等待原文进入证据质量门。"
+    else:
+        reason = "官方证据或结构化字段尚未完整通过系统质量门。"
+    return "PENDING", "SYSTEM_PENDING", reason
+
+
+def _buyback_entity_payload(entity: StoredBuybackEntity) -> dict[str, Any]:
+    payload = dict(entity.payload)
+    review = entity.review
+    review_status = review.decision if review is not None else "UNREVIEWED"
+    if entity.entity_type == "DISCLOSURE_CANDIDATE":
+        current_classification = classify_buyback_title(
+            str(payload.get("title") or "")
+        )
+        payload["current_title_classification"] = current_classification
+        if (
+            not (review is not None and review.corrected_event_type)
+            and current_classification in BUYBACK_EVENT_LABELS
+        ):
+            payload["event_type"] = current_classification
+            payload["event_type_label"] = BUYBACK_EVENT_LABELS[
+                current_classification
+            ]
+    if review is not None and review.corrected_event_type:
+        payload["event_type"] = review.corrected_event_type
+        payload["event_type_label"] = BUYBACK_EVENT_LABELS.get(
+            review.corrected_event_type,
+            review.corrected_event_type,
+        )
+    if review is not None and review.program_status:
+        payload["program_status"] = review.program_status
+    if review is not None and review.program_key:
+        payload["program_key"] = review.program_key
+    intelligence_scope, verification_status, verification_basis = (
+        _buyback_system_verification(entity.entity_type, payload)
+    )
+    if review_status == "REJECTED_EVENT":
+        intelligence_scope = "EXCLUDED"
+        verification_status = "HUMAN_REJECTED"
+        verification_basis = "人工校正记录已将当前 revision 排除为非目标回购事件。"
+    elif review_status == "CONFIRMED_EVENT":
+        intelligence_scope = "VERIFIED"
+        verification_status = "HUMAN_CONFIRMED"
+        verification_basis = "人工校正记录已确认当前 revision，并覆盖相应事件字段。"
+    elif review_status == "NEEDS_FOLLOW_UP":
+        intelligence_scope = "PENDING"
+        verification_status = "NEEDS_FOLLOW_UP"
+        verification_basis = "人工校正记录要求补充核对，暂不进入默认情报清单。"
+    verification_labels = {
+        "SYSTEM_VERIFIED": "系统已核验",
+        "HUMAN_CONFIRMED": "人工校正确认",
+        "SYSTEM_PENDING": "系统待补全",
+        "SYSTEM_EXCLUDED": "系统已排除",
+        "HUMAN_REJECTED": "人工已排除",
+        "NEEDS_FOLLOW_UP": "待补充核对",
+    }
+    event_type = str(payload.get("event_type") or "")
+    attention_level, attention_label = classify_buyback_attention(
+        event_type, intelligence_scope
+    )
+    headline = str(
+        payload.get("event_type_label")
+        or BUYBACK_EVENT_LABELS.get(event_type, event_type)
+    )
+    if entity.entity_type == "HKEX_EXECUTION":
+        intelligence_summary = "港交所官方日报记录本次实际回购"
+    else:
+        intelligence_summary = _buyback_intelligence_summary(payload, headline)
+    scale_status, scale_reason = _buyback_scale_status(payload)
+    payload.update(
+        {
+            "entity_key": entity.entity_key,
+            "entity_type": entity.entity_type,
+            "revision_no": entity.revision_no,
+            "revision_id": entity.revision_id,
+            "observed_at": iso_utc(entity.observed_at),
+            "effective_at": iso_utc(entity.effective_at),
+            "effective_date": entity.effective_at.astimezone(
+                SHANGHAI_TZ
+            ).date().isoformat(),
+            "document_sha256": entity.document_sha256,
+            "review_status": review_status,
+            "review_status_label": BUYBACK_REVIEW_LABELS[review_status],
+            "review_created_at": (
+                iso_utc(review.created_at) if review is not None else None
+            ),
+            "intelligence_scope": intelligence_scope,
+            "verification_status": verification_status,
+            "verification_status_label": verification_labels[verification_status],
+            "verification_basis": verification_basis,
+            "verification_boundary": (
+                "核验确认所示官方回购事实及字段来源；不包含收益方向、买卖建议或仓位。"
+            ),
+            "is_verified_intelligence": intelligence_scope == "VERIFIED",
+            "attention_level": attention_level,
+            "attention_label": attention_label,
+            "security_label": " · ".join(
+                value
+                for value in (
+                    str(payload.get("stock_code") or "").strip(),
+                    str(payload.get("issuer_name") or "").strip(),
+                )
+                if value
+            ),
+            "intelligence_headline": headline,
+            "intelligence_summary": intelligence_summary,
+            "scale_label": _buyback_scale_label(payload),
+            "scale_status": scale_status,
+            "scale_reason": scale_reason,
+        }
+    )
+    if intelligence_scope == "EXCLUDED":
+        payload["row_tone"] = "DISABLED"
+        payload["candidate_status"] = "REJECTED_EVENT"
+        payload["data_quality_label"] = "人工校正排除"
+        payload["no_action_reason"] = "REVIEW_REJECTED"
+    elif intelligence_scope == "VERIFIED":
+        payload.pop("row_tone", None)
+        payload["candidate_status"] = "VERIFIED_INTELLIGENCE"
+        payload["data_quality_label"] = verification_labels[verification_status]
+    else:
+        payload["row_tone"] = "WARNING"
+        payload["candidate_status"] = "SYSTEM_PENDING"
+    return payload
+
+
+BUYBACK_LIST_FIELDS = frozenset(
+    {
+        "entity_key",
+        "entity_type",
+        "revision_no",
+        "observed_at",
+        "effective_at",
+        "effective_date",
+        "market_scope",
+        "market",
+        "market_label",
+        "stock_code",
+        "issuer_name",
+        "event_type",
+        "event_type_label",
+        "attention_level",
+        "attention_label",
+        "security_label",
+        "connect_status",
+        "connect_status_label",
+        "connect_route_label",
+        "daily_change_percent",
+        "attractiveness_score",
+        "attractiveness_level",
+        "attractiveness_label",
+        "attractiveness_summary",
+        "attractiveness_explanation",
+        "roe_percent",
+        "revenue_yoy_percent",
+        "net_profit_yoy_percent",
+        "execution_days_value",
+        "execution_days_label",
+        "execution_days_scope",
+        "cumulative_shares",
+        "cumulative_shares_label",
+        "cumulative_amount",
+        "cumulative_amount_label",
+        "recent_amount_label",
+        "average_cost",
+        "average_cost_label",
+        "average_cost_scope_label",
+        "recent_average_cost_label",
+        "current_price",
+        "current_price_label",
+        "price_vs_average_percent",
+        "recent_price_vs_average_percent",
+        "actual_amount_yield_percent",
+        "intelligence_scope",
+        "intelligence_headline",
+        "intelligence_summary",
+        "row_tone",
+        "review_status",
+        "scale_status",
+        "scale_label",
+        "scale_reason",
+        "missing_reasons",
+        "currency",
+    }
+)
+
+
+def _buyback_list_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bound the high-cardinality list response; details remain on their endpoint."""
+
+    return {key: value for key, value in payload.items() if key in BUYBACK_LIST_FIELDS}
+
+
+def _buyback_source_payload(source: StoredBuybackSourceState) -> dict[str, Any]:
+    tone = {
+        "SUCCESS": "HEALTHY",
+        "EMPTY": "HEALTHY",
+        "PARTIAL": "PARTIAL",
+        "STALE": "STALE",
+        "ERROR": "FAILED",
+    }.get(source.status, "UNKNOWN")
+    labels = {
+        "SUCCESS": "读取成功",
+        "EMPTY": "已检查 · 无记录",
+        "PARTIAL": "部分可用",
+        "STALE": "读取失败 · 保留旧值",
+        "ERROR": "读取失败 · 无可用值",
+    }
+    summary_keys = {
+        "as_of",
+        "window_start",
+        "window_end",
+        "candidate_count",
+        "target_candidate_count",
+        "report_count",
+        "hkex_execution_row_count",
+        "cross_market_row_count",
+        "new_document_count",
+        "existing_document_count",
+        "fallback_document_count",
+        "failed_document_count",
+        "empty_text_document_count",
+        "backlog_count",
+        "run_document_limit",
+        "page_count",
+        "programme_count",
+        "quote_count",
+        "requested_count",
+    }
+    return {
+        "source_key": source.source_key,
+        "source_label": source.source_label,
+        "status": source.status,
+        "status_label": labels.get(source.status, source.status),
+        "tone": tone,
+        "checked_at": iso_utc(source.checked_at),
+        "source_time": (
+            iso_utc(source.source_time) if source.source_time is not None else None
+        ),
+        "next_due_at": iso_utc(source.next_due_at),
+        "record_count": source.record_count,
+        "detail_code": source.detail_code,
+        "summary": {
+            key: value
+            for key, value in source.payload.items()
+            if key in summary_keys
+        },
     }
 
 
@@ -620,7 +1618,12 @@ def _forward_evaluation_payload(
     definition = monitor.view.evaluation
     if definition is None:
         return None
-    summary = store.forward_evaluation_summary(monitor.monitor_id, now=now)
+    evaluation_source = getattr(monitor, "evaluation_source", None)
+    summary = store.forward_evaluation_summary(
+        monitor.monitor_id,
+        now=now,
+        source=evaluation_source,
+    )
     due_cases = int(summary["due_cases"])
     completed_cases = int(summary["completed_cases"])
     coverage_percent = (
@@ -675,6 +1678,7 @@ def _forward_evaluation_payload(
             for item in store.recent_forward_evaluations(
                 monitor.monitor_id,
                 limit=120,
+                source=evaluation_source,
             )
         ],
     }
@@ -716,6 +1720,54 @@ def create_app(
     start_scheduler: bool = True,
 ) -> FastAPI:
     static_root = Path(__file__).with_name("static")
+    buyback_cache_lock = threading.Lock()
+    buyback_cache: dict[str, Any] = {"key": None}
+
+    def buyback_projection(monitor_id: str, *, now: datetime) -> dict[str, Any]:
+        display_limit = 19_999
+        cache_key = (
+            monitor_id,
+            store.buyback_projection_version(monitor_id),
+            int(now.timestamp() // 60),
+        )
+        with buyback_cache_lock:
+            if buyback_cache.get("key") == cache_key:
+                return dict(buyback_cache)
+            entity_window = store.latest_buyback_entities(
+                monitor_id,
+                limit=display_limit + 1,
+            )
+            entities = entity_window[:display_limit]
+            entity_payloads = tuple(_buyback_entity_payload(entity) for entity in entities)
+            source_states = store.buyback_source_states(monitor_id)
+            projected = project_buyback_metrics(
+                entity_payloads,
+                source_payloads={
+                    source.source_key: dict(source.payload) for source in source_states
+                },
+                source_statuses={
+                    source.source_key: source.status for source in source_states
+                },
+                now=now,
+            )
+            rows = tuple(_buyback_list_payload(row) for row in projected)
+            buyback_cache.clear()
+            buyback_cache.update(
+                {
+                    "key": cache_key,
+                    "rows": rows,
+                    "rows_by_key": {
+                        str(row.get("entity_key") or ""): row
+                        for row in rows
+                        if row.get("entity_key")
+                    },
+                    "source_states": source_states,
+                    "entity_count": len(entity_payloads),
+                    "entity_truncated": len(entity_window) > display_limit,
+                    "display_limit": display_limit,
+                }
+            )
+            return dict(buyback_cache)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -785,8 +1837,35 @@ def create_app(
         return FileResponse(static_root / "index.html")
 
     @app.get("/healthz", include_in_schema=False)
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> Response:
+        if scheduler is None or not start_scheduler:
+            return JSONResponse(
+                {"status": "ok", "scheduler": "not_managed_by_app"}
+            )
+        workers = scheduler.worker_states()
+        healthy = scheduler.healthy
+        return JSONResponse(
+            {
+                "status": "ok" if healthy else "degraded",
+                "scheduler": "running" if scheduler.started else "stopped",
+                "workers": [
+                    {
+                        "monitor_id": worker.monitor_id,
+                        "alive": worker.alive,
+                        "collecting": worker.collecting,
+                        "manual_run_pending": worker.manual_run_pending,
+                        "last_seen_at": (
+                            iso_utc(worker.last_seen_at)
+                            if worker.last_seen_at is not None
+                            else None
+                        ),
+                        "last_error": worker.last_error,
+                    }
+                    for worker in workers
+                ],
+            },
+            status_code=200 if healthy else 503,
+        )
 
     @app.get("/api/view")
     def view(
@@ -794,6 +1873,8 @@ def create_app(
         monitor_id: str | None = None,
         hours: int = Query(default=6),
         series_key: str | None = None,
+        stock_query: str = Query(default="", max_length=64),
+        event_query: str = Query(default="", max_length=64),
     ) -> dict[str, Any]:
         if hours not in ALLOWED_WINDOWS:
             raise HTTPException(status_code=422, detail="TIME_WINDOW_UNSUPPORTED")
@@ -810,75 +1891,239 @@ def create_app(
                 ) from None
 
         now = utc_now()
-        summaries = [_monitor_summary(monitor, store, now=now) for monitor in monitors]
+        summaries = [
+            _monitor_summary(monitor, store, now=now, scheduler=scheduler)
+            for monitor in monitors
+        ]
         selected_summary = next(
             item for item in summaries if item["monitor_id"] == selected.monitor_id
         )
-        selected_filters: dict[str, str] = {}
+        selected_filters: dict[str, str | list[str]] = {}
         filter_payload: list[dict[str, Any]] = []
         for definition in selected.view.filters:
-            requested = request.query_params.get(definition.key, definition.default)
             allowed = {choice.value for choice in definition.choices}
-            if requested not in allowed:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"FILTER_VALUE_UNSUPPORTED_{definition.key.upper()}",
+            if definition.multiple:
+                requested_values = request.query_params.getlist(definition.key)
+                if not requested_values:
+                    requested_values = [definition.default]
+                requested = list(dict.fromkeys(requested_values))
+                if not requested or any(value not in allowed for value in requested):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"FILTER_VALUE_UNSUPPORTED_{definition.key.upper()}",
+                    )
+            else:
+                requested = request.query_params.get(
+                    definition.key,
+                    definition.default,
                 )
+                if requested not in allowed:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"FILTER_VALUE_UNSUPPORTED_{definition.key.upper()}",
+                    )
             selected_filters[definition.key] = requested
             filter_payload.append(
                 {
                     "key": definition.key,
                     "label": definition.label,
                     "selected": requested,
+                    "multiple": definition.multiple,
                     "choices": [
-                        {"value": choice.value, "label": choice.label}
+                        {
+                            "value": choice.value,
+                            "label": choice.label,
+                            "description": choice.description,
+                        }
                         for choice in definition.choices
                     ],
                 }
             )
 
-        data_run = store.latest_sample_run(selected.monitor_id)
-        samples = store.samples_for_run(data_run.run_id) if data_run else ()
-        rows = [
-            sample
-            for sample in samples
-            if all(
-                value == "*" or str(sample.payload.get(key, "")) == value
-                for key, value in selected_filters.items()
-            )
-        ]
-        available_series = {sample.series_key for sample in rows}
-        selected_series = (
-            series_key
-            if series_key in available_series
-            else rows[0].series_key
-            if rows
-            else None
-        )
-        history = (
-            store.history(
-                selected.monitor_id,
-                selected_series,
-                since=now - timedelta(hours=hours),
-            )
-            if selected_series is not None
-            else ()
-        )
-        history_points, collection_gaps = _history_payload(
-            history,
-            interval_seconds=selected.interval_seconds,
-            now=now,
-        )
         issues = store.recent_issues(selected.monitor_id, limit=20)
         latest_run = store.latest_run(selected.monitor_id)
         current_issues = (
             store.issues_for_run(latest_run.run_id) if latest_run is not None else ()
         )
-        promoted_columns = _promoted_uniform_columns(selected, samples)
-
+        projection_kind = getattr(selected, "projection_kind", "time_series")
+        is_buyback = projection_kind == "buyback"
+        is_market_events = projection_kind == "market_events"
+        buyback_payload: dict[str, Any] | None = None
+        market_events_payload: dict[str, Any] | None = None
+        if is_buyback:
+            data_run = store.latest_completed_run(selected.monitor_id)
+            samples: tuple[StoredSample, ...] = ()
+            projection = buyback_projection(selected.monitor_id, now=now)
+            all_row_payloads = projection["rows"]
+            source_states = projection["source_states"]
+            row_payloads = [
+                row
+                for row in all_row_payloads
+                if row["intelligence_scope"] == "VERIFIED"
+                and _buyback_stock_matches(row, stock_query)
+                and _row_matches_filters(row, selected_filters)
+            ]
+            selected_series = None
+            history_points: list[dict[str, Any]] = []
+            collection_gaps: list[dict[str, Any]] = []
+            promoted_columns: dict[str, Any] = {}
+            intelligence_count = len(row_payloads)
+            fresh_intelligence_count = sum(
+                (
+                    parsed := _buyback_effective_at(row.get("effective_at"))
+                ) is not None
+                and parsed >= now - timedelta(hours=24)
+                for row in row_payloads
+            )
+            execution_count = sum(
+                row.get("event_type") in BUYBACK_EXECUTION_EVENTS
+                for row in row_payloads
+            )
+            priority_count = sum(
+                row.get("attention_level") == "PRIORITY"
+                for row in row_payloads
+            )
+            high_attractiveness_count = sum(
+                row.get("attractiveness_level") == "HIGH"
+                for row in row_payloads
+            )
+            pending_count = sum(
+                row["intelligence_scope"] == "PENDING"
+                for row in all_row_payloads
+            )
+            excluded_count = sum(
+                row["intelligence_scope"] == "EXCLUDED"
+                for row in all_row_payloads
+            )
+            source_problem_count = sum(
+                source.status not in {"SUCCESS", "EMPTY"}
+                for source in source_states
+            )
+            source_checked_at = max(
+                (source.checked_at for source in source_states),
+                default=None,
+            )
+            buyback_payload = {
+                "projection_kind": "buyback",
+                "entity_count": projection["entity_count"],
+                "entity_truncated": projection["entity_truncated"],
+                "display_limit": projection["display_limit"],
+                "filtered_entity_count": len(row_payloads),
+                "stock_query": stock_query.strip(),
+                "intelligence_count": intelligence_count,
+                "fresh_intelligence_count": fresh_intelligence_count,
+                "execution_count": execution_count,
+                "priority_count": priority_count,
+                "high_attractiveness_count": high_attractiveness_count,
+                "pending_count": pending_count,
+                "excluded_count": excluded_count,
+                "source_problem_count": source_problem_count,
+                "source_checked_at": (
+                    iso_utc(source_checked_at)
+                    if source_checked_at is not None
+                    else None
+                ),
+                "list_title": selected.view.table_title,
+                "source_states": [
+                    _buyback_source_payload(source) for source in source_states
+                ],
+            }
+            run_summary_payload = []
+        elif is_market_events:
+            data_run = store.latest_completed_run(selected.monitor_id)
+            samples = store.samples_for_run(data_run.run_id) if data_run else ()
+            history_revisions = store.latest_market_event_revisions(
+                selected.monitor_id,
+                limit=5000,
+            )
+            history_payloads = tuple(
+                {
+                    **revision.payload,
+                    "history_revision_no": revision.revision_no,
+                    "history_observed_at": iso_utc(revision.observed_at),
+                    "history_state": revision.state,
+                }
+                for revision in history_revisions
+            )
+            row_payloads, market_events_payload = _market_event_projection(
+                samples,
+                selected_filters,
+                event_query,
+                now=now,
+                current_issues=current_issues,
+                history_payloads=history_payloads,
+                history_started_at=store.market_event_history_started_at(
+                    selected.monitor_id
+                ),
+            )
+            selected_series = None
+            history_points = []
+            collection_gaps = []
+            promoted_columns = {}
+            run_summary_payload = []
+        else:
+            data_run = store.latest_sample_run(selected.monitor_id)
+            samples = store.samples_for_run(data_run.run_id) if data_run else ()
+            if projection_kind == "altcoin_radar":
+                samples = tuple(
+                    sample
+                    for sample in samples
+                    if sample.payload.get("market_scope") == "USDM_PERPETUAL"
+                )
+            rows = [
+                sample
+                for sample in samples
+                if _row_matches_filters(sample.payload, selected_filters)
+            ]
+            row_payloads = [_sample_payload(sample) for sample in rows]
+            available_series = {sample.series_key for sample in rows}
+            selected_series = (
+                series_key
+                if series_key in available_series
+                else rows[0].series_key
+                if rows
+                else None
+            )
+            history = (
+                store.history(
+                    selected.monitor_id,
+                    selected_series,
+                    since=now - timedelta(hours=hours),
+                )
+                if selected_series is not None
+                else ()
+            )
+            history_points, collection_gaps = _history_payload(
+                history,
+                interval_seconds=selected.interval_seconds,
+                now=now,
+            )
+            promoted_columns = _promoted_uniform_columns(selected, samples)
+            run_summary_payload = _run_summary_payload(
+                selected,
+                samples,
+                promoted_columns,
+            )
+        refresh_after_seconds = 15
+        automatic_collection = selected_summary.get("automatic_collection")
+        if is_buyback and automatic_collection is not None:
+            automatic_status = str(automatic_collection.get("status") or "")
+            latest_selected_run = selected_summary.get("latest_run")
+            if latest_selected_run and latest_selected_run.get("status") == "RUNNING":
+                refresh_after_seconds = 15
+            elif automatic_status == "CLOSED":
+                next_open = _payload_time(automatic_collection.get("next_open_at"))
+                refresh_after_seconds = (
+                    max(15, min(round((next_open - now).total_seconds()) + 2, 7 * 86400))
+                    if next_open is not None
+                    else 300
+                )
+            elif automatic_status == "UNAVAILABLE":
+                refresh_after_seconds = 300
         service_status, service_status_label = _overall_data_status(summaries)
         return {
             "server_time": iso_utc(now),
+            "refresh_after_seconds": refresh_after_seconds,
             "service_status": service_status,
             "service_status_label": service_status_label,
             "collection_load": _collection_load(monitors, summaries, now=now),
@@ -898,13 +2143,12 @@ def create_app(
                 "show_description": selected.view.show_description,
                 "data_run": _run_payload(data_run),
                 "configuration": _configuration_payload(selected, store),
+                "projection_kind": projection_kind,
             },
-            "rows": [_sample_payload(sample) for sample in rows],
-            "run_summary": _run_summary_payload(
-                selected,
-                samples,
-                promoted_columns,
-            ),
+            "rows": row_payloads,
+            "run_summary": run_summary_payload,
+            "buyback": buyback_payload,
+            "market_events": market_events_payload,
             "evaluation": _forward_evaluation_payload(selected, store, now=now),
             "selected_series_key": selected_series,
             "history": history_points,
@@ -942,18 +2186,55 @@ def create_app(
         )
         if scheduler is not None:
             stored = scheduler.set_enabled(monitor_id, body.enabled)
-            # set_enabled() already wakes the monitor thread. A second
-            # request_run() can race with the thread clearing its event and
-            # accidentally start an immediate duplicate collection.
-            refresh_requested = bool(body.enabled and scheduler.started)
+            automatic_state = scheduler.automatic_collection_state(
+                monitor_id,
+                now=utc_now(),
+            )
+            # set_enabled() already wakes the worker. Scheduled monitors only
+            # start automatically when their current calendar gate is open.
+            refresh_requested = bool(
+                body.enabled
+                and scheduler.started
+                and (automatic_state is None or automatic_state.allowed)
+            )
         else:
             stored = store.set_enabled(monitor_id, body.enabled)
             refresh_requested = False
+            automatic_state = None
         return {
             "status": "APPLIED",
             "enabled": stored.enabled,
             "updated_at": iso_utc(stored.updated_at),
             "refresh_requested": refresh_requested,
+            "automatic_collection": _automatic_collection_payload(
+                automatic_state
+            ),
+        }
+
+    @app.post("/api/monitors/{monitor_id}/refresh")
+    def refresh_monitor(monitor_id: str, request: Request) -> dict[str, Any]:
+        origin = request.headers.get("origin")
+        expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+        if origin is not None and origin.rstrip("/") != expected_origin:
+            raise HTTPException(status_code=403, detail="ORIGIN_NOT_ALLOWED")
+        try:
+            registry.get(monitor_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="MONITOR_NOT_FOUND") from None
+        if scheduler is None or not scheduler.started:
+            raise HTTPException(status_code=503, detail="SCHEDULER_NOT_RUNNING")
+        if not store.is_enabled(monitor_id):
+            raise HTTPException(status_code=409, detail="MONITOR_DISABLED")
+        latest = store.latest_run(monitor_id)
+        if not scheduler.request_run(monitor_id):
+            raise HTTPException(status_code=409, detail="REFRESH_NOT_ACCEPTED")
+        return {
+            "status": "ACCEPTED",
+            "manual": True,
+            "run_after": latest.run_id if latest is not None else 0,
+            "automatic_collection": _automatic_collection_payload(
+                scheduler.automatic_collection_state(monitor_id, now=utc_now())
+            ),
         }
 
     @app.put("/api/monitors/{monitor_id}/configuration")
@@ -998,6 +2279,139 @@ def create_app(
                 "updated_at": iso_utc(stored.updated_at),
             },
         }
+
+    @app.get("/api/buybacks/entities/{entity_key}")
+    def buyback_entity_detail(entity_key: str) -> dict[str, Any]:
+        if not entity_key or len(entity_key) > 256:
+            raise HTTPException(status_code=404, detail="BUYBACK_ENTITY_NOT_FOUND")
+        entity = store.buyback_entity(BUYBACK_MONITOR_ID, entity_key)
+        if entity is None:
+            raise HTTPException(status_code=404, detail="BUYBACK_ENTITY_NOT_FOUND")
+        revisions = store.buyback_entity_revisions(
+            BUYBACK_MONITOR_ID,
+            entity_key,
+        )
+        reviews = store.buyback_reviews(BUYBACK_MONITOR_ID, entity_key)
+        document_payload = None
+        if entity.document_sha256 is not None:
+            document = store.buyback_document(entity.document_sha256)
+            if document is not None:
+                document_payload = {
+                    "sha256": document.sha256,
+                    "source_key": document.source_key,
+                    "source_label": document.source_label,
+                    "source_document_id": document.source_document_id,
+                    "source_url": document.source_url,
+                    "published_at": (
+                        iso_utc(document.published_at)
+                        if document.published_at is not None
+                        else None
+                    ),
+                    "observed_at": iso_utc(document.observed_at),
+                    "media_type": document.media_type,
+                    "size_bytes": document.size_bytes,
+                    "quality_state": document.quality_state,
+                    "metadata": document.metadata,
+                    "local_url": f"/api/buybacks/documents/{document.sha256}",
+                }
+        base_payload = _buyback_entity_payload(entity)
+        projection = buyback_projection(BUYBACK_MONITOR_ID, now=utc_now())
+        entity_payload = {
+            **base_payload,
+            **projection["rows_by_key"].get(entity_key, {}),
+        }
+        return {
+            "entity": entity_payload,
+            "document": document_payload,
+            "reviews": [_buyback_review_payload(review) for review in reviews],
+            "revisions": [
+                {
+                    "revision_no": revision.revision_no,
+                    "revision_id": revision.revision_id,
+                    "effective_at": iso_utc(revision.effective_at),
+                    "observed_at": iso_utc(revision.observed_at),
+                    "source_key": revision.source_key,
+                    "document_sha256": revision.document_sha256,
+                    "payload_sha256": revision.payload_sha256,
+                    "payload": revision.payload,
+                }
+                for revision in revisions
+            ],
+        }
+
+    @app.post("/api/buybacks/entities/{entity_key}/reviews")
+    def create_buyback_review(
+        entity_key: str,
+        body: BuybackReviewRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        origin = request.headers.get("origin")
+        expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+        if origin is not None and origin.rstrip("/") != expected_origin:
+            raise HTTPException(status_code=403, detail="ORIGIN_NOT_ALLOWED")
+        if not entity_key or len(entity_key) > 256:
+            raise HTTPException(status_code=404, detail="BUYBACK_ENTITY_NOT_FOUND")
+        try:
+            review = store.save_buyback_review(
+                BUYBACK_MONITOR_ID,
+                entity_key,
+                base_revision_no=body.base_revision_no,
+                decision=body.decision,
+                corrected_event_type=body.corrected_event_type,
+                program_key=body.program_key,
+                program_status=body.program_status,
+                note=body.note,
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail="BUYBACK_ENTITY_NOT_FOUND",
+            ) from None
+        except RuntimeError as exc:
+            if str(exc) == "BUYBACK_REVISION_CONFLICT":
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        refreshed = store.buyback_entity(BUYBACK_MONITOR_ID, entity_key)
+        if refreshed is None:
+            raise RuntimeError("BUYBACK_ENTITY_MISSING_AFTER_REVIEW")
+        return {
+            "status": "APPLIED",
+            "review": _buyback_review_payload(review),
+            "entity": _buyback_entity_payload(refreshed),
+        }
+
+    @app.get("/api/buybacks/documents/{sha256}")
+    def buyback_document(sha256: str) -> FileResponse:
+        document = store.buyback_document(sha256.casefold())
+        if document is None:
+            raise HTTPException(status_code=404, detail="BUYBACK_DOCUMENT_NOT_FOUND")
+        try:
+            path = store.buyback_document_path(document)
+        except RuntimeError as exc:
+            if str(exc) == "BUYBACK_EVIDENCE_FILE_MISSING":
+                raise HTTPException(
+                    status_code=410,
+                    detail="BUYBACK_DOCUMENT_FILE_MISSING",
+                ) from None
+            if str(exc) in {
+                "BUYBACK_EVIDENCE_LINK_UNSUPPORTED",
+                "BUYBACK_EVIDENCE_PATH_INVALID",
+                "BUYBACK_EVIDENCE_SIZE_MISMATCH",
+                "BUYBACK_EVIDENCE_CONTENT_MISMATCH",
+            }:
+                raise HTTPException(
+                    status_code=409,
+                    detail="BUYBACK_DOCUMENT_INTEGRITY_FAILED",
+                ) from None
+            raise
+        return FileResponse(
+            path,
+            media_type=document.media_type,
+            filename=f"{document.source_document_id}{path.suffix}",
+            content_disposition_type="inline",
+        )
 
     @app.get("/favicon.ico", include_in_schema=False)
     def favicon() -> Response:

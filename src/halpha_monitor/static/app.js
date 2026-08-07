@@ -1,46 +1,119 @@
 "use strict";
 
 const MONITOR_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const RADAR_MONITOR_ID = "binance-altcoin-radar";
+const RADAR_TAB_LOCATION_VALUES = {
+  TABLE: "candidates",
+  HISTORY: "history",
+  EVALUATION: "evaluation",
+};
 
 function monitorIdFromLocation() {
   const monitorId = new URL(window.location.href).searchParams.get("monitor_id");
   return monitorId && MONITOR_ID_PATTERN.test(monitorId) ? monitorId : null;
 }
 
+function radarTabFromLocation() {
+  const requested = new URL(window.location.href).searchParams.get("view");
+  const entry = Object.entries(RADAR_TAB_LOCATION_VALUES)
+    .find(([, value]) => value === requested);
+  return entry?.[0] || "TABLE";
+}
+
+const MONITOR_RAIL_STORAGE_KEY = "halpha-monitor-rail-collapsed";
+
+function storedMonitorRailCollapsed() {
+  try {
+    return window.localStorage.getItem(MONITOR_RAIL_STORAGE_KEY) === "true";
+  } catch (_error) {
+    return false;
+  }
+}
+
 const ui = {
+  appShell: document.querySelector(".app-shell"),
   workspace: document.querySelector("#workspace"),
   serviceStatus: document.querySelector("#service-status"),
   collectionLoad: document.querySelector("#collection-load"),
   networkRequests: document.querySelector("#network-requests"),
   collectionCadence: document.querySelector("#collection-cadence"),
   lastRefresh: document.querySelector("#last-refresh"),
+  monitorRailToggle: document.querySelector("#monitor-rail-toggle"),
+  monitorRailToggleIcon: document.querySelector("#monitor-rail-toggle-icon"),
   monitorList: document.querySelector("#monitor-list"),
-  monitoringCount: document.querySelector("#monitoring-count"),
-  healthyCount: document.querySelector("#healthy-count"),
-  staleCount: document.querySelector("#stale-count"),
-  failedCount: document.querySelector("#failed-count"),
-  disabledCount: document.querySelector("#disabled-count"),
-  summaryCutoff: document.querySelector("#summary-cutoff"),
   monitorTitle: document.querySelector("#monitor-title"),
   monitorDescription: document.querySelector("#monitor-description"),
   monitorMethodNote: document.querySelector("#monitor-method-note"),
   monitorState: document.querySelector("#monitor-state"),
+  diagnosticsOpen: document.querySelector("#diagnostics-open"),
+  diagnosticsOpenCount: document.querySelector("#diagnostics-open-count"),
+  monitorRefreshButton: document.querySelector("#monitor-refresh-button"),
   monitorControlButton: document.querySelector("#monitor-control-button"),
   monitorControlStatus: document.querySelector("#monitor-control-status"),
+  filtersRegion: document.querySelector("#filters"),
+  historyWindowField: document.querySelector(".history-window-field"),
   configurationRegion: document.querySelector("#configuration-region"),
   configurationForm: document.querySelector("#configuration-form"),
   configurationFields: document.querySelector("#configuration-fields"),
   configurationSubmit: document.querySelector("#configuration-submit"),
   configurationStatus: document.querySelector("#configuration-status"),
   filters: document.querySelector("#dynamic-filters"),
+  buybackStockSearchField: document.querySelector("#buyback-stock-search-field"),
+  buybackStockSearch: document.querySelector("#buyback-stock-search"),
+  eventSearchField: document.querySelector("#event-search-field"),
+  eventSearch: document.querySelector("#event-search"),
   timeWindow: document.querySelector("#time-window"),
   dataCutoff: document.querySelector("#data-cutoff"),
   quoteScroll: document.querySelector("#quote-scroll"),
+  quoteHorizontalScrollbar: document.querySelector("#quote-horizontal-scrollbar"),
+  quoteHorizontalScrollbarTrack: document.querySelector("#quote-horizontal-scrollbar-track"),
   quoteTableTitle: document.querySelector("#quote-table-title"),
+  tablePagination: document.querySelector("#table-pagination"),
+  tablePageSummary: document.querySelector("#table-page-summary"),
+  tablePagePrevious: document.querySelector("#table-page-previous"),
+  tablePageSelect: document.querySelector("#table-page-select"),
+  tablePageTotal: document.querySelector("#table-page-total"),
+  tablePageNext: document.querySelector("#table-page-next"),
   runSummary: document.querySelector("#run-summary"),
   quoteHead: document.querySelector("#quote-head"),
   quoteBody: document.querySelector("#quote-body"),
   quoteEmpty: document.querySelector("#quote-empty"),
+  buybackOverviewRegion: document.querySelector("#buyback-overview-region"),
+  buybackOverview: document.querySelector("#buyback-overview"),
+  buybackSourceRegion: document.querySelector("#buyback-source-region"),
+  buybackSourceSummary: document.querySelector("#buyback-source-summary"),
+  buybackSourceGrid: document.querySelector("#buyback-source-grid"),
+  eventSourceRegion: document.querySelector("#event-source-region"),
+  eventSourceSummary: document.querySelector("#event-source-summary"),
+  eventSourceDetails: document.querySelector("#event-source-details"),
+  eventViewTabs: document.querySelector("#event-view-tabs"),
+  eventUpcomingTab: document.querySelector("#event-upcoming-tab"),
+  eventHistoryTab: document.querySelector("#event-history-tab"),
+  eventHistoryCount: document.querySelector("#event-history-count"),
+  radarViewTabs: document.querySelector("#radar-view-tabs"),
+  radarTableTab: document.querySelector("#radar-table-tab"),
+  radarHistoryTab: document.querySelector("#radar-history-tab"),
+  radarEvaluationTab: document.querySelector("#radar-evaluation-tab"),
+  eventAttentionRegion: document.querySelector("#event-attention-region"),
+  eventAttentionSummary: document.querySelector("#event-attention-summary"),
+  eventSourceCutoff: document.querySelector("#event-source-cutoff"),
+  eventAttentionCards: document.querySelector("#event-attention-cards"),
+  eventAttentionEmpty: document.querySelector("#event-attention-empty"),
+  macroIndicatorRegion: document.querySelector("#macro-indicator-region"),
+  macroIndicatorCards: document.querySelector("#macro-indicator-cards"),
+  eventCalendarRegion: document.querySelector("#event-calendar-region"),
+  eventCalendarGrid: document.querySelector("#event-calendar-grid"),
+  eventHistoryRegion: document.querySelector("#event-history-region"),
+  eventHistorySummary: document.querySelector("#event-history-summary"),
+  eventHistoryBody: document.querySelector("#event-history-body"),
+  eventHistoryPagination: document.querySelector("#event-history-pagination"),
+  eventHistoryPageSummary: document.querySelector("#event-history-page-summary"),
+  eventHistoryPrevious: document.querySelector("#event-history-previous"),
+  eventHistoryNext: document.querySelector("#event-history-next"),
+  eventHistoryPageStatus: document.querySelector("#event-history-page-status"),
+  eventHistoryEmpty: document.querySelector("#event-history-empty"),
+  tableRegion: document.querySelector("#table-region"),
+  historyRegion: document.querySelector("#history-region"),
   historyTitle: document.querySelector("#history-title"),
   historySeries: document.querySelector("#history-series"),
   historyChart: document.querySelector("#history-chart"),
@@ -58,11 +131,48 @@ const ui = {
   evaluationGroupEmpty: document.querySelector("#evaluation-group-empty"),
   evaluationRecentBody: document.querySelector("#evaluation-recent-body"),
   evaluationRecentEmpty: document.querySelector("#evaluation-recent-empty"),
-  diagnosticsRegion: document.querySelector("#diagnostics-region"),
+  diagnosticsDialog: document.querySelector("#diagnostics-dialog"),
+  diagnosticsDialogClose: document.querySelector("#diagnostics-dialog-close"),
+  diagnosticsDialogSubtitle: document.querySelector("#diagnostics-dialog-subtitle"),
   issueCount: document.querySelector("#issue-count"),
+  issueScroll: document.querySelector("#issue-scroll"),
   issueBody: document.querySelector("#issue-body"),
   issueEmpty: document.querySelector("#issue-empty"),
+  backToTop: document.querySelector("#back-to-top"),
   pageError: document.querySelector("#page-error"),
+  buybackDetailDialog: document.querySelector("#buyback-detail-dialog"),
+  buybackDetailClose: document.querySelector("#buyback-detail-close"),
+  buybackDetailTitle: document.querySelector("#buyback-detail-title"),
+  buybackDetailSubtitle: document.querySelector("#buyback-detail-subtitle"),
+  buybackDetailStatus: document.querySelector("#buyback-detail-status"),
+  buybackDetailContent: document.querySelector("#buyback-detail-content"),
+  buybackFacts: document.querySelector("#buyback-facts"),
+  buybackEvidenceLinks: document.querySelector("#buyback-evidence-links"),
+  buybackEvidenceMeta: document.querySelector("#buyback-evidence-meta"),
+  buybackEvidenceExcerpt: document.querySelector("#buyback-evidence-excerpt"),
+  buybackReviewForm: document.querySelector("#buyback-review-form"),
+  buybackReviewDecision: document.querySelector("#buyback-review-decision"),
+  buybackReviewEventType: document.querySelector("#buyback-review-event-type"),
+  buybackReviewProgramKey: document.querySelector("#buyback-review-program-key"),
+  buybackReviewProgramStatus: document.querySelector("#buyback-review-program-status"),
+  buybackReviewNote: document.querySelector("#buyback-review-note"),
+  buybackReviewSubmit: document.querySelector("#buyback-review-submit"),
+  buybackReviewHistory: document.querySelector("#buyback-review-history"),
+  marketEventDetailDialog: document.querySelector("#market-event-detail-dialog"),
+  marketEventDetailClose: document.querySelector("#market-event-detail-close"),
+  marketEventDetailTitle: document.querySelector("#market-event-detail-title"),
+  marketEventDetailSubtitle: document.querySelector("#market-event-detail-subtitle"),
+  marketEventDetailFacts: document.querySelector("#market-event-detail-facts"),
+  marketEventImpactReason: document.querySelector("#market-event-impact-reason"),
+  marketEventDescription: document.querySelector("#market-event-description"),
+  marketEventHowToRead: document.querySelector("#market-event-how-to-read"),
+  marketEventDecisionRule: document.querySelector("#market-event-decision-rule"),
+  marketEventDirectionSection: document.querySelector("#market-event-direction-section"),
+  marketEventDirectionLabel: document.querySelector("#market-event-direction-label"),
+  marketEventDirectionAction: document.querySelector("#market-event-direction-action"),
+  marketEventDirectionFormula: document.querySelector("#market-event-direction-formula"),
+  marketEventDirectionInputs: document.querySelector("#market-event-direction-inputs"),
+  marketEventSourceLinks: document.querySelector("#market-event-source-links"),
 };
 
 const state = {
@@ -75,7 +185,9 @@ const state = {
   configurationDirty: false,
   configurationSubmitting: false,
   controlSubmitting: false,
+  manualRefreshSubmitting: false,
   pendingControl: null,
+  pendingManualRefresh: null,
   pendingConfigurationRunAfter: null,
   latestRunId: null,
   chartModel: null,
@@ -84,12 +196,39 @@ const state = {
   chartDrag: null,
   chartResizeTimer: null,
   tableSort: null,
+  tablePage: 1,
+  monitorRailCollapsed: storedMonitorRailCollapsed(),
+  projectionKind: "time_series",
+  buybackStockQuery: "",
+  buybackStockSearchTimer: null,
+  eventQuery: "",
+  eventSearchTimer: null,
+  eventTab: "UPCOMING",
+  radarTab: radarTabFromLocation(),
+  eventHistoryPage: 1,
+  marketEventPayload: null,
+  buybackDetailEntityKey: null,
+  buybackDetailRevisionNo: null,
+  buybackReviewSubmitting: false,
 };
 
 const TABLE_TEXT_COLLATOR = new Intl.Collator("zh-CN", {
   numeric: true,
   sensitivity: "base",
 });
+
+const BUYBACK_TABLE_PAGE_SIZE = 50;
+const MARKET_EVENT_TABLE_PAGE_SIZE = 50;
+const MARKET_EVENT_HISTORY_PAGE_SIZE = 50;
+
+const MONITOR_COMPACT_LABELS = {
+  "binance-c2c-normalized": "C2C",
+  "binance-usdm-smart-money": "合约",
+  "binance-altcoin-radar": "异动",
+  "binance-btc-relationship": "BTC",
+  "a-hk-buyback": "回购",
+  "market-event-calendar": "事件",
+};
 
 const STATUS_LABELS = {
   HEALTHY: "运行正常",
@@ -128,6 +267,71 @@ const ISSUE_REASON_LABELS = {
   RADAR_OI_STALE: "OI 历史陈旧",
   RADAR_SOURCE_ROWS_MALFORMED: "来源存在畸形记录",
   RADAR_TICKER_ROWS_STALE: "行情记录陈旧",
+  BUYBACK_BACKOFF_ACTIVE: "公开来源暂时无法读取",
+  BUYBACK_DOCUMENT_RUN_LIMIT_REACHED: "部分 A 股公告原文尚未获取",
+  BUYBACK_DOCUMENTS_INCOMPLETE: "部分 A 股公告原文尚未获取",
+  BUYBACK_PDF_TEXT_EMPTY: "公告原文无法读取文字",
+  BUYBACK_HKEX_CURRENCY_INCONSISTENT: "港交所日报币种不一致",
+  BUYBACK_HKEX_REPORTS_INCOMPLETE: "部分港交所日报未能读取",
+  BUYBACK_A_REFERENCE_JSON_INVALID: "A股回购参考数据格式异常",
+  BUYBACK_A_REFERENCE_SCHEMA_CHANGED: "A股回购参考数据字段变化",
+  BUYBACK_A_REFERENCE_CONTENT_TYPE_INVALID: "A股回购参考数据响应异常",
+  BUYBACK_HK_REFERENCE_JSON_INVALID: "港股行情参考格式异常",
+  BUYBACK_HK_REFERENCE_SCHEMA_CHANGED: "港股行情参考字段变化",
+  BUYBACK_HK_REFERENCE_EMPTY: "港股行情参考没有返回目标证券",
+  BUYBACK_HK_REFERENCE_CONTENT_TYPE_INVALID: "港股行情参考响应异常",
+  BUYBACK_MARKET_REFERENCE_JSON_INVALID: "行情与业绩参考格式异常",
+  BUYBACK_MARKET_REFERENCE_TEXT_INVALID: "备用行情参考格式异常",
+  BUYBACK_MARKET_REFERENCE_SCHEMA_CHANGED: "行情与业绩参考字段变化",
+  BUYBACK_MARKET_REFERENCE_EMPTY: "行情与业绩参考没有返回目标证券",
+  BUYBACK_MARKET_REFERENCE_CONTENT_TYPE_INVALID: "行情与业绩参考响应异常",
+  BUYBACK_MARKET_REFERENCE_COUNT_INVALID: "行情与业绩参考请求范围超出上限",
+  BUYBACK_MARKET_REFERENCE_INCOMPLETE: "部分证券暂时没有行情或业绩参考",
+  BUYBACK_MARKET_PERFORMANCE_UNAVAILABLE: "业绩参考暂时不可用",
+  BUYBACK_FINANCIAL_REFERENCE_JSON_INVALID: "公开业绩参考格式异常",
+  BUYBACK_FINANCIAL_REFERENCE_SCHEMA_CHANGED: "公开业绩参考字段变化",
+  BUYBACK_FINANCIAL_REFERENCE_TRUNCATED: "公开业绩参考返回不完整",
+  BUYBACK_FINANCIAL_REFERENCE_EMPTY: "没有取得公开业绩参考",
+  BUYBACK_FINANCIAL_REFERENCE_COUNT_INVALID: "公开业绩参考请求范围超出上限",
+  BUYBACK_FINANCIAL_REFERENCE_CONTENT_TYPE_INVALID: "公开业绩参考响应异常",
+  BUYBACK_FINANCIAL_REFERENCE_INCOMPLETE: "部分证券暂时没有公开业绩参考",
+  MARKET_EVENTS_BEA_JSON_INVALID: "BEA发布日程格式异常",
+  MARKET_EVENTS_BEA_SCHEMA_CHANGED: "BEA发布日程字段变化",
+  MARKET_EVENTS_BEA_RELEASE_DATE_INVALID: "BEA发布时间异常",
+  MARKET_EVENTS_NYFED_SCHEMA_CHANGED: "纽约联储事件日历格式变化",
+  MARKET_EVENTS_NYFED_MONTH_MISMATCH: "纽约联储事件日历月份不符",
+  MARKET_EVENTS_NYFED_EVENT_TIME_MISSING: "纽约联储事件缺少发布时间",
+  MARKET_EVENTS_FOMC_SCHEMA_CHANGED: "美联储议息日历格式变化",
+  MARKET_EVENTS_FOMC_DATE_INVALID: "美联储议息日期异常",
+  MARKET_EVENTS_BLS_JSON_INVALID: "BLS宏观数据格式异常",
+  MARKET_EVENTS_BLS_RESPONSE_FAILED: "BLS宏观数据请求失败",
+  MARKET_EVENTS_BLS_SCHEMA_CHANGED: "BLS宏观数据字段变化",
+  MARKET_EVENTS_BLS_SERIES_MISSING: "BLS宏观数据序列缺失",
+  MARKET_EVENTS_BLS_SERIES_INSUFFICIENT: "BLS宏观数据不足以计算最近变化",
+  MARKET_EVENTS_BLS_PERIOD_MISMATCH: "BLS宏观数据参考期不一致",
+  MARKET_EVENTS_CONSENSUS_JSON_INVALID: "市场一致预期格式异常",
+  MARKET_EVENTS_CONSENSUS_SCHEMA_CHANGED: "市场一致预期字段变化",
+  MARKET_EVENTS_CONSENSUS_DATE_INVALID: "市场一致预期发布时间异常",
+  MARKET_EVENTS_CONSENSUS_VALUE_INVALID: "市场一致预期数值异常",
+  MARKET_EVENTS_CONSENSUS_AMBIGUOUS: "市场一致预期存在冲突",
+};
+
+const ISSUE_SCOPE_LABELS = {
+  "sse-announcements": "上交所公告索引",
+  "cninfo-sh-announcements": "巨潮沪市公告索引",
+  "cninfo-sz-announcements": "巨潮深市公告索引",
+  "a-share-documents": "A股公告原文",
+  "hkex-main-reports": "港交所主板回购日报",
+  "hkex-gem-reports": "港交所 GEM 回购日报",
+  "connect-sh": "沪港通港股名单",
+  "connect-sz": "深港通港股名单",
+  "a-share-buyback-reference": "A股回购结构化参考",
+  "hk-market-reference": "A股与港股行情参考",
+  "buyback-financial-reference": "A股与港股公开业绩参考",
+  "bea-schedule": "美国经济分析局发布日程",
+  "fomc-calendar": "美联储议息日历",
+  "bls-macro-data": "美国通胀与就业数据",
+  "market-consensus": "本周市场一致预期",
 };
 
 const ISSUE_REASON_DETAILS = {
@@ -141,7 +345,7 @@ const ISSUE_REASON_DETAILS = {
   SMART_MONEY_MARK_PRICE_STALE: "官方 USDⓈ-M 标记价时间超过允许阈值，未生成新特征",
   SMART_MONEY_OI_STALE: "官方 USDⓈ-M 持仓量时间超过允许阈值，未生成新特征",
   SMART_MONEY_OVERVIEW_STALE: "仓位总览更新时间陈旧，资金流特征保留但不使用总览字段",
-  SMART_MONEY_SCHEMA_CHANGED: "未文档化接口的字段集合与已核验契约不一致，未生成新特征",
+  SMART_MONEY_SCHEMA_CHANGED: "未文档化接口的字段集合与预期契约不一致，未生成新特征",
   RADAR_BACKOFF_ACTIVE: "Binance 上游退避窗口尚未结束，本轮没有继续发送公开行情请求",
   RADAR_CANDIDATE_COLLECTION_FAILED: "单个候选详查发生隔离失败，其他候选仍可展示",
   RADAR_FUTURES_ROWS_STALE: "资金费率来源时间超过有效截止点，相关字段保持为空",
@@ -156,7 +360,76 @@ const ISSUE_REASON_DETAILS = {
   RADAR_OI_STALE: "最新 OI 时间超过有效截止点，变化率保持为空",
   RADAR_SOURCE_ROWS_MALFORMED: "公开来源中部分记录未通过字段或数值校验，已隔离",
   RADAR_TICKER_ROWS_STALE: "部分滚动行情超过有效截止点，已从本轮候选中排除",
+  BUYBACK_BACKOFF_ACTIVE: "此前读取失败或受限，系统将在限定时间后重试；相关记录暂不展示。",
+  BUYBACK_DOCUMENT_RUN_LIMIT_REACHED: "尚未取得原文的公告会在后续检查中继续获取；相关记录暂不展示。",
+  BUYBACK_DOCUMENTS_INCOMPLETE: "部分公告尚未取得可读取的原文；相关记录暂不展示。",
+  BUYBACK_PDF_TEXT_EMPTY: "公告文件已取得，但无法从中读取文字；相关记录暂不展示。",
+  BUYBACK_HKEX_CURRENCY_INCONSISTENT: "该行金额或币种没有通过一致性校验，相关字段保持为空",
+  BUYBACK_HKEX_REPORTS_INCOMPLETE: "部分日报没有通过文件或表头契约，其他日期仍照常更新",
+  BUYBACK_A_REFERENCE_JSON_INVALID: "本轮不计算依赖A股结构化参考值的指标，公告事实仍照常展示。",
+  BUYBACK_A_REFERENCE_SCHEMA_CHANGED: "参考字段与约定不一致，本轮不计算相关衍生指标。",
+  BUYBACK_A_REFERENCE_CONTENT_TYPE_INVALID: "参考来源没有返回预期数据格式，本轮不计算相关衍生指标。",
+  BUYBACK_HK_REFERENCE_JSON_INVALID: "本轮不使用港股当前参考价，港交所回购事实仍照常展示。",
+  BUYBACK_HK_REFERENCE_SCHEMA_CHANGED: "行情参考字段与约定不一致，本轮不计算现价相关指标。",
+  BUYBACK_HK_REFERENCE_EMPTY: "目标证券没有可用行情参考，本轮不计算现价相关指标。",
+  BUYBACK_HK_REFERENCE_CONTENT_TYPE_INVALID: "行情参考没有返回预期数据格式，本轮不计算现价相关指标。",
+  BUYBACK_MARKET_REFERENCE_JSON_INVALID: "行情与业绩参考无法解析，本轮不展示相关字段。",
+  BUYBACK_MARKET_REFERENCE_TEXT_INVALID: "备用行情参考无法解析，本轮不展示相关字段。",
+  BUYBACK_MARKET_REFERENCE_SCHEMA_CHANGED: "行情与业绩参考字段与约定不一致，本轮不展示相关字段。",
+  BUYBACK_MARKET_REFERENCE_EMPTY: "目标证券没有可用行情与业绩参考，本轮不展示相关字段。",
+  BUYBACK_MARKET_REFERENCE_CONTENT_TYPE_INVALID: "行情与业绩参考没有返回预期数据格式，本轮不展示相关字段。",
+  BUYBACK_MARKET_REFERENCE_COUNT_INVALID: "目标证券数量超过单轮上限，本轮不展示行情与业绩字段。",
+  BUYBACK_MARKET_REFERENCE_INCOMPLETE: "缺少参考值的证券在对应字段显示为空，其他证券不受影响。",
+  BUYBACK_MARKET_PERFORMANCE_UNAVAILABLE: "现价、涨跌幅和市值参考可用；ROE、营收同比和净利同比暂时留空。",
+  BUYBACK_FINANCIAL_REFERENCE_JSON_INVALID: "公开业绩参考无法解析，对应业绩字段留空。",
+  BUYBACK_FINANCIAL_REFERENCE_SCHEMA_CHANGED: "公开业绩参考字段与约定不一致，对应业绩字段留空。",
+  BUYBACK_FINANCIAL_REFERENCE_TRUNCATED: "公开业绩参考超过单次读取边界，对应批次的业绩字段留空。",
+  BUYBACK_FINANCIAL_REFERENCE_EMPTY: "目标证券没有可用的公开业绩参考，对应字段留空。",
+  BUYBACK_FINANCIAL_REFERENCE_COUNT_INVALID: "目标证券数量超过单轮上限，本轮不读取业绩参考。",
+  BUYBACK_FINANCIAL_REFERENCE_CONTENT_TYPE_INVALID: "公开业绩参考没有返回预期数据格式，对应字段留空。",
+  BUYBACK_FINANCIAL_REFERENCE_INCOMPLETE: "缺少业绩参考的证券在对应字段显示为空，其他证券不受影响。",
+  MARKET_EVENTS_BEA_JSON_INVALID: "BEA机器可读日程无法解析，本轮不展示依赖该来源的GDP、PCE和贸易事件。",
+  MARKET_EVENTS_BEA_SCHEMA_CHANGED: "BEA日程字段与既定契约不一致，本轮隔离该来源。",
+  MARKET_EVENTS_BEA_RELEASE_DATE_INVALID: "BEA日程包含无效时间，本轮隔离该来源。",
+  MARKET_EVENTS_NYFED_SCHEMA_CHANGED: "该月份日历结构与既定契约不一致，本轮不展示其中事件。",
+  MARKET_EVENTS_NYFED_MONTH_MISMATCH: "页面返回的月份与请求月份不一致，本轮不展示其中事件。",
+  MARKET_EVENTS_NYFED_EVENT_TIME_MISSING: "目标事件没有可校验的发布时间，本轮不展示该月份事件。",
+  MARKET_EVENTS_FOMC_SCHEMA_CHANGED: "美联储会议日历结构与既定契约不一致，本轮不展示议息事件。",
+  MARKET_EVENTS_FOMC_DATE_INVALID: "美联储会议日期无法解析，本轮不展示议息事件。",
+  MARKET_EVENTS_BLS_JSON_INVALID: "BLS公共API响应无法解析，最近通胀与就业结果暂不展示。",
+  MARKET_EVENTS_BLS_RESPONSE_FAILED: "BLS公共API没有返回成功状态，事件日历不受影响。",
+  MARKET_EVENTS_BLS_SCHEMA_CHANGED: "BLS公共API字段与既定契约不一致，最近宏观结果暂不展示。",
+  MARKET_EVENTS_BLS_SERIES_MISSING: "计算所需的官方时间序列缺失，最近宏观结果暂不展示。",
+  MARKET_EVENTS_BLS_SERIES_INSUFFICIENT: "官方时间序列不足以计算同比或月度变化，相关结果暂不展示。",
+  MARKET_EVENTS_BLS_PERIOD_MISMATCH: "就业或通胀序列的最近参考期不一致，未拼接不同月份的数据。",
+  MARKET_EVENTS_CONSENSUS_JSON_INVALID: "本周市场一致预期响应无法解析；未使用替代预期。",
+  MARKET_EVENTS_CONSENSUS_SCHEMA_CHANGED: "市场一致预期字段与既定契约不一致；未使用替代预期。",
+  MARKET_EVENTS_CONSENSUS_DATE_INVALID: "一致预期的事件时间无效；没有与官方日历强行匹配。",
+  MARKET_EVENTS_CONSENSUS_VALUE_INVALID: "一致预期数值无法可靠解析；相关指标不计算预期差。",
+  MARKET_EVENTS_CONSENSUS_AMBIGUOUS: "同一事件同一指标出现冲突预期；相关指标不计算方向。",
 };
+
+function issueReasonLabel(reasonCode) {
+  if (ISSUE_REASON_LABELS[reasonCode]) return ISSUE_REASON_LABELS[reasonCode];
+  if (String(reasonCode).startsWith("BUYBACK_NETWORK_")) return "公开来源连接中断";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_BEA_")) return "BEA发布日程暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_NYFED_")) return "纽约联储事件日历暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_FOMC_")) return "美联储议息日历暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_BLS_")) return "BLS宏观数据暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_CONSENSUS_")) return "市场一致预期暂时无法读取";
+  return "采集过程出现未识别问题";
+}
+
+function issueReasonDetail(reasonCode) {
+  if (ISSUE_REASON_DETAILS[reasonCode]) return ISSUE_REASON_DETAILS[reasonCode];
+  if (String(reasonCode).startsWith("BUYBACK_NETWORK_")) {
+    return "读取公开来源时连接中断；系统会按计划重试，受影响字段保持为空。";
+  }
+  if (String(reasonCode).startsWith("MARKET_EVENTS_")) {
+    return "读取对应官方来源时失败；系统会按计划重试，其他来源的事件仍照常展示。";
+  }
+  return "该问题尚无更具体的页面说明；系统会保留记录并继续按计划采集。";
+}
 
 const CHART = {
   defaultWidth: 800,
@@ -181,6 +454,20 @@ function formatTime(value) {
     hour12: false,
   }).format(parsed);
   return `${rendered} UTC+8`;
+}
+
+function formatDate(value) {
+  if (!value) return "未知";
+  const text = String(value);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(parsed);
 }
 
 function formatChartTime(value, includeDate = false) {
@@ -219,6 +506,11 @@ function syncMonitorLocation(monitorId) {
   const url = new URL(window.location.href);
   if (monitorId) url.searchParams.set("monitor_id", monitorId);
   else url.searchParams.delete("monitor_id");
+  if (monitorId === RADAR_MONITOR_ID && state.projectionKind === "altcoin_radar") {
+    url.searchParams.set("view", RADAR_TAB_LOCATION_VALUES[state.radarTab]);
+  } else {
+    url.searchParams.delete("view");
+  }
   const nextLocation = `${url.pathname}${url.search}${url.hash}`;
   if (`${window.location.pathname}${window.location.search}${window.location.hash}` !== nextLocation) {
     window.history.replaceState(window.history.state, "", nextLocation);
@@ -230,11 +522,24 @@ function queryUrl() {
   if (state.monitorId) params.set("monitor_id", state.monitorId);
   params.set("hours", String(state.hours));
   if (state.seriesKey) params.set("series_key", state.seriesKey);
-  Object.entries(state.filters).forEach(([key, value]) => params.set(key, value));
+  if (state.buybackStockQuery.trim()) {
+    params.set("stock_query", state.buybackStockQuery.trim());
+  }
+  if (state.eventQuery.trim()) {
+    params.set("event_query", state.eventQuery.trim());
+  }
+  Object.entries(state.filters).forEach(([key, value]) => {
+    if (Array.isArray(value)) {
+      value.forEach((item) => params.append(key, item));
+    } else {
+      params.set(key, value);
+    }
+  });
   return `/api/view?${params.toString()}`;
 }
 
 async function loadView({ preserveSeries = true } = {}) {
+  let nextRefreshMilliseconds = 15000;
   if (!preserveSeries) state.seriesKey = null;
   if (state.request) state.request.abort();
   state.request = new AbortController();
@@ -249,7 +554,11 @@ async function loadView({ preserveSeries = true } = {}) {
       state.monitorId = null;
       state.seriesKey = null;
       state.filters = {};
+      state.buybackStockQuery = "";
+      state.eventQuery = "";
+      state.radarTab = "TABLE";
       state.tableSort = null;
+      state.tablePage = 1;
       syncMonitorLocation(null);
       response = await fetch(queryUrl(), {
         signal: state.request.signal,
@@ -259,12 +568,36 @@ async function loadView({ preserveSeries = true } = {}) {
     }
     if (!response.ok) throw new Error(`HTTP_${response.status}`);
     const payload = await response.json();
+    const requestedRefreshSeconds = Number(payload.refresh_after_seconds);
+    if (Number.isFinite(requestedRefreshSeconds)) {
+      nextRefreshMilliseconds = clamp(requestedRefreshSeconds, 15, 7 * 86400) * 1000;
+    }
     state.monitorId = payload.monitor.monitor_id;
+    state.projectionKind = payload.monitor.projection_kind || "time_series";
+    if (state.projectionKind === "buyback") {
+      if (document.activeElement !== ui.buybackStockSearch) {
+        state.buybackStockQuery = String(payload.buyback?.stock_query || "");
+      }
+    } else {
+      state.buybackStockQuery = "";
+    }
+    if (state.projectionKind === "market_events") {
+      if (document.activeElement !== ui.eventSearch) {
+        state.eventQuery = String(payload.market_events?.event_query || "");
+      }
+    } else {
+      state.eventQuery = "";
+    }
     state.seriesKey = payload.selected_series_key;
     state.filters = payload.monitor.selected_filters;
     state.latestRunId = payload.monitor.latest_run?.run_id ?? null;
     syncMonitorLocation(state.monitorId);
     render(payload);
+    if (state.pendingManualRefresh?.monitorId === state.monitorId) {
+      const manualRunStarted = Number(payload.monitor.latest_run?.run_id ?? 0)
+        > state.pendingManualRefresh.runAfter;
+      nextRefreshMilliseconds = manualRunStarted ? 15000 : 3000;
+    }
     ui.pageError.hidden = true;
     return true;
   } catch (error) {
@@ -276,18 +609,53 @@ async function loadView({ preserveSeries = true } = {}) {
   } finally {
     ui.workspace.setAttribute("aria-busy", "false");
     clearTimeout(state.refreshTimer);
-    state.refreshTimer = setTimeout(() => loadView(), 15000);
+    state.refreshTimer = setTimeout(() => loadView(), nextRefreshMilliseconds);
   }
 }
 
 function render(payload) {
+  const isBuyback = payload.monitor.projection_kind === "buyback";
+  const isMarketEvents = payload.monitor.projection_kind === "market_events";
+  const isAltcoinRadar = payload.monitor.projection_kind === "altcoin_radar";
+  ui.workspace.dataset.projectionKind = isBuyback
+    ? "buyback"
+    : isMarketEvents
+      ? "market-events"
+      : isAltcoinRadar
+        ? "altcoin-radar"
+        : "time-series";
   renderGlobal(payload);
   renderMonitorList(payload.monitors);
   renderContext(payload.monitor);
   renderControl(payload.monitor);
   renderConfiguration(payload.monitor.configuration, payload.monitor.latest_run);
-  renderFilters(payload.monitor.filters, payload.time_windows);
-  ui.quoteTableTitle.textContent = payload.monitor.table_title;
+  renderFilters(
+    payload.monitor.filters,
+    payload.time_windows,
+    payload.monitor.projection_kind,
+  );
+  renderBuybackOverview(payload.buyback);
+  renderBuybackSources(payload.buyback);
+  renderMarketEvents(payload.market_events);
+  ui.historyRegion.hidden = isBuyback || isMarketEvents || isAltcoinRadar;
+  ui.historyWindowField.hidden = isBuyback || isMarketEvents || isAltcoinRadar;
+  ui.dataCutoff.hidden = isBuyback || isMarketEvents;
+  ui.quoteScroll.classList.toggle("buyback-table-scroll", isBuyback);
+  ui.quoteScroll.classList.toggle("market-event-table-scroll", isMarketEvents);
+  ui.quoteScroll.classList.toggle("radar-table-scroll", isAltcoinRadar);
+  ui.quoteScroll.setAttribute(
+    "aria-label",
+    isBuyback
+      ? "回购情报清单，可横向滚动"
+      : isMarketEvents
+        ? "关键事件日历"
+        : isAltcoinRadar
+          ? "USDⓈ-M 永续合约异动候选，可横向滚动"
+          : "最新监控数据，可横向滚动",
+  );
+  ui.quoteTableTitle.textContent = payload.buyback?.list_title
+    || payload.market_events?.list_title
+    || payload.monitor.table_title;
   renderRunSummary(payload.run_summary);
   renderTable(
     payload.monitor.columns,
@@ -305,8 +673,516 @@ function render(payload) {
     payload.collection_gaps,
   );
   renderEvaluation(payload.evaluation);
-  renderIssues(payload.issues);
+  applyRadarTabState();
+  renderIssues(payload.issues, payload.monitor);
+  updateBackToTopVisibility();
+  requestAnimationFrame(updateQuoteHorizontalScrollbar);
 }
+
+const BUYBACK_SOURCE_SUMMARY_LABELS = {
+  as_of: "名单日期",
+  window_start: "窗口开始",
+  window_end: "窗口结束",
+  target_candidate_count: "相关公告",
+  candidate_count: "去重后相关公告",
+  report_count: "已读取日报",
+  hkex_execution_row_count: "实际回购记录",
+  cross_market_row_count: "已排除跨市场行",
+  new_document_count: "本次获取原文",
+  existing_document_count: "已有可用原文",
+  fallback_document_count: "从备用来源获取",
+  failed_document_count: "获取原文失败",
+  empty_text_document_count: "原文无法读取文字",
+  backlog_count: "尚未获取原文",
+  run_document_limit: "每次最多获取原文",
+  page_count: "查询页数",
+  programme_count: "回购方案参考",
+  quote_count: "行情记录",
+  requested_count: "请求证券",
+};
+
+function renderBuybackOverview(buybackPayload) {
+  ui.buybackOverview.replaceChildren();
+  if (!buybackPayload) {
+    ui.buybackOverviewRegion.hidden = true;
+    return;
+  }
+  const metrics = [
+    ["近24小时新增", buybackPayload.fresh_intelligence_count],
+    ["回购情报", buybackPayload.intelligence_count],
+    ["执行类事件", buybackPayload.execution_count],
+    ["高吸引力", buybackPayload.high_attractiveness_count],
+  ];
+  metrics.forEach(([label, value]) => {
+    const group = document.createElement("div");
+    group.append(createElement("dt", "", label));
+    group.append(createElement("dd", "", new Intl.NumberFormat("zh-CN").format(Number(value || 0))));
+    ui.buybackOverview.append(group);
+  });
+  const timing = document.createElement("div");
+  timing.className = "buyback-overview-time";
+  timing.append(createElement("dt", "", "最近来源检查"));
+  timing.append(createElement("dd", "", formatTime(buybackPayload.source_checked_at)));
+  ui.buybackOverview.append(timing);
+  ui.buybackOverviewRegion.hidden = false;
+}
+
+function renderBuybackSources(buybackPayload) {
+  if (!buybackPayload) {
+    ui.buybackSourceRegion.hidden = true;
+    ui.buybackSourceGrid.replaceChildren();
+    return;
+  }
+  const problemCount = Number(buybackPayload.source_problem_count || 0);
+  const pendingCount = Number(buybackPayload.pending_count || 0);
+  const problemSources = buybackPayload.source_states.filter(
+    (source) => !["SUCCESS", "EMPTY"].includes(source.status),
+  );
+  const documentSource = buybackPayload.source_states.find(
+    (source) => source.source_key === "a-share-documents",
+  );
+  const documentProblem = documentSource
+    && !["SUCCESS", "EMPTY"].includes(documentSource.status);
+  const backlogCount = Number(documentSource?.summary?.backlog_count || 0);
+  const failedDocumentCount = Number(documentSource?.summary?.failed_document_count || 0);
+  const unreadableDocumentCount = Number(documentSource?.summary?.empty_text_document_count || 0);
+  const sourceMessages = [];
+  if (backlogCount > 0) sourceMessages.push(`${backlogCount} 份 A 股公告原文尚未获取`);
+  if (failedDocumentCount > 0) sourceMessages.push(`${failedDocumentCount} 份 A 股公告原文获取失败`);
+  if (unreadableDocumentCount > 0) sourceMessages.push(`${unreadableDocumentCount} 份 A 股公告原文无法读取文字`);
+  if (documentProblem && sourceMessages.length === 0) {
+    sourceMessages.push("A 股公告原文未完整获取");
+  }
+  const documentedPendingCount = backlogCount + failedDocumentCount + unreadableDocumentCount;
+  const otherPendingCount = Math.max(pendingCount - documentedPendingCount, 0);
+  if (otherPendingCount > 0) {
+    sourceMessages.push(`${otherPendingCount} 条记录存在其他信息缺失`);
+  }
+  const otherProblemSources = problemSources.filter(
+    (source) => source.source_key !== "a-share-documents",
+  );
+  if (otherProblemSources.length === 1) {
+    sourceMessages.push(`${otherProblemSources[0].source_label}读取异常`);
+  } else if (otherProblemSources.length > 1) {
+    sourceMessages.push(`${otherProblemSources.length} 个其他数据来源读取异常`);
+  }
+  const hasVisibleProblem = problemCount > 0 || pendingCount > 0 || sourceMessages.length > 0;
+  ui.buybackSourceRegion.hidden = !hasVisibleProblem;
+  if (!hasVisibleProblem) {
+    ui.buybackSourceGrid.replaceChildren();
+    return;
+  }
+  if (sourceMessages.length > 0) {
+    const impact = pendingCount > 0
+      ? `共 ${pendingCount} 条信息不完整的记录暂不展示。`
+      : "页面不会展示受影响的数据。";
+    ui.buybackSourceSummary.textContent = `${sourceMessages.join("；")}。${impact}`;
+  } else if (pendingCount > 0) {
+    ui.buybackSourceSummary.textContent = `${pendingCount} 条记录信息不完整，暂不展示。`;
+  } else {
+    ui.buybackSourceSummary.textContent = "查看数据来源";
+  }
+  ui.buybackSourceRegion.dataset.tone = problemCount > 0 || pendingCount > 0
+    ? "WARNING"
+    : "HEALTHY";
+  ui.buybackSourceGrid.replaceChildren();
+  if (!buybackPayload.source_states.length) {
+    ui.buybackSourceGrid.append(createElement("p", "empty-state", "等待首轮来源检查。"));
+    return;
+  }
+  buybackPayload.source_states.forEach((source) => {
+    const card = createElement("article", "buyback-source-card");
+    card.dataset.tone = source.tone;
+    const head = createElement("div", "buyback-source-card-head");
+    head.append(createElement("h3", "", source.source_label));
+    const badge = createElement("span", "buyback-source-status", source.status_label);
+    badge.dataset.tone = source.tone;
+    head.append(badge);
+    card.append(head);
+    const timing = createElement("p", "buyback-source-timing");
+    timing.textContent = `检查 ${formatTime(source.checked_at)} · 来源 ${formatTime(source.source_time)}`;
+    card.append(timing);
+    const facts = createElement("dl", "buyback-source-facts");
+    if (source.record_count !== null && source.record_count !== undefined) {
+      const group = document.createElement("div");
+      group.append(createElement("dt", "", "记录"));
+      group.append(createElement("dd", "", String(source.record_count)));
+      facts.append(group);
+    }
+    Object.entries(source.summary || {}).slice(0, 5).forEach(([key, value]) => {
+      const group = document.createElement("div");
+      group.append(createElement("dt", "", BUYBACK_SOURCE_SUMMARY_LABELS[key] || key));
+      group.append(createElement("dd", "", String(value)));
+      facts.append(group);
+    });
+    card.append(facts);
+    if (source.detail_code) {
+      const detail = createElement(
+        "p",
+        "buyback-source-detail",
+        issueReasonLabel(source.detail_code),
+      );
+      detail.title = issueReasonDetail(source.detail_code);
+      card.append(detail);
+    }
+    ui.buybackSourceGrid.append(card);
+  });
+}
+
+function marketEventScheduleText(event) {
+  const label = String(event.schedule_label || "");
+  if (!label) return "发布时间待公布";
+  if (event.time_precision === "DATE") return label;
+  return `${label}（北京时间）`;
+}
+
+function marketEventButton(event, className) {
+  const button = createElement("button", className);
+  button.type = "button";
+  button.addEventListener("click", () => openMarketEventDetail(event));
+  return button;
+}
+
+function renderEventCoverage(eventPayload) {
+  const messages = eventPayload?.coverage_messages || [];
+  ui.eventSourceRegion.hidden = messages.length === 0;
+  ui.eventSourceDetails.replaceChildren();
+  if (!messages.length) return;
+  ui.eventSourceSummary.textContent = `${messages.join("；")}。`;
+  messages.forEach((message) => {
+    const item = createElement("p", "event-source-message", message);
+    ui.eventSourceDetails.append(item);
+  });
+}
+
+function renderEventAttention(eventPayload) {
+  ui.eventAttentionCards.replaceChildren();
+  if (!eventPayload) {
+    ui.eventAttentionRegion.hidden = true;
+    return;
+  }
+  ui.eventAttentionRegion.hidden = false;
+  ui.eventAttentionSummary.textContent = [
+    `未来24小时 ${Number(eventPayload.next_24h_count || 0)} 项`,
+    `未来7天高影响 ${Number(eventPayload.next_7d_high_count || 0)} 项`,
+    Number(eventPayload.recent_schedule_change_count || 0) > 0
+      ? `近期时间调整 ${Number(eventPayload.recent_schedule_change_count)} 项`
+      : null,
+  ].filter(Boolean).join(" · ");
+  ui.eventSourceCutoff.textContent = `最近检查 ${formatTime(eventPayload.source_checked_at)}`;
+  const events = eventPayload.attention_events || [];
+  events.forEach((event) => {
+    const card = marketEventButton(event, "event-attention-card");
+    card.dataset.priority = String(event.priority_rank || 4);
+    const top = createElement("span", "event-attention-card-top");
+    const priority = createElement("span", "event-priority-badge", event.priority_label || "日历关注");
+    priority.dataset.priority = String(event.priority_rank || 4);
+    const countdown = createElement("strong", "event-countdown", event.countdown_label || "");
+    top.append(priority, countdown);
+    card.append(
+      top,
+      createElement("strong", "event-attention-title", event.event_title || "关键事件"),
+      createElement("span", "event-attention-time", marketEventScheduleText(event)),
+      createElement("span", "event-attention-markets", event.markets_label || ""),
+    );
+    if (event.expectation_summary) {
+      card.append(createElement(
+        "span",
+        "event-attention-result",
+        `市场预期 ${event.expectation_summary}`,
+      ));
+    }
+    card.title = `${event.priority_reason || ""} ${event.impact_reason || ""}`.trim();
+    ui.eventAttentionCards.append(card);
+  });
+  ui.eventAttentionEmpty.hidden = events.length > 0;
+  ui.eventAttentionEmpty.textContent = Number(eventPayload.event_count || 0) > 0
+    ? "当前筛选下，未来7天没有进入优先准备窗口的事件。"
+    : "当前筛选没有未来事件。";
+}
+
+function renderMacroIndicators(eventPayload) {
+  ui.macroIndicatorCards.replaceChildren();
+  const indicators = eventPayload?.indicators || [];
+  ui.macroIndicatorRegion.hidden = indicators.length === 0;
+  indicators.forEach((indicator) => {
+    const sourceUrl = safeExternalUrl(indicator.source_url);
+    const card = sourceUrl
+      ? createElement("a", "macro-indicator-card")
+      : createElement("article", "macro-indicator-card");
+    if (sourceUrl) {
+      card.href = sourceUrl;
+      card.target = "_blank";
+      card.rel = "noopener noreferrer";
+      card.setAttribute("aria-label", `${indicator.indicator_label}，打开${indicator.source_label}，新标签页`);
+    }
+    const heading = createElement("span", "macro-indicator-heading");
+    heading.append(
+      createElement("strong", "", indicator.indicator_label || "宏观数据"),
+      createElement("span", "", indicator.period_label || ""),
+    );
+    card.append(
+      heading,
+      createElement("strong", "macro-indicator-primary", indicator.primary_value || "—"),
+      createElement("span", "macro-indicator-secondary", indicator.secondary_value || ""),
+      createElement("span", "macro-indicator-method", indicator.method_label || ""),
+    );
+    ui.macroIndicatorCards.append(card);
+  });
+}
+
+function calendarDayHeading(day) {
+  if (day.day_offset === 0) return "今天";
+  if (day.day_offset === 1) return "明天";
+  const parsed = new Date(`${day.date}T12:00:00+08:00`);
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    weekday: "short",
+  }).format(parsed);
+}
+
+function renderEventCalendar(eventPayload) {
+  ui.eventCalendarGrid.replaceChildren();
+  if (!eventPayload) {
+    ui.eventCalendarRegion.hidden = true;
+    return;
+  }
+  ui.eventCalendarRegion.hidden = false;
+  (eventPayload.calendar_days || []).forEach((day) => {
+    const cell = createElement("article", "event-calendar-day");
+    if (day.day_offset === 0) cell.dataset.today = "true";
+    const heading = createElement("div", "event-calendar-day-head");
+    heading.append(
+      createElement("strong", "", calendarDayHeading(day)),
+      createElement("span", "", String(day.date || "").slice(5).replace("-", "/")),
+    );
+    cell.append(heading);
+    (day.events || []).forEach((event) => {
+      const item = marketEventButton(event, "event-calendar-item");
+      item.dataset.importance = event.importance || "MEDIUM";
+      item.append(
+        createElement("strong", "", event.event_title || "关键事件"),
+        createElement("span", "", event.time_precision === "EXACT"
+          ? String(event.schedule_label || "").slice(11)
+          : "时间待公布"),
+      );
+      item.title = `${event.countdown_label || ""} · ${event.markets_label || ""}`;
+      cell.append(item);
+    });
+    if (Number(day.additional_count || 0) > 0) {
+      cell.append(createElement("span", "event-calendar-more", `另有 ${day.additional_count} 项`));
+    }
+    if (!(day.events || []).length) {
+      cell.append(createElement("span", "event-calendar-none", "—"));
+    }
+    ui.eventCalendarGrid.append(cell);
+  });
+}
+
+function marketEventMetricSummary(items) {
+  return (items || []).slice(0, 2).map((item) => (
+    `${item.label || "数据"} ${item.display || "—"}`
+  )).join(" · ");
+}
+
+function renderEventHistory(eventPayload) {
+  ui.eventHistoryBody.replaceChildren();
+  const events = eventPayload?.history_events || [];
+  const pageCount = Math.max(1, Math.ceil(events.length / MARKET_EVENT_HISTORY_PAGE_SIZE));
+  state.eventHistoryPage = Math.min(Math.max(1, state.eventHistoryPage), pageCount);
+  const start = (state.eventHistoryPage - 1) * MARKET_EVENT_HISTORY_PAGE_SIZE;
+  const pageRows = events.slice(start, start + MARKET_EVENT_HISTORY_PAGE_SIZE);
+  pageRows.forEach((event) => {
+    const tr = document.createElement("tr");
+    tr.className = "event-history-row";
+    tr.tabIndex = 0;
+    const timeCell = document.createElement("td");
+    timeCell.textContent = marketEventScheduleText(event);
+    const titleCell = document.createElement("td");
+    const title = createElement("div", "market-event-title-cell");
+    title.append(
+      createElement("strong", "", event.event_title || "关键事件"),
+      createElement("span", "", `${event.category_label || ""} · ${event.release_state_label || ""}`),
+    );
+    titleCell.append(title);
+    const expectationCell = document.createElement("td");
+    expectationCell.textContent = event.expectation_summary || "—";
+    if (!event.expectation_summary) expectationCell.dataset.missing = "true";
+    const actualCell = document.createElement("td");
+    actualCell.textContent = event.actual_summary || event.release_state_label || "—";
+    if (!event.actual_summary) actualCell.className = "event-history-state";
+    const surpriseCell = document.createElement("td");
+    surpriseCell.textContent = event.surprise_summary || "—";
+    if (!event.surprise_summary) surpriseCell.dataset.missing = "true";
+    const directionCell = document.createElement("td");
+    if (event.direction) {
+      const badge = createElement("span", "event-direction-badge", event.direction.label || "中性");
+      badge.dataset.tone = event.direction.tone || "NEUTRAL";
+      badge.title = `方向分 ${event.direction.score} · ${event.direction.threshold || ""}`;
+      directionCell.append(badge);
+    } else {
+      directionCell.textContent = "—";
+      directionCell.dataset.missing = "true";
+    }
+    tr.append(timeCell, titleCell, expectationCell, actualCell, surpriseCell, directionCell);
+    const open = () => openMarketEventDetail(event);
+    tr.addEventListener("click", open);
+    tr.addEventListener("keydown", (keyboardEvent) => {
+      if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") {
+        keyboardEvent.preventDefault();
+        open();
+      }
+    });
+    ui.eventHistoryBody.append(tr);
+  });
+  const started = eventPayload?.history_started_at
+    ? formatTime(eventPayload.history_started_at)
+    : "首次成功采集后";
+  ui.eventHistorySummary.textContent = `仅保存 ${started} 起采集到的事件，不补录此前历史`;
+  ui.eventHistoryEmpty.hidden = events.length > 0;
+  ui.eventHistoryEmpty.textContent = `历史从 ${started} 开始记录，目前还没有已发生事件。`;
+  ui.eventHistoryPagination.hidden = events.length <= MARKET_EVENT_HISTORY_PAGE_SIZE;
+  ui.eventHistoryPageSummary.textContent = events.length
+    ? `显示第 ${start + 1}–${Math.min(start + pageRows.length, events.length)} 项，共 ${events.length} 项`
+    : "暂无历史事件";
+  ui.eventHistoryPageStatus.textContent = `${state.eventHistoryPage} / ${pageCount} 页`;
+  ui.eventHistoryPrevious.disabled = state.eventHistoryPage <= 1;
+  ui.eventHistoryNext.disabled = state.eventHistoryPage >= pageCount;
+}
+
+function applyEventTabState() {
+  const isMarketEvents = state.projectionKind === "market_events";
+  ui.eventViewTabs.hidden = !isMarketEvents;
+  if (!isMarketEvents) {
+    ui.eventHistoryRegion.hidden = true;
+    ui.tableRegion.hidden = false;
+    ui.filtersRegion.hidden = false;
+    return;
+  }
+  const history = state.eventTab === "HISTORY";
+  ui.eventUpcomingTab.setAttribute("aria-selected", String(!history));
+  ui.eventHistoryTab.setAttribute("aria-selected", String(history));
+  ui.eventHistoryRegion.hidden = !history;
+  ui.tableRegion.hidden = history;
+  ui.filtersRegion.hidden = history;
+  if (history) {
+    ui.eventAttentionRegion.hidden = true;
+    ui.macroIndicatorRegion.hidden = true;
+    ui.eventCalendarRegion.hidden = true;
+    renderEventHistory(state.marketEventPayload);
+  } else {
+    renderEventAttention(state.marketEventPayload);
+    renderMacroIndicators(state.marketEventPayload);
+    renderEventCalendar(state.marketEventPayload);
+  }
+  ui.eventHistoryCount.textContent = String(state.marketEventPayload?.history_event_count || 0);
+  requestAnimationFrame(updateQuoteHorizontalScrollbar);
+}
+
+function renderMarketEvents(eventPayload) {
+  state.marketEventPayload = eventPayload;
+  renderEventCoverage(eventPayload);
+  applyEventTabState();
+}
+
+function applyRadarTabState() {
+  const isAltcoinRadar = state.projectionKind === "altcoin_radar";
+  ui.radarViewTabs.hidden = !isAltcoinRadar;
+  ui.filters.hidden = false;
+  if (!isAltcoinRadar) {
+    [ui.tableRegion, ui.historyRegion, ui.evaluationRegion].forEach((region) => {
+      region.removeAttribute("role");
+      region.removeAttribute("aria-labelledby");
+    });
+    return;
+  }
+
+  const tabs = {
+    TABLE: ui.radarTableTab,
+    HISTORY: ui.radarHistoryTab,
+    EVALUATION: ui.radarEvaluationTab,
+  };
+  Object.entries(tabs).forEach(([key, tab]) => {
+    const selected = key === state.radarTab;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  });
+
+  const showingTable = state.radarTab === "TABLE";
+  const showingHistory = state.radarTab === "HISTORY";
+  const showingEvaluation = state.radarTab === "EVALUATION";
+  ui.tableRegion.hidden = !showingTable;
+  ui.historyRegion.hidden = !showingHistory;
+  ui.evaluationRegion.hidden = !showingEvaluation;
+  ui.filtersRegion.hidden = showingEvaluation;
+  ui.filters.hidden = !showingTable;
+  ui.historyWindowField.hidden = !showingHistory;
+  ui.monitorMethodNote.hidden = !showingTable || !ui.monitorMethodNote.textContent.trim();
+
+  const panels = [
+    [ui.tableRegion, "radar-table-tab"],
+    [ui.historyRegion, "radar-history-tab"],
+    [ui.evaluationRegion, "radar-evaluation-tab"],
+  ];
+  panels.forEach(([region, labelledBy]) => {
+    region.setAttribute("role", "tabpanel");
+    region.setAttribute("aria-labelledby", labelledBy);
+  });
+  requestAnimationFrame(() => {
+    if (showingHistory && state.chartModel) drawHistoryChart();
+    updateQuoteHorizontalScrollbar();
+  });
+}
+
+function activateRadarTab(tab) {
+  if (!Object.hasOwn(RADAR_TAB_LOCATION_VALUES, tab)) return;
+  state.radarTab = tab;
+  syncMonitorLocation(state.monitorId);
+  applyRadarTabState();
+}
+
+ui.eventUpcomingTab.addEventListener("click", () => {
+  state.eventTab = "UPCOMING";
+  applyEventTabState();
+});
+
+ui.eventHistoryTab.addEventListener("click", () => {
+  state.eventTab = "HISTORY";
+  state.eventHistoryPage = 1;
+  applyEventTabState();
+});
+
+ui.radarTableTab.addEventListener("click", () => activateRadarTab("TABLE"));
+ui.radarHistoryTab.addEventListener("click", () => activateRadarTab("HISTORY"));
+ui.radarEvaluationTab.addEventListener("click", () => activateRadarTab("EVALUATION"));
+
+ui.radarViewTabs.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const order = ["TABLE", "HISTORY", "EVALUATION"];
+  const current = Math.max(0, order.indexOf(state.radarTab));
+  const next = event.key === "Home"
+    ? 0
+    : event.key === "End"
+      ? order.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + order.length) % order.length;
+  event.preventDefault();
+  activateRadarTab(order[next]);
+  ({
+    TABLE: ui.radarTableTab,
+    HISTORY: ui.radarHistoryTab,
+    EVALUATION: ui.radarEvaluationTab,
+  })[order[next]].focus();
+});
+
+ui.eventHistoryPrevious.addEventListener("click", () => {
+  state.eventHistoryPage = Math.max(1, state.eventHistoryPage - 1);
+  renderEventHistory(state.marketEventPayload);
+});
+
+ui.eventHistoryNext.addEventListener("click", () => {
+  state.eventHistoryPage += 1;
+  renderEventHistory(state.marketEventPayload);
+});
 
 function renderRunSummary(items) {
   ui.runSummary.replaceChildren();
@@ -341,21 +1217,44 @@ function renderGlobal(payload) {
   ui.collectionCadence.textContent = `计划 ${Number(load.planned_runs_per_minute).toFixed(1)} 轮/分`;
   ui.collectionCadence.title = "按各启用监控的采集周期计算；一轮可能包含多个公开 HTTP 请求。";
   ui.lastRefresh.textContent = formatTime(load.latest_completed_at);
-  ui.summaryCutoff.textContent = `状态统计截止：${formatTime(payload.server_time)}`;
-  ui.monitoringCount.textContent = String(payload.monitors.filter(
-    (item) => item.enabled
-  ).length);
-  ui.healthyCount.textContent = String(payload.monitors.filter(
-    (item) => item.enabled && ["CURRENT", "CURRENT_WITH_NOTICES", "CURRENT_WITH_GAPS"].includes(item.data_status.kind)
-  ).length);
-  ui.staleCount.textContent = String(payload.monitors.filter(
-    (item) => item.enabled && ["COLLECTING_PREVIOUS", "HISTORICAL", "STALE"].includes(item.data_status.kind)
-  ).length);
-  ui.failedCount.textContent = String(payload.monitors.filter(
-    (item) => item.enabled && item.data_status.kind === "EMPTY"
-  ).length);
-  ui.disabledCount.textContent = String(payload.monitors.filter((item) => !item.enabled).length);
 }
+
+function monitorCompactLabel(monitor) {
+  const configured = MONITOR_COMPACT_LABELS[monitor.monitor_id];
+  if (configured) return configured;
+  const normalized = String(monitor.display_name || monitor.monitor_id)
+    .replace(/[^\p{L}\p{N}]+/gu, "")
+    .trim();
+  return normalized.slice(0, 3) || "监控";
+}
+
+function applyMonitorRailState({ persist = true } = {}) {
+  const collapsed = Boolean(state.monitorRailCollapsed);
+  ui.appShell.dataset.railCollapsed = String(collapsed);
+  ui.monitorRailToggle.setAttribute("aria-expanded", String(!collapsed));
+  ui.monitorRailToggle.setAttribute(
+    "aria-label",
+    collapsed ? "展开监控列表" : "收起监控列表",
+  );
+  ui.monitorRailToggle.title = collapsed ? "展开监控列表" : "收起监控列表";
+  ui.monitorRailToggleIcon.textContent = collapsed ? "›" : "‹";
+  if (persist) {
+    try {
+      window.localStorage.setItem(MONITOR_RAIL_STORAGE_KEY, String(collapsed));
+    } catch (_error) {
+      // 页面仍可使用；仅不记住折叠状态。
+    }
+  }
+  requestAnimationFrame(() => {
+    updateQuoteHorizontalScrollbar();
+    if (state.chartModel) drawHistoryChart();
+  });
+}
+
+ui.monitorRailToggle.addEventListener("click", () => {
+  state.monitorRailCollapsed = !state.monitorRailCollapsed;
+  applyMonitorRailState();
+});
 
 function renderMonitorList(monitors) {
   ui.monitorList.replaceChildren();
@@ -364,7 +1263,15 @@ function renderMonitorList(monitors) {
     button.type = "button";
     button.dataset.monitorId = monitor.monitor_id;
     if (monitor.monitor_id === state.monitorId) button.setAttribute("aria-current", "page");
-    button.append(createElement("span", "monitor-link-name", monitor.display_name));
+    button.setAttribute(
+      "aria-label",
+      `${monitor.display_name}，${monitor.operational_status.label}`,
+    );
+    button.title = `${monitor.display_name} · ${monitor.operational_status.label}`;
+    button.append(
+      createElement("span", "monitor-link-name", monitor.display_name),
+      createElement("span", "monitor-link-compact", monitorCompactLabel(monitor)),
+    );
     const status = createElement(
       "span",
       "monitor-link-status",
@@ -377,19 +1284,35 @@ function renderMonitorList(monitors) {
         monitorId: state.monitorId,
         filters: state.filters,
         seriesKey: state.seriesKey,
+        buybackStockQuery: state.buybackStockQuery,
+        eventQuery: state.eventQuery,
+        radarTab: state.radarTab,
         tableSort: state.tableSort,
+        tablePage: state.tablePage,
         tableScrollLeft: ui.quoteScroll.scrollLeft,
       };
+      clearTimeout(state.buybackStockSearchTimer);
+      state.buybackStockSearchTimer = null;
+      clearTimeout(state.eventSearchTimer);
+      state.eventSearchTimer = null;
       state.monitorId = monitor.monitor_id;
       state.filters = {};
       state.seriesKey = null;
+      state.buybackStockQuery = "";
+      state.eventQuery = "";
+      state.radarTab = "TABLE";
       state.tableSort = null;
+      state.tablePage = 1;
       ui.quoteScroll.scrollLeft = 0;
       if (!await loadView({ preserveSeries: false })) {
         state.monitorId = previous.monitorId;
         state.filters = previous.filters;
         state.seriesKey = previous.seriesKey;
+        state.buybackStockQuery = previous.buybackStockQuery;
+        state.eventQuery = previous.eventQuery;
+        state.radarTab = previous.radarTab;
         state.tableSort = previous.tableSort;
+        state.tablePage = previous.tablePage;
         ui.quoteScroll.scrollLeft = previous.tableScrollLeft;
       }
     });
@@ -417,6 +1340,33 @@ function renderContext(monitor) {
 
 function renderControl(monitor) {
   if (state.controlSubmitting) return;
+  let showedManualResult = false;
+  const isBuyback = monitor.projection_kind === "buyback";
+  const collecting = monitor.latest_run?.status === "RUNNING";
+  const schedule = monitor.automatic_collection;
+  ui.monitorRefreshButton.hidden = !isBuyback;
+  ui.monitorRefreshButton.disabled = !monitor.enabled
+    || collecting
+    || state.manualRefreshSubmitting;
+  ui.monitorRefreshButton.textContent = state.manualRefreshSubmitting
+    ? "正在请求…"
+    : collecting && isBuyback
+      ? "正在刷新"
+      : "手动刷新";
+  ui.monitorRefreshButton.title = !monitor.enabled
+    ? "请先开启监控"
+    : "无论当前是否处于交易时段，显式采集一次公开来源";
+  if (
+    state.pendingManualRefresh?.monitorId === monitor.monitor_id
+    && monitor.latest_run?.run_id > state.pendingManualRefresh.runAfter
+    && monitor.latest_run.status !== "RUNNING"
+  ) {
+    ui.monitorControlStatus.textContent = ["SUCCESS", "PARTIAL"].includes(monitor.latest_run.status)
+      ? "手动刷新已完成"
+      : "手动刷新失败；仍显示最近已提交数据";
+    state.pendingManualRefresh = null;
+    showedManualResult = true;
+  }
   if (
     state.pendingControl?.monitorId === monitor.monitor_id
     && monitor.latest_run?.run_id > state.pendingControl.runAfter
@@ -434,7 +1384,51 @@ function renderControl(monitor) {
     "aria-label",
     `${monitor.enabled ? "关闭" : "开启"}${monitor.display_name}`,
   );
+  if (
+    isBuyback
+    && monitor.enabled
+    && !showedManualResult
+    && !state.pendingManualRefresh
+    && !state.manualRefreshSubmitting
+    && schedule
+  ) {
+    const nextOpen = schedule.next_open_at
+      ? `；下次自动刷新时段 ${formatTime(schedule.next_open_at)}`
+      : "";
+    ui.monitorControlStatus.textContent = `${schedule.detail}${nextOpen}`;
+  }
 }
+
+ui.monitorRefreshButton.addEventListener("click", async () => {
+  if (state.manualRefreshSubmitting || !state.monitorId) return;
+  const monitorId = state.monitorId;
+  const runAfter = state.latestRunId ?? 0;
+  state.manualRefreshSubmitting = true;
+  ui.monitorRefreshButton.disabled = true;
+  ui.monitorRefreshButton.textContent = "正在请求…";
+  ui.monitorControlStatus.textContent = "正在提交手动刷新请求";
+  try {
+    const response = await fetch(
+      `/api/monitors/${encodeURIComponent(monitorId)}/refresh`,
+      { method: "POST", headers: { Accept: "application/json" } },
+    );
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `HTTP_${response.status}`);
+    state.pendingManualRefresh = {
+      monitorId,
+      runAfter: Number(payload.run_after ?? runAfter),
+    };
+    ui.monitorControlStatus.textContent = "已请求手动刷新，等待本轮完成";
+    state.manualRefreshSubmitting = false;
+    await loadView();
+    ui.monitorRefreshButton.focus();
+  } catch (error) {
+    ui.monitorControlStatus.textContent = `手动刷新失败 · ${error.message}`;
+  } finally {
+    state.manualRefreshSubmitting = false;
+    ui.monitorRefreshButton.disabled = false;
+  }
+});
 
 ui.monitorControlButton.addEventListener("click", async () => {
   if (state.controlSubmitting || !state.monitorId) return;
@@ -586,11 +1580,101 @@ ui.configurationForm.addEventListener("submit", async (event) => {
   }
 });
 
-function renderFilters(filters, timeWindows) {
-  ui.filters.replaceChildren();
+function updateFilterChoiceDescription(select, choices) {
+  const selectedChoice = choices.find((choice) => choice.value === select.value);
+  const description = String(selectedChoice?.description || "").trim();
+  if (description) {
+    select.title = description;
+    select.setAttribute("aria-description", description);
+  } else {
+    select.removeAttribute("title");
+    select.removeAttribute("aria-description");
+  }
+}
+
+function createFilterLabel(filter) {
+  const heading = createElement("span", "filter-label", filter.label);
+  const describedChoices = filter.choices.filter((choice) => choice.description);
+  if (!describedChoices.length) return heading;
+
+  const help = createElement("span", "filter-help");
+  help.tabIndex = 0;
+  help.setAttribute("aria-label", `${filter.label}说明`);
+  help.append(createElement("span", "field-help", "ⓘ"));
+  const tooltip = createElement("span", "filter-help-tooltip");
+  tooltip.setAttribute("role", "tooltip");
+  describedChoices.forEach((choice) => {
+    const row = createElement("span", "filter-help-row");
+    row.append(
+      createElement("strong", "", choice.label),
+      createElement("span", "", choice.description),
+    );
+    tooltip.append(row);
+  });
+  help.append(tooltip);
+  heading.append(help);
+  return heading;
+}
+
+function renderFilters(filters, timeWindows, projectionKind) {
+  ui.filters.dataset.projectionKind = projectionKind;
+  ui.filters.querySelectorAll(".dynamic-filter-field").forEach((field) => field.remove());
   filters.forEach((filter) => {
-    const label = createElement("label", "filter-field");
-    label.append(createElement("span", "", filter.label));
+    if (filter.multiple) {
+      const field = createElement("div", "filter-field dynamic-filter-field");
+      const heading = createFilterLabel(filter);
+      heading.id = `filter-${filter.key}-label`;
+      field.append(heading);
+      const group = createElement("div", "filter-multi-choice");
+      group.setAttribute("role", "group");
+      group.setAttribute("aria-labelledby", heading.id);
+      const selected = new Set(
+        Array.isArray(filter.selected) ? filter.selected : [filter.selected],
+      );
+      const checkboxes = [];
+      filter.choices.forEach((choice) => {
+        const option = createElement("label", "filter-multi-option");
+        if (choice.description) option.title = choice.description;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.name = filter.key;
+        checkbox.value = choice.value;
+        checkbox.checked = selected.has(choice.value);
+        checkbox.setAttribute("aria-label", choice.label);
+        option.append(checkbox, createElement("span", "", choice.label));
+        group.append(option);
+        checkboxes.push(checkbox);
+        checkbox.addEventListener("change", async () => {
+          const previous = Array.isArray(state.filters[filter.key])
+            ? [...state.filters[filter.key]]
+            : [state.filters[filter.key]].filter(Boolean);
+          const next = checkboxes
+            .filter((item) => item.checked)
+            .map((item) => item.value);
+          if (!next.length) {
+            checkbox.checked = true;
+            return;
+          }
+          const previousSeries = state.seriesKey;
+          const previousPage = state.tablePage;
+          state.filters[filter.key] = next;
+          state.tablePage = 1;
+          if (!await loadView({ preserveSeries: false })) {
+            state.filters[filter.key] = previous;
+            state.seriesKey = previousSeries;
+            state.tablePage = previousPage;
+            checkboxes.forEach((item) => {
+              item.checked = previous.includes(item.value);
+            });
+          }
+        });
+      });
+      field.append(group);
+      ui.filters.insertBefore(field, ui.buybackStockSearchField);
+      return;
+    }
+    const label = createElement("label", "filter-field dynamic-filter-field");
+    label.append(createFilterLabel(filter));
     const select = document.createElement("select");
     select.name = filter.key;
     select.setAttribute("aria-label", filter.label);
@@ -599,21 +1683,38 @@ function renderFilters(filters, timeWindows) {
       option.value = choice.value;
       option.textContent = choice.label;
       option.selected = choice.value === filter.selected;
+      if (choice.description) option.title = choice.description;
       select.append(option);
     });
+    updateFilterChoiceDescription(select, filter.choices);
     select.addEventListener("change", async () => {
       const previous = state.filters[filter.key];
       const previousSeries = state.seriesKey;
+      const previousPage = state.tablePage;
       state.filters[filter.key] = select.value;
+      state.tablePage = 1;
+      updateFilterChoiceDescription(select, filter.choices);
       if (!await loadView({ preserveSeries: false })) {
         state.filters[filter.key] = previous;
         state.seriesKey = previousSeries;
+        state.tablePage = previousPage;
         select.value = previous;
+        updateFilterChoiceDescription(select, filter.choices);
       }
     });
     label.append(select);
-    ui.filters.append(label);
+    ui.filters.insertBefore(label, ui.buybackStockSearchField);
   });
+  const isBuyback = projectionKind === "buyback";
+  const isMarketEvents = projectionKind === "market_events";
+  ui.buybackStockSearchField.hidden = !isBuyback;
+  if (document.activeElement !== ui.buybackStockSearch) {
+    ui.buybackStockSearch.value = isBuyback ? state.buybackStockQuery : "";
+  }
+  ui.eventSearchField.hidden = !isMarketEvents;
+  if (document.activeElement !== ui.eventSearch) {
+    ui.eventSearch.value = isMarketEvents ? state.eventQuery : "";
+  }
   ui.timeWindow.replaceChildren();
   timeWindows.forEach((window) => {
     const option = document.createElement("option");
@@ -623,6 +1724,58 @@ function renderFilters(filters, timeWindows) {
     ui.timeWindow.append(option);
   });
 }
+
+function runBuybackStockSearch() {
+  clearTimeout(state.buybackStockSearchTimer);
+  state.buybackStockSearchTimer = null;
+  loadView({ preserveSeries: false });
+}
+
+ui.buybackStockSearch.addEventListener("input", () => {
+  state.buybackStockQuery = ui.buybackStockSearch.value;
+  state.tablePage = 1;
+  clearTimeout(state.buybackStockSearchTimer);
+  state.buybackStockSearchTimer = setTimeout(runBuybackStockSearch, 300);
+});
+
+ui.buybackStockSearch.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    runBuybackStockSearch();
+  } else if (event.key === "Escape" && ui.buybackStockSearch.value) {
+    event.preventDefault();
+    ui.buybackStockSearch.value = "";
+    state.buybackStockQuery = "";
+    state.tablePage = 1;
+    runBuybackStockSearch();
+  }
+});
+
+function runEventSearch() {
+  clearTimeout(state.eventSearchTimer);
+  state.eventSearchTimer = null;
+  loadView({ preserveSeries: false });
+}
+
+ui.eventSearch.addEventListener("input", () => {
+  state.eventQuery = ui.eventSearch.value;
+  state.tablePage = 1;
+  clearTimeout(state.eventSearchTimer);
+  state.eventSearchTimer = setTimeout(runEventSearch, 300);
+});
+
+ui.eventSearch.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    runEventSearch();
+  } else if (event.key === "Escape" && ui.eventSearch.value) {
+    event.preventDefault();
+    ui.eventSearch.value = "";
+    state.eventQuery = "";
+    state.tablePage = 1;
+    runEventSearch();
+  }
+});
 
 ui.timeWindow.addEventListener("change", async () => {
   const previous = state.hours;
@@ -650,8 +1803,12 @@ function cellValue(row, column) {
   if (column.kind === "percent") {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return missing("数值异常，已停止展示。");
+    const formatted = new Intl.NumberFormat("zh-CN", {
+      minimumFractionDigits: column.minimum_fraction_digits ?? 0,
+      maximumFractionDigits: column.maximum_fraction_digits ?? 4,
+    }).format(Math.abs(numeric));
     return {
-      text: `${column.show_sign !== false && numeric >= 0 ? "+" : ""}${numeric.toFixed(4)}%`,
+      text: `${numeric < 0 ? "-" : column.show_sign !== false ? "+" : ""}${formatted}%`,
       missing: false,
     };
   }
@@ -670,7 +1827,17 @@ function cellValue(row, column) {
   return { text: String(value), missing: false };
 }
 
-function emptyTableMessage(dataStatus) {
+function emptyTableMessage(dataStatus, _filters = {}) {
+  if (state.projectionKind === "buyback") {
+    if (state.buybackStockQuery.trim()) {
+      return "没有找到匹配的股票，请检查代码或名称。";
+    }
+    return "当前筛选没有匹配的回购情报；如有数据问题，可在下方“数据来源与问题”查看。";
+  }
+  if (state.projectionKind === "market_events") {
+    if (state.eventQuery.trim()) return "没有找到匹配的未来事件。";
+    return "当前筛选范围没有未来事件。";
+  }
   if ([
     "HISTORICAL",
     "STALE",
@@ -736,10 +1903,16 @@ function rowAlreadyMarksIssue(issue, rows) {
 }
 
 function issueScopeLabel(scope) {
-  if (scope === "monitor") return "全部范围";
-  const parts = String(scope).split(":");
-  if (parts.length > 1 && ["BUY", "SELL"].includes(parts[0])) return parts[1];
-  return String(scope);
+  const scopeValue = String(scope || "");
+  if (ISSUE_SCOPE_LABELS[scopeValue]) return ISSUE_SCOPE_LABELS[scopeValue];
+  if (scopeValue.startsWith("nyfed-calendar:")) {
+    return `纽约联储事件日历 ${scopeValue.split(":", 2)[1]}`;
+  }
+  if (scopeValue === "monitor") return "全部范围";
+  const [direction, asset] = scopeValue.split(":", 2);
+  if (!asset) return scopeValue || "当前监控";
+  const directionLabel = direction === "BUY" ? "买入" : direction === "SELL" ? "卖出" : direction;
+  return `${directionLabel} ${asset}`;
 }
 
 function tableIssueGroups(issues, filters, rows) {
@@ -771,7 +1944,7 @@ function appendTableIssueRow(columns, group) {
     : `本轮受影响：${scopes}`;
   const detail = expectedAbsence
     ? ISSUE_REASON_DETAILS.NO_ELIGIBLE_C2C_AD
-    : `${ISSUE_REASON_LABELS[group.reason_code] || group.reason_code}；对应范围未展示未通过校验的值。`;
+    : `${issueReasonLabel(group.reason_code)}；对应范围未展示未通过校验的值。`;
   td.append(createElement("strong", "table-notice-title", heading));
   td.append(createElement("span", "table-notice-detail", detail));
   td.title = `${detail}（${group.reason_code}）`;
@@ -826,22 +1999,161 @@ function nextSortDirection(columnKey) {
   return "ascending";
 }
 
-function marketDestination(row) {
-  if (state.monitorId !== "binance-altcoin-radar") return null;
-  const symbol = String(row.symbol || "").toUpperCase();
-  if (!/^[A-Z0-9]{1,24}USDT$/.test(symbol)) return null;
-  if (row.data_scope_label === "现货 + 合约") {
+function buybackTablePage(totalRows) {
+  if (!["buyback", "market_events"].includes(state.projectionKind)) {
     return {
-      url: `https://www.binance.com/zh-CN/futures/${encodeURIComponent(symbol)}`,
-      label: "Binance USDⓈ-M 合约行情",
+      enabled: false,
+      page: 1,
+      pageCount: 1,
+      start: 0,
+      end: totalRows,
+      totalRows,
     };
   }
-  const baseAsset = String(row.base_asset || symbol.slice(0, -4)).toUpperCase();
-  if (!/^[A-Z0-9]{1,24}$/.test(baseAsset)) return null;
+  const pageSize = state.projectionKind === "market_events"
+    ? MARKET_EVENT_TABLE_PAGE_SIZE
+    : BUYBACK_TABLE_PAGE_SIZE;
+  const pageCount = Math.max(1, Math.ceil(totalRows / pageSize));
+  state.tablePage = Math.min(Math.max(Number(state.tablePage) || 1, 1), pageCount);
+  const start = (state.tablePage - 1) * pageSize;
   return {
-    url: `https://www.binance.com/zh-CN/trade/${encodeURIComponent(baseAsset)}_USDT`,
-    label: "本轮未确认同名合约，打开 Binance 现货行情",
+    enabled: totalRows > pageSize,
+    page: state.tablePage,
+    pageCount,
+    start,
+    end: Math.min(start + pageSize, totalRows),
+    totalRows,
   };
+}
+
+function scrollToTableStart() {
+  const tableRegion = ui.quoteTableTitle.closest(".table-region");
+  if (!tableRegion) return;
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  requestAnimationFrame(() => {
+    tableRegion.scrollIntoView({
+      behavior: reducedMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  });
+}
+
+function renderTablePagination(model, rerender) {
+  ui.tablePagination.hidden = !model.enabled;
+  if (!model.enabled) {
+    ui.tablePageSelect.replaceChildren();
+    return;
+  }
+  ui.tablePageSummary.textContent = `第 ${model.start + 1}–${model.end} 条，共 ${model.totalRows} 条`;
+  ui.tablePageTotal.textContent = `/ ${model.pageCount} 页`;
+  ui.tablePageSelect.replaceChildren();
+  for (let page = 1; page <= model.pageCount; page += 1) {
+    const option = document.createElement("option");
+    option.value = String(page);
+    option.textContent = String(page);
+    option.selected = page === model.page;
+    ui.tablePageSelect.append(option);
+  }
+  ui.tablePagePrevious.disabled = model.page === 1;
+  ui.tablePageNext.disabled = model.page === model.pageCount;
+  const moveToPage = (page) => {
+    state.tablePage = Math.min(Math.max(page, 1), model.pageCount);
+    rerender();
+    scrollToTableStart();
+  };
+  ui.tablePagePrevious.onclick = () => moveToPage(model.page - 1);
+  ui.tablePageNext.onclick = () => moveToPage(model.page + 1);
+  ui.tablePageSelect.onchange = () => moveToPage(Number(ui.tablePageSelect.value));
+}
+
+function updateQuoteHorizontalScrollbar() {
+  const rect = ui.quoteScroll.getBoundingClientRect();
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const left = Math.max(0, rect.left);
+  const right = Math.min(viewportWidth, rect.right);
+  const visibleWidth = Math.max(0, right - left);
+  const hasHorizontalOverflow = ui.quoteScroll.scrollWidth > ui.quoteScroll.clientWidth + 1;
+  const tableContinuesBelowViewport = rect.bottom > viewportHeight + 1;
+  const tableHasEnteredViewport = rect.top < viewportHeight - 18;
+  const usesPageLengthTable = state.projectionKind === "buyback"
+    || (state.projectionKind === "altcoin_radar" && state.radarTab === "TABLE");
+  const shouldShow = usesPageLengthTable
+    && hasHorizontalOverflow
+    && visibleWidth > 0
+    && tableHasEnteredViewport
+    && tableContinuesBelowViewport;
+  ui.quoteHorizontalScrollbar.hidden = !shouldShow;
+  if (!shouldShow) return;
+  ui.quoteHorizontalScrollbar.style.left = `${left}px`;
+  ui.quoteHorizontalScrollbar.style.width = `${visibleWidth}px`;
+  const overflowRange = ui.quoteScroll.scrollWidth - ui.quoteScroll.clientWidth;
+  ui.quoteHorizontalScrollbarTrack.style.width = `${ui.quoteHorizontalScrollbar.clientWidth + overflowRange}px`;
+  if (Math.abs(ui.quoteHorizontalScrollbar.scrollLeft - ui.quoteScroll.scrollLeft) > 1) {
+    ui.quoteHorizontalScrollbar.scrollLeft = ui.quoteScroll.scrollLeft;
+  }
+}
+
+ui.quoteScroll.addEventListener("scroll", () => {
+  if (Math.abs(ui.quoteHorizontalScrollbar.scrollLeft - ui.quoteScroll.scrollLeft) > 1) {
+    ui.quoteHorizontalScrollbar.scrollLeft = ui.quoteScroll.scrollLeft;
+  }
+});
+
+ui.quoteScroll.addEventListener("wheel", (event) => {
+  const usesPageLengthTable = state.projectionKind === "buyback"
+    || (state.projectionKind === "altcoin_radar" && state.radarTab === "TABLE");
+  if (!usesPageLengthTable) return;
+  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+  const documentHeight = document.documentElement.scrollHeight;
+  const canScrollUp = event.deltaY < 0 && window.scrollY > 0;
+  const canScrollDown = event.deltaY > 0
+    && window.scrollY + window.innerHeight < documentHeight;
+  if (!canScrollUp && !canScrollDown) return;
+  const multiplier = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+    ? 16
+    : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+      ? window.innerHeight
+      : 1;
+  event.preventDefault();
+  window.scrollBy({ top: event.deltaY * multiplier, behavior: "auto" });
+}, { passive: false });
+
+ui.quoteHorizontalScrollbar.addEventListener("scroll", () => {
+  if (Math.abs(ui.quoteScroll.scrollLeft - ui.quoteHorizontalScrollbar.scrollLeft) > 1) {
+    ui.quoteScroll.scrollLeft = ui.quoteHorizontalScrollbar.scrollLeft;
+  }
+});
+
+function marketDestination(row) {
+  if (state.monitorId !== RADAR_MONITOR_ID) return null;
+  const symbol = String(row.symbol || "").toUpperCase();
+  if (!/^[A-Z0-9]{1,24}USDT$/.test(symbol)) return null;
+  return {
+    url: `https://www.binance.com/zh-CN/futures/${encodeURIComponent(symbol)}`,
+    label: "Binance USDⓈ-M 永续合约行情",
+  };
+}
+
+function buybackMarketDestination(row) {
+  const code = String(row.stock_code || "");
+  if (row.market_scope === "HK" && /^\d{5}$/.test(code)) {
+    const tradingViewCode = code.replace(/^0+(?=\d)/, "");
+    return {
+      url: `https://cn.tradingview.com/chart/?symbol=${encodeURIComponent(`HKEX:${tradingViewCode}`)}`,
+      label: "TradingView 港股专业图表",
+    };
+  }
+  if (row.market_scope === "A_SHARE" && /^\d{6}$/.test(code)) {
+    const exchange = row.market === "SH" ? "SSE" : row.market === "SZ" ? "SZSE" : null;
+    if (exchange) {
+      return {
+        url: `https://cn.tradingview.com/chart/?symbol=${encodeURIComponent(`${exchange}:${code}`)}`,
+        label: "TradingView A股专业图表",
+      };
+    }
+  }
+  return null;
 }
 
 function renderTable(
@@ -871,10 +2183,16 @@ function renderTable(
     );
     button.append(createElement("span", "table-sort-label", column.label));
     if (column.description) {
-      button.title = column.description;
       button.setAttribute("aria-description", column.description);
       const help = createElement("span", "table-column-help", "ⓘ");
       help.setAttribute("aria-hidden", "true");
+      const tooltip = createElement(
+        "span",
+        "table-column-help-tooltip",
+        column.description,
+      );
+      tooltip.setAttribute("role", "tooltip");
+      help.append(tooltip);
       button.append(help);
     }
     const indicator = createElement(
@@ -890,13 +2208,16 @@ function renderTable(
         columnKey: column.key,
         direction: nextSortDirection(column.key),
       };
+      state.tablePage = 1;
       renderTable(columns, rows, selectedSeries, issues, filters, dataStatus);
     });
     th.append(button);
     ui.quoteHead.append(th);
   });
   ui.quoteBody.replaceChildren();
-  sortTableRows(rows, columns).forEach((row) => {
+  const sortedRows = sortTableRows(rows, columns);
+  const page = buybackTablePage(sortedRows.length);
+  sortedRows.slice(page.start, page.end).forEach((row) => {
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     if (row.row_tone) tr.dataset.tone = String(row.row_tone);
@@ -904,6 +2225,14 @@ function renderTable(
     const destination = marketDestination(row);
     let marketAnchor = null;
     const select = async () => {
+      if (state.projectionKind === "buyback" && row.entity_key) {
+        await openBuybackDetail(String(row.entity_key));
+        return;
+      }
+      if (state.projectionKind === "market_events") {
+        openMarketEventDetail(row);
+        return;
+      }
       const previous = state.seriesKey;
       state.seriesKey = row.series_key;
       if (!await loadView()) state.seriesKey = previous;
@@ -915,7 +2244,244 @@ function renderTable(
         column.priority === "secondary" ? "col-secondary" : "",
       );
       td.dataset.kind = column.kind;
-      if (rendered.missing) {
+      if (state.projectionKind === "market_events" && column.key === "priority_rank") {
+        td.classList.add("market-event-priority-cell");
+        const badge = createElement("span", "event-priority-badge", row.priority_label || "日历关注");
+        badge.dataset.priority = String(row.priority_rank || 4);
+        badge.title = row.priority_reason || "";
+        td.append(badge);
+      } else if (state.projectionKind === "market_events" && column.key === "scheduled_sort_at") {
+        td.classList.add("market-event-time-cell");
+        const timing = createElement("div", "market-event-time");
+        timing.append(
+          createElement("strong", "", row.schedule_label || "时间待公布"),
+          createElement("span", "", row.countdown_label || ""),
+        );
+        if (row.schedule_changed_recently) {
+          timing.append(createElement("span", "market-event-change", "时间有调整"));
+        }
+        timing.title = row.time_precision === "DATE"
+          ? "官方目前只公布了美国东部日期，具体发布时间待公布。"
+          : "已换算为北京时间。";
+        td.append(timing);
+      } else if (state.projectionKind === "market_events" && column.key === "event_title") {
+        const event = createElement("div", "market-event-title-cell");
+        event.append(
+          createElement("strong", "", row.event_title || "关键事件"),
+          createElement("span", "", `${row.category_label || ""} · ${row.source_label || ""}`),
+        );
+        td.append(event);
+      } else if (state.projectionKind === "market_events" && column.key === "importance_rank") {
+        td.classList.add("market-event-importance-cell");
+        const badge = createElement("span", "market-event-importance", row.importance_label || "中");
+        badge.dataset.importance = row.importance || "MEDIUM";
+        badge.title = row.impact_reason || "";
+        td.append(badge);
+      } else if (state.projectionKind === "market_events" && column.key === "markets_label") {
+        const markets = createElement("div", "market-event-markets");
+        String(row.markets_label || "").split("、").filter(Boolean).forEach((label) => {
+          markets.append(createElement("span", "", label));
+        });
+        td.append(markets);
+      } else if (state.projectionKind === "market_events" && column.key === "expectation_summary") {
+        if (row.expectation_summary) {
+          const result = createElement("div", "market-event-result");
+          result.append(
+            createElement("strong", "", row.expectation_summary),
+            createElement("span", "", row.consensus_observed_at
+              ? `预期记录 ${formatTime(row.consensus_observed_at)}`
+              : ""),
+          );
+          td.append(result);
+        } else {
+          td.textContent = "—";
+          td.dataset.missing = "true";
+          td.title = row.expected_period
+            ? "尚未取得与官方发布时间精确匹配的市场一致预期。"
+            : "该事件当前不使用量化一致预期。";
+        }
+      } else if (state.projectionKind === "market_events" && column.key === "release_summary") {
+        if (row.release_summary) {
+          const result = createElement("div", "market-event-result");
+          result.append(createElement("strong", "", row.release_summary));
+          if (row.direction) {
+            const badge = createElement("span", "event-direction-badge", row.direction.label || "中性");
+            badge.dataset.tone = row.direction.tone || "NEUTRAL";
+            badge.title = `方向分 ${row.direction.score} · ${row.direction.threshold || ""}`;
+            result.append(badge);
+          }
+          td.append(result);
+        } else {
+          td.textContent = row.release_state_label || "等待公布";
+          td.classList.add("event-history-state");
+        }
+      } else if (state.projectionKind === "buyback" && column.key === "attention_label") {
+        const badge = createElement("span", "buyback-attention-badge", row.attention_label || "状态更新");
+        badge.dataset.level = row.attention_level || "UPDATE";
+        td.append(badge);
+      } else if (state.projectionKind === "buyback" && column.key === "security_label") {
+        const security = createElement("div", "buyback-security");
+        const quoteDestination = buybackMarketDestination(row);
+        const content = quoteDestination
+          ? createElement("a", "buyback-security-link")
+          : createElement("span", "buyback-security-link");
+        if (quoteDestination) {
+          content.href = quoteDestination.url;
+          content.target = "_blank";
+          content.rel = "noopener noreferrer";
+          content.title = `${quoteDestination.label}（新标签页）`;
+          content.setAttribute(
+            "aria-label",
+            `${row.stock_code || ""} ${row.issuer_name || ""}，${row.connect_status_label || ""}，打开${quoteDestination.label}，新标签页`,
+          );
+        }
+        const nameLine = createElement("span", "buyback-security-name");
+        const eligibility = createElement("span", "buyback-eligibility-dot");
+        eligibility.dataset.status = row.connect_status || "";
+        eligibility.title = [row.connect_status_label, row.connect_route_label]
+          .filter((value) => value && value !== "—")
+          .join(" · ");
+        eligibility.setAttribute("aria-hidden", "true");
+        nameLine.append(eligibility, createElement("span", "", row.issuer_name || "未知公司"));
+        content.append(
+          createElement("strong", "", row.stock_code || "未知代码"),
+          nameLine,
+        );
+        security.append(content);
+        if (quoteDestination) {
+          const externalIcon = createElement("span", "buyback-market-link-icon", "↗");
+          externalIcon.setAttribute("aria-hidden", "true");
+          security.append(externalIcon);
+        }
+        td.append(security);
+      } else if (state.projectionKind === "buyback" && column.key === "attractiveness_score") {
+        const metric = createElement("div", "buyback-score");
+        metric.dataset.level = row.attractiveness_level || "INSUFFICIENT";
+        const score = Number(row.attractiveness_score);
+        const hasScore = row.attractiveness_score !== null
+          && row.attractiveness_score !== undefined
+          && Number.isFinite(score);
+        const head = createElement("span", "buyback-score-head");
+        if (hasScore) {
+          head.append(
+            createElement("strong", "", score.toFixed(1)),
+            createElement("span", "buyback-score-label", row.attractiveness_label || ""),
+          );
+        } else {
+          head.append(createElement("strong", "buyback-score-unavailable", row.attractiveness_label || "数据不足"));
+          td.dataset.missing = "true";
+        }
+        metric.append(head);
+        metric.title = [
+          row.attractiveness_summary,
+          row.attractiveness_explanation,
+          row.missing_reasons?.attractiveness_score,
+        ].filter(Boolean).join("。 ");
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "execution_days_value") {
+        const metric = createElement("div", "buyback-derived-metric");
+        if (row.execution_days_label) {
+          metric.append(createElement("strong", "", row.execution_days_label));
+          if (row.execution_days_scope === "LOWER_BOUND") {
+            metric.append(createElement("span", "buyback-partial-label", "历史未完整"));
+            metric.title = row.missing_reasons?.cumulative_amount || "当前只显示已覆盖历史中的最低天数。";
+          }
+        } else {
+          metric.append(createElement("strong", "buyback-score-unavailable", "—"));
+          td.dataset.missing = "true";
+          metric.title = row.missing_reasons?.execution_days_value || "无法计算实际执行天数。";
+        }
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "cumulative_shares") {
+        const metric = createElement("div", "buyback-derived-metric");
+        if (row.cumulative_shares_label) {
+          metric.append(createElement("strong", "", row.cumulative_shares_label));
+        } else {
+          metric.append(createElement("strong", "buyback-score-unavailable", "—"));
+          td.dataset.missing = "true";
+          metric.title = row.missing_reasons?.cumulative_shares || "没有可计算的累计回购股数。";
+        }
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "cumulative_amount") {
+        const metric = createElement("div", "buyback-derived-metric");
+        if (row.cumulative_amount_label) {
+          metric.append(createElement("strong", "", row.cumulative_amount_label));
+        } else if (row.recent_amount_label) {
+          metric.append(
+            createElement("strong", "", row.recent_amount_label),
+            createElement("span", "buyback-partial-label", "近7日"),
+          );
+          td.dataset.partial = "true";
+          metric.title = row.missing_reasons?.cumulative_amount || "当前仅有近7日金额。";
+        } else {
+          metric.append(createElement("strong", "buyback-score-unavailable", "—"));
+          td.dataset.missing = "true";
+          metric.title = row.missing_reasons?.cumulative_amount || "没有可计算的累计回购金额。";
+        }
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "average_cost") {
+        const metric = createElement("div", "buyback-derived-metric");
+        if (row.average_cost_label) {
+          metric.append(createElement("strong", "", row.average_cost_label));
+          metric.title = row.average_cost_scope_label || "";
+        } else if (row.recent_average_cost_label) {
+          metric.append(
+            createElement("strong", "", row.recent_average_cost_label),
+            createElement("span", "buyback-partial-label", "近7日"),
+          );
+          td.dataset.partial = "true";
+          metric.title = row.missing_reasons?.average_cost || "当前仅有近7日加权均价。";
+        } else {
+          metric.append(createElement("strong", "buyback-score-unavailable", "—"));
+          td.dataset.missing = "true";
+          metric.title = row.missing_reasons?.average_cost || "无法估算回购均价。";
+        }
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "current_price") {
+        const metric = createElement("div", "buyback-derived-metric");
+        if (row.current_price_label) {
+          metric.append(createElement("strong", "", row.current_price_label));
+        } else {
+          metric.append(createElement("strong", "buyback-score-unavailable", "—"));
+          td.dataset.missing = "true";
+          metric.title = row.missing_reasons?.current_price || "当前没有可用行情价格。";
+        }
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "price_vs_average_percent") {
+        const metric = createElement("div", "buyback-derived-metric");
+        const fullDifference = Number(row.price_vs_average_percent);
+        const recentDifference = Number(row.recent_price_vs_average_percent);
+        if (row.price_vs_average_percent !== null && Number.isFinite(fullDifference)) {
+          const value = `${fullDifference >= 0 ? "+" : ""}${fullDifference.toFixed(2)}%`;
+          const result = createElement("strong", "buyback-directional-value", value);
+          result.dataset.direction = fullDifference > 0 ? "UP" : fullDifference < 0 ? "DOWN" : "FLAT";
+          metric.append(result);
+        } else if (row.recent_price_vs_average_percent !== null && Number.isFinite(recentDifference)) {
+          const value = `${recentDifference >= 0 ? "+" : ""}${recentDifference.toFixed(2)}%`;
+          const result = createElement("strong", "buyback-directional-value", value);
+          result.dataset.direction = recentDifference > 0 ? "UP" : recentDifference < 0 ? "DOWN" : "FLAT";
+          metric.append(result, createElement("span", "buyback-partial-label", "近7日"));
+          td.dataset.partial = "true";
+          metric.title = "现价相对近7日回购均价；本轮完整均价尚未形成。";
+        } else {
+          metric.append(createElement("strong", "buyback-score-unavailable", "—"));
+          td.dataset.missing = "true";
+          metric.title = row.missing_reasons?.price_vs_average_percent || "无法比较现价与回购均价。";
+        }
+        td.append(metric);
+      } else if (state.projectionKind === "buyback" && column.key === "intelligence_summary") {
+        const summary = createElement("div", "buyback-intelligence-summary");
+        summary.append(createElement("strong", "", row.intelligence_headline || row.event_type_label || "回购事件"));
+        const detail = createElement("span", "", row.intelligence_summary || "官方回购事实");
+        detail.title = row.intelligence_summary || "官方回购事实";
+        summary.append(detail);
+        td.append(summary);
+      } else if (state.projectionKind === "buyback" && column.key === "scale_label") {
+        const scale = createElement("span", "buyback-scale-label", row.scale_label || "规模未结构化");
+        scale.dataset.status = row.scale_status || "MISSING";
+        scale.title = row.scale_reason || "";
+        td.append(scale);
+      } else if (rendered.missing) {
         td.textContent = rendered.text;
         td.dataset.missing = "true";
         td.title = rendered.reason;
@@ -934,6 +2500,16 @@ function renderTable(
         td.append(externalIcon);
       } else {
         td.textContent = rendered.text;
+        if (
+          state.projectionKind === "buyback"
+          && column.kind === "percent"
+          && column.key !== "actual_amount_yield_percent"
+          && Number.isFinite(Number(row[column.key]))
+        ) {
+          const numeric = Number(row[column.key]);
+          td.classList.add("buyback-directional-cell");
+          td.dataset.direction = numeric > 0 ? "UP" : numeric < 0 ? "DOWN" : "FLAT";
+        }
       }
       tr.append(td);
     });
@@ -942,8 +2518,22 @@ function renderTable(
       tr.title = `${destination.label}（新标签页）`;
       tr.setAttribute("aria-label", `${row.symbol}：${destination.label}，新标签页`);
     }
+    if (state.projectionKind === "buyback") {
+      tr.classList.add("buyback-row");
+      tr.setAttribute(
+        "aria-label",
+        `${row.stock_code || ""} ${row.issuer_name || ""}，${row.intelligence_headline || "回购记录"}，按回车查看情报详情与官方证据`,
+      );
+    }
+    if (state.projectionKind === "market_events") {
+      tr.classList.add("market-event-row");
+      tr.setAttribute(
+        "aria-label",
+        `${row.event_title || "关键事件"}，${row.schedule_label || "时间待公布"}，按回车查看事件详情与官方来源`,
+      );
+    }
     tr.addEventListener("click", (event) => {
-      if (event.target.closest("a")) return;
+      if (event.target.closest("a, button")) return;
       if (marketAnchor) marketAnchor.click();
       else void select();
     });
@@ -956,11 +2546,407 @@ function renderTable(
     });
     ui.quoteBody.append(tr);
   });
-  const issueGroups = tableIssueGroups(issues || [], filters, rows);
+  const issueGroups = state.projectionKind === "market_events"
+    ? []
+    : tableIssueGroups(issues || [], filters, rows);
   issueGroups.forEach((group) => appendTableIssueRow(columns, group));
   ui.quoteEmpty.hidden = rows.length > 0 || issueGroups.length > 0;
-  ui.quoteEmpty.textContent = emptyTableMessage(dataStatus);
+  ui.quoteEmpty.textContent = emptyTableMessage(dataStatus, filters);
+  renderTablePagination(
+    page,
+    () => renderTable(columns, rows, selectedSeries, issues, filters, dataStatus),
+  );
 }
+
+const BUYBACK_EVENT_OPTIONS = [
+  ["PLAN_OR_APPROVAL", "方案 / 审议"],
+  ["FIRST_EXECUTION", "首次实施"],
+  ["PROGRESS", "实施进展"],
+  ["MODIFICATION", "方案变更"],
+  ["COMPLETION_OR_TERMINATION", "完成 / 终止"],
+  ["POST_BUYBACK_CANCELLATION", "注销"],
+  ["POST_BUYBACK_DISPOSAL", "出售已回购股份"],
+  ["AMBIGUOUS_BUYBACK", "待确认回购事件"],
+  ["HKEX_EXECUTION", "港股实际回购"],
+];
+
+function appendBuybackFact(label, value) {
+  const group = document.createElement("div");
+  group.append(createElement("dt", "", label));
+  group.append(createElement("dd", value ? "" : "missing-value", value || "—"));
+  ui.buybackFacts.append(group);
+}
+
+function safeExternalUrl(value) {
+  try {
+    const parsed = new URL(String(value));
+    return parsed.protocol === "https:" ? parsed.href : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function evidenceLink(label, href, { external = false } = {}) {
+  const anchor = createElement("a", "buyback-evidence-link", label);
+  anchor.href = href;
+  anchor.target = "_blank";
+  anchor.rel = external ? "noopener noreferrer" : "noopener";
+  return anchor;
+}
+
+function appendMarketEventFact(label, value, { warning = false } = {}) {
+  const group = document.createElement("div");
+  if (warning) group.dataset.warning = "true";
+  group.append(
+    createElement("dt", "", label),
+    createElement("dd", value ? "" : "missing-value", value || "—"),
+  );
+  ui.marketEventDetailFacts.append(group);
+}
+
+function openMarketEventDetail(event) {
+  ui.marketEventDetailFacts.replaceChildren();
+  ui.marketEventSourceLinks.replaceChildren();
+  ui.marketEventDetailTitle.textContent = event.event_title || "关键事件";
+  ui.marketEventDetailSubtitle.textContent = [
+    marketEventScheduleText(event),
+    event.countdown_label,
+  ].filter(Boolean).join(" · ");
+  appendMarketEventFact("准备优先级", event.priority_label);
+  appendMarketEventFact("影响级别", event.importance_label);
+  appendMarketEventFact("事件类别", event.category_label);
+  appendMarketEventFact("需考虑市场", event.markets_label);
+  appendMarketEventFact("发布时间", marketEventScheduleText(event));
+  if (event.expected_period) appendMarketEventFact("数据所属期", event.expected_period);
+  if (event.expected_period || (event.expectations || []).length) {
+    appendMarketEventFact(
+      "市场预期",
+      event.expectation_summary || "暂未取得匹配的一致预期",
+      { warning: !event.expectation_summary },
+    );
+  }
+  if (event.release_state !== "SCHEDULED") {
+    appendMarketEventFact(
+      "官方公布",
+      event.actual_summary || event.release_state_label,
+      { warning: event.release_state === "AWAITING_OFFICIAL" },
+    );
+  }
+  if (event.surprise_summary) appendMarketEventFact("预期差（实际-预期）", event.surprise_summary);
+  if (event.direction) {
+    appendMarketEventFact(
+      event.direction.scope || "风险资产短线",
+      `${event.direction.label} · 方向分 ${Number(event.direction.score).toFixed(2)}`,
+    );
+  }
+  if (event.schedule_changed_recently || Number(event.schedule_change_count || 0) > 0) {
+    appendMarketEventFact(
+      "时间变化",
+      event.previous_schedule_label
+        ? `此前 ${event.previous_schedule_label}`
+        : `累计调整 ${event.schedule_change_count} 次`,
+      { warning: true },
+    );
+  }
+  ui.marketEventImpactReason.textContent = [
+    event.priority_reason,
+    event.impact_reason,
+  ].filter(Boolean).join(" ");
+  ui.marketEventDescription.textContent = event.event_description || "—";
+  ui.marketEventHowToRead.textContent = event.interpretation?.how_to_read || "—";
+  ui.marketEventDecisionRule.textContent = event.interpretation?.decision_rule || "";
+
+  const directionMethod = event.direction || event.direction_method;
+  ui.marketEventDirectionSection.hidden = !directionMethod;
+  ui.marketEventDirectionInputs.replaceChildren();
+  if (directionMethod) {
+    const hasDirection = Boolean(event.direction);
+    ui.marketEventDirectionLabel.textContent = hasDirection
+      ? `${event.direction.scope || "风险资产短线"} ${event.direction.label} · ${Number(event.direction.score).toFixed(2)}`
+      : "公布后自动计算";
+    ui.marketEventDirectionLabel.dataset.tone = event.direction?.tone || "NEUTRAL";
+    ui.marketEventDirectionAction.textContent = hasDirection
+      ? event.direction.action || ""
+      : "实际值与发布前一致预期均完整后，系统按下列固定公式自动给出偏多、偏空或中性判断。";
+    ui.marketEventDirectionFormula.textContent = [
+      directionMethod.formula,
+      directionMethod.threshold,
+    ].filter(Boolean).join("；");
+    const inputs = event.direction?.inputs || directionMethod.required_inputs || [];
+    inputs.forEach((input) => {
+      ui.marketEventDirectionInputs.append(createElement(
+        "span",
+        "",
+        input.display ? `${input.label} ${input.display}` : String(input),
+      ));
+    });
+  }
+
+  const links = [
+    ["查看事件发布页", safeExternalUrl(event.official_release_url)],
+    ["查看官方日历", safeExternalUrl(event.schedule_source_url)],
+    ["查看市场一致预期来源", safeExternalUrl(event.consensus_source_url)],
+    ["查看官方实值来源", safeExternalUrl(event.actual_source_url)],
+  ];
+  const seen = new Set();
+  links.forEach(([label, href]) => {
+    if (!href || seen.has(href)) return;
+    seen.add(href);
+    const anchor = createElement("a", "market-event-source-link", label);
+    anchor.href = href;
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    ui.marketEventSourceLinks.append(anchor);
+  });
+  if (!ui.marketEventDetailDialog.open) ui.marketEventDetailDialog.showModal();
+}
+
+ui.marketEventDetailClose.addEventListener("click", () => {
+  ui.marketEventDetailDialog.close();
+});
+
+ui.marketEventDetailDialog.addEventListener("click", (event) => {
+  if (event.target === ui.marketEventDetailDialog) {
+    ui.marketEventDetailDialog.close();
+  }
+});
+
+async function openBuybackDetail(entityKey) {
+  state.buybackDetailEntityKey = entityKey;
+  state.buybackDetailRevisionNo = null;
+  ui.buybackDetailTitle.textContent = "正在读取证据";
+  ui.buybackDetailSubtitle.textContent = "";
+  ui.buybackDetailStatus.textContent = "正在加载回购事实、官方证据与校正记录…";
+  ui.buybackDetailStatus.dataset.kind = "loading";
+  ui.buybackDetailStatus.hidden = false;
+  ui.buybackDetailContent.hidden = true;
+  if (!ui.buybackDetailDialog.open) ui.buybackDetailDialog.showModal();
+  try {
+    const response = await fetch(
+      `/api/buybacks/entities/${encodeURIComponent(entityKey)}`,
+      { headers: { Accept: "application/json" }, cache: "no-store" },
+    );
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    const payload = await response.json();
+    renderBuybackDetail(payload);
+  } catch (error) {
+    ui.buybackDetailStatus.textContent = `详情读取失败 · ${error.message}`;
+    ui.buybackDetailStatus.dataset.kind = "error";
+    ui.buybackDetailStatus.hidden = false;
+  }
+}
+
+function renderBuybackDetail(payload) {
+  const entity = payload.entity;
+  const documentValue = payload.document;
+  const latestReview = payload.reviews.find(
+    (review) => Number(review.base_revision_no) === Number(entity.revision_no),
+  ) || null;
+  state.buybackDetailRevisionNo = entity.revision_no;
+  ui.buybackDetailTitle.textContent = `${entity.stock_code || "未知代码"} · ${entity.issuer_name || "未知公司"}`;
+  ui.buybackDetailSubtitle.textContent = `${entity.event_type_label || entity.event_type} · ${formatDate(entity.effective_date || entity.effective_at)}`;
+  ui.buybackDetailStatus.textContent = "";
+  ui.buybackDetailStatus.dataset.kind = "";
+  ui.buybackDetailStatus.hidden = true;
+  ui.buybackDetailContent.hidden = false;
+
+  ui.buybackFacts.replaceChildren();
+  const attractivenessScore = Number(entity.attractiveness_score);
+  const hasAttractivenessScore = entity.attractiveness_score !== null
+    && entity.attractiveness_score !== undefined
+    && Number.isFinite(attractivenessScore);
+  appendBuybackFact(
+    "回购吸引力",
+    hasAttractivenessScore
+      ? `${attractivenessScore.toFixed(1)} · ${entity.attractiveness_label} · 输入覆盖 ${Number(entity.attractiveness_coverage_percent || 0).toFixed(1)}%`
+      : entity.attractiveness_label,
+  );
+  appendBuybackFact("实际执行天数", entity.execution_days_label);
+  appendBuybackFact("累计股数", entity.cumulative_shares_label);
+  appendBuybackFact(
+    "累计金额",
+    entity.cumulative_amount_label
+      || (entity.recent_amount_label ? `${entity.recent_amount_label} · 仅近7日` : null),
+  );
+  appendBuybackFact(
+    "回购均价",
+    entity.average_cost_label
+      || (entity.recent_average_cost_label ? `${entity.recent_average_cost_label} · 仅近7日` : null),
+  );
+  appendBuybackFact(
+    "现价",
+    entity.current_price_label,
+  );
+  const priceDifference = entity.price_vs_average_percent ?? entity.recent_price_vs_average_percent;
+  const priceDifferenceNumber = Number(priceDifference);
+  appendBuybackFact(
+    "现价/回购均价",
+    priceDifference != null && Number.isFinite(priceDifferenceNumber)
+      ? `${priceDifferenceNumber >= 0 ? "+" : ""}${priceDifferenceNumber.toFixed(2)}%${entity.price_vs_average_percent == null ? " · 近7日口径" : ""}`
+      : null,
+  );
+  const dailyChange = Number(entity.daily_change_percent);
+  appendBuybackFact(
+    "涨跌幅",
+    entity.daily_change_percent != null && Number.isFinite(dailyChange)
+      ? `${dailyChange >= 0 ? "+" : ""}${dailyChange.toFixed(2)}%`
+      : null,
+  );
+  const marketCapYield = Number(entity.actual_amount_yield_percent);
+  appendBuybackFact(
+    "回购金额/市值",
+    entity.actual_amount_yield_percent != null && Number.isFinite(marketCapYield)
+      ? `${marketCapYield.toFixed(2)}%`
+      : null,
+  );
+  [
+    ["年度ROE", entity.roe_percent],
+    ["营收同比", entity.revenue_yoy_percent],
+    ["净利同比", entity.net_profit_yoy_percent],
+  ].forEach(([label, value]) => {
+    const numeric = Number(value);
+    appendBuybackFact(
+      label,
+      value != null && Number.isFinite(numeric)
+        ? `${numeric > 0 ? "+" : ""}${numeric.toFixed(1)}%`
+        : null,
+      );
+    });
+  const financialPeriods = [
+    entity.roe_report_date ? `年度ROE ${formatDate(entity.roe_report_date)}` : null,
+    entity.financial_report_date ? `增长数据 ${formatDate(entity.financial_report_date)}` : null,
+  ].filter(Boolean);
+  if (financialPeriods.length) appendBuybackFact("业绩报告期", financialPeriods.join(" · "));
+  (entity.attractiveness_components || [])
+    .filter((component) => component.available)
+    .forEach((component) => {
+      appendBuybackFact(
+        `${component.name} · 权重${Number(component.weight).toFixed(0)}%`,
+        component.detail,
+      );
+    });
+  appendBuybackFact("情报", entity.intelligence_headline || entity.event_type_label || entity.event_type);
+  appendBuybackFact("事实摘要", entity.intelligence_summary);
+  appendBuybackFact("市场", entity.market_label);
+  appendBuybackFact("日期", formatDate(entity.effective_date || entity.effective_at));
+  appendBuybackFact("官方发布时间", formatTime(entity.official_release_at));
+  const connectRoute = entity.connect_route_label && entity.connect_route_label !== "—"
+    ? ` · ${entity.connect_route_label}`
+    : "";
+  appendBuybackFact("购买资格", `${entity.connect_status_label || "—"}${connectRoute}`);
+  if (entity.program_key) appendBuybackFact("回购方案", entity.program_key);
+
+  ui.buybackEvidenceLinks.replaceChildren();
+  const marketQuote = buybackMarketDestination(entity);
+  if (marketQuote) {
+    ui.buybackEvidenceLinks.append(
+      evidenceLink("查看 TradingView 专业图表 ↗", marketQuote.url, { external: true }),
+    );
+  }
+  const official = safeExternalUrl(
+    documentValue?.source_url || entity.document_url || entity.source_url,
+  );
+  if (official) {
+    ui.buybackEvidenceLinks.append(evidenceLink("打开官方原文 ↗", official, { external: true }));
+  }
+  if (documentValue?.local_url && /^\/api\/buybacks\/documents\/[0-9a-f]{64}$/.test(documentValue.local_url)) {
+    ui.buybackEvidenceLinks.append(evidenceLink("打开本机证据副本", documentValue.local_url));
+  }
+  ui.buybackEvidenceMeta.textContent = documentValue
+    ? `${documentValue.source_label} · 取得 ${formatTime(documentValue.observed_at)} · 本机证据副本 ${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(Number(documentValue.size_bytes) / 1024)} KB`
+    : "尚未取得通过校验的原始文件；当前仅保留公告索引事实。";
+  const excerpt = entity.evidence_excerpt || documentValue?.metadata?.evidence_excerpt || "";
+  ui.buybackEvidenceExcerpt.textContent = excerpt;
+  ui.buybackEvidenceExcerpt.hidden = !excerpt;
+
+  ui.buybackReviewDecision.value = latestReview?.decision || "";
+  ui.buybackReviewEventType.replaceChildren();
+  BUYBACK_EVENT_OPTIONS.forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = value === entity.event_type;
+    ui.buybackReviewEventType.append(option);
+  });
+  ui.buybackReviewProgramKey.value = entity.program_key || "";
+  ui.buybackReviewProgramStatus.value = entity.program_status || "";
+  ui.buybackReviewNote.value = "";
+  ui.buybackReviewSubmit.disabled = false;
+  ui.buybackReviewSubmit.textContent = "提交校正";
+
+  ui.buybackReviewHistory.replaceChildren();
+  if (!payload.reviews.length) {
+    ui.buybackReviewHistory.append(createElement("p", "empty-state", "尚无人工校正记录。"));
+  } else {
+    payload.reviews.forEach((review) => {
+      const item = createElement("article", "buyback-review-record");
+      item.append(createElement("strong", "", `${review.decision_label} · ${formatTime(review.created_at)}`));
+      const details = [
+        review.corrected_event_type,
+        review.program_key,
+        review.program_status,
+      ].filter(Boolean).join(" · ");
+      if (details) item.append(createElement("p", "", details));
+      if (review.note) item.append(createElement("p", "", review.note));
+      ui.buybackReviewHistory.append(item);
+    });
+  }
+}
+
+ui.buybackDetailClose.addEventListener("click", () => {
+  ui.buybackDetailDialog.close();
+});
+
+ui.buybackReviewForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (
+    state.buybackReviewSubmitting
+    || !state.buybackDetailEntityKey
+    || !state.buybackDetailRevisionNo
+    || !ui.buybackReviewForm.reportValidity()
+  ) return;
+  state.buybackReviewSubmitting = true;
+  ui.buybackReviewSubmit.disabled = true;
+  ui.buybackReviewSubmit.textContent = "正在保存…";
+  ui.buybackDetailStatus.textContent = "正在追加人工校正记录…";
+  ui.buybackDetailStatus.dataset.kind = "loading";
+  ui.buybackDetailStatus.hidden = false;
+  const entityKey = state.buybackDetailEntityKey;
+  try {
+    const response = await fetch(
+      `/api/buybacks/entities/${encodeURIComponent(entityKey)}/reviews`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          base_revision_no: state.buybackDetailRevisionNo,
+          decision: ui.buybackReviewDecision.value,
+          corrected_event_type: ui.buybackReviewEventType.value || null,
+          program_key: ui.buybackReviewProgramKey.value.trim() || null,
+          program_status: ui.buybackReviewProgramStatus.value || null,
+          note: ui.buybackReviewNote.value.trim(),
+        }),
+      },
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || `HTTP_${response.status}`);
+    await loadView();
+    await openBuybackDetail(entityKey);
+    ui.buybackDetailStatus.textContent = "人工校正已追加保存。";
+    ui.buybackDetailStatus.dataset.kind = "success";
+    ui.buybackDetailStatus.hidden = false;
+  } catch (error) {
+    ui.buybackDetailStatus.textContent = error.message === "BUYBACK_REVISION_CONFLICT"
+      ? "保存前事实 revision 已变化，请关闭后重新查看最新情报。"
+      : `人工校正保存失败 · ${error.message}`;
+    ui.buybackDetailStatus.dataset.kind = "error";
+    ui.buybackDetailStatus.hidden = false;
+  } finally {
+    state.buybackReviewSubmitting = false;
+    ui.buybackReviewSubmit.disabled = false;
+    ui.buybackReviewSubmit.textContent = "提交校正";
+  }
+});
 
 function evaluationHorizonLabel(minutes) {
   if (Number(minutes) === 60) return "1小时";
@@ -1390,32 +3376,72 @@ window.addEventListener("resize", () => {
   clearTimeout(state.chartResizeTimer);
   state.chartResizeTimer = setTimeout(() => {
     if (state.chartModel) drawHistoryChart();
+    updateQuoteHorizontalScrollbar();
   }, 100);
 });
 
-function renderIssues(issues) {
+function updateBackToTopVisibility() {
+  ui.backToTop.hidden = window.scrollY < 320;
+}
+
+window.addEventListener("scroll", () => {
+  updateBackToTopVisibility();
+  updateQuoteHorizontalScrollbar();
+}, { passive: true });
+
+ui.backToTop.addEventListener("click", () => {
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
+});
+
+updateBackToTopVisibility();
+
+function renderIssues(issues, monitor) {
   const diagnosticIssues = issues.filter(
     (issue) => issue.classification !== "EXPECTED_ABSENCE"
   );
-  ui.diagnosticsRegion.hidden = diagnosticIssues.length === 0;
   ui.issueBody.replaceChildren();
   diagnosticIssues.forEach((issue) => {
     const row = document.createElement("tr");
-    const [direction, asset] = issue.scope.split(":", 2);
-    const scope = asset ? `${direction === "BUY" ? "买入" : direction === "SELL" ? "卖出" : direction} ${asset}` : issue.scope;
-    row.append(createElement("td", "", scope));
+    row.append(createElement("td", "", issueScopeLabel(issue.scope)));
     row.append(createElement("td", "", formatTime(issue.occurred_at)));
-    const reason = createElement("td", "", ISSUE_REASON_LABELS[issue.reason_code] || issue.reason_code);
-    reason.title = `${ISSUE_REASON_DETAILS[issue.reason_code] || issue.reason_code}（${issue.reason_code}）`;
+    const reason = createElement("td", "", issueReasonLabel(issue.reason_code));
+    reason.title = issueReasonDetail(issue.reason_code);
     row.append(reason);
     ui.issueBody.append(row);
   });
   ui.issueCount.textContent = `${diagnosticIssues.length} 条`;
+  ui.diagnosticsOpenCount.textContent = String(diagnosticIssues.length);
+  ui.diagnosticsOpenCount.hidden = diagnosticIssues.length === 0;
+  ui.diagnosticsOpen.dataset.hasIssues = String(diagnosticIssues.length > 0);
+  ui.diagnosticsOpen.setAttribute(
+    "aria-label",
+    diagnosticIssues.length > 0
+      ? `查看${monitor.display_name}的诊断日志，${diagnosticIssues.length} 条记录`
+      : `查看${monitor.display_name}的诊断日志，当前没有采集失败`,
+  );
+  ui.diagnosticsDialogSubtitle.textContent = diagnosticIssues.length > 0
+    ? `${monitor.display_name} · ${diagnosticIssues.length} 条近期记录`
+    : `${monitor.display_name} · 当前没有采集失败`;
+  ui.issueScroll.hidden = diagnosticIssues.length === 0;
   ui.issueEmpty.hidden = diagnosticIssues.length > 0;
 }
+
+ui.diagnosticsOpen.addEventListener("click", () => {
+  if (!ui.diagnosticsDialog.open) ui.diagnosticsDialog.showModal();
+});
+
+ui.diagnosticsDialogClose.addEventListener("click", () => {
+  ui.diagnosticsDialog.close();
+});
+
+ui.diagnosticsDialog.addEventListener("click", (event) => {
+  if (event.target === ui.diagnosticsDialog) ui.diagnosticsDialog.close();
+});
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") loadView();
 });
 
+applyMonitorRailState({ persist: false });
 loadView();

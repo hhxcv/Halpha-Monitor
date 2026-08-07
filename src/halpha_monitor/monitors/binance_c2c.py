@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 from dataclasses import dataclass, replace
@@ -15,6 +16,7 @@ from urllib.request import OpenerDirector, ProxyHandler, Request, build_opener
 
 from halpha_monitor.contracts import (
     CollectionBatch,
+    CollectionCancelled,
     CollectionIssue,
     ConfigurationField,
     FilterChoice,
@@ -100,19 +102,19 @@ class BinanceC2CSettings:
         )
         if not ASSET_PATTERN.fullmatch(normalized_fiat):
             raise ValueError("C2C_FIAT_INVALID")
-        if not normalized_assets or any(
+        if not normalized_assets or len(normalized_assets) > 20 or any(
             not ASSET_PATTERN.fullmatch(asset) for asset in normalized_assets
         ):
             raise ValueError("C2C_ASSETS_INVALID")
-        if self.interval_seconds < 15:
+        if not math.isfinite(self.interval_seconds) or self.interval_seconds < 15:
             raise ValueError("C2C_INTERVAL_TOO_SHORT")
-        if self.target_fiat <= 0:
+        if not self.target_fiat.is_finite() or self.target_fiat <= 0:
             raise ValueError("C2C_TARGET_FIAT_INVALID")
         if not normalized_methods:
             raise ValueError("C2C_TRADE_METHODS_INVALID")
         if not 1 <= self.ad_limit <= 20:
             raise ValueError("C2C_AD_LIMIT_INVALID")
-        if self.timeout_seconds <= 0:
+        if not math.isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 60:
             raise ValueError("C2C_TIMEOUT_INVALID")
         object.__setattr__(self, "fiat", normalized_fiat)
         object.__setattr__(self, "assets", normalized_assets)
@@ -280,11 +282,20 @@ class BinancePublicClient:
             else build_opener()
         )
         self._network_requests = NetworkRequestWindow()
+        self._stop_event: threading.Event | None = None
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise CollectionCancelled("C2C_COLLECTION_CANCELLED")
 
     def network_request_count(self, *, window_seconds: float = 60) -> int:
         return self._network_requests.count(window_seconds=window_seconds)
 
     def _get(self, base: str, path: str, params: list[tuple[str, str]]) -> Any:
+        self._raise_if_cancelled()
         url = f"{base}{path}?{urlencode(params)}"
         request = Request(
             url,
@@ -562,6 +573,11 @@ class BinanceC2CMonitor:
         if not callable(counter):
             return None
         return int(counter(window_seconds=window_seconds))
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        binder = getattr(self.client, "bind_stop_event", None)
+        if callable(binder):
+            binder(stop_event)
 
     def collect(self) -> CollectionBatch:
         with self._settings_lock:

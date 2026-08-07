@@ -1,4 +1,4 @@
-"""Explicit monitor registry and one-thread-per-monitor scheduler."""
+"""Explicit monitor registry and one-worker-per-monitor scheduler."""
 
 from __future__ import annotations
 
@@ -7,13 +7,40 @@ import re
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime
+import math
 
-from halpha_monitor.contracts import ForwardEvaluatingMonitor, RegisteredMonitor
+from halpha_monitor.contracts import (
+    AutomaticCollectionMonitor,
+    AutomaticCollectionState,
+    CollectionCancelled,
+    CooperativeMonitor,
+    ForwardEvaluatingMonitor,
+    RegisteredMonitor,
+)
 from halpha_monitor.store import SQLiteMonitorStore, StoredControl, utc_now
 
 
 MONITOR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+
+
+def _safe_runtime_log(message: str) -> None:
+    """Best-effort stdout diagnostics must never stop collection workers."""
+    try:
+        print(message, flush=True)
+    except (OSError, ValueError):
+        return
+
+
+@dataclass(frozen=True)
+class WorkerState:
+    monitor_id: str
+    alive: bool
+    collecting: bool
+    manual_run_pending: bool
+    last_seen_at: datetime | None
+    last_error: str | None
 
 
 class MonitorRegistry:
@@ -27,6 +54,8 @@ class MonitorRegistry:
             raise ValueError(f"MONITOR_ID_INVALID id={monitor.monitor_id}")
         if monitor.monitor_id in self._monitors:
             raise ValueError(f"MONITOR_ID_DUPLICATE id={monitor.monitor_id}")
+        if not math.isfinite(float(monitor.interval_seconds)):
+            raise ValueError("MONITOR_INTERVAL_INVALID")
         if monitor.interval_seconds < 15:
             raise ValueError("MONITOR_INTERVAL_TOO_SHORT")
         self._monitors[monitor.monitor_id] = monitor
@@ -56,7 +85,7 @@ class MonitorScheduler:
         store: SQLiteMonitorStore,
         *,
         retention_days: int = 90,
-        stop_timeout_seconds: float = 5,
+        stop_timeout_seconds: float = 65,
         maintenance_interval_seconds: float = 3600,
     ) -> None:
         if retention_days < 1:
@@ -71,59 +100,183 @@ class MonitorScheduler:
         self.stop_timeout_seconds = stop_timeout_seconds
         self.maintenance_interval_seconds = maintenance_interval_seconds
         self._stop_event = threading.Event()
-        self._threads: list[threading.Thread] = []
+        self._threads: dict[str, threading.Thread] = {}
         self._wake_events: dict[str, threading.Event] = {}
+        self._manual_run_events: dict[str, threading.Event] = {}
         self._maintenance_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._worker_state_lock = threading.Lock()
+        self._worker_last_seen_at: dict[str, datetime] = {}
+        self._worker_last_error: dict[str, str] = {}
+        self._collecting: set[str] = set()
         self._next_maintenance_at = 0.0
+        self._started_at = 0.0
         self._started = False
 
     def start(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        self._stop_event.clear()
-        self._next_maintenance_at = 0.0
-        for monitor in self.registry:
-            self.store.ensure_control(
-                monitor.monitor_id,
-                default_enabled=bool(getattr(monitor, "default_enabled", True)),
-            )
-            wake_event = threading.Event()
-            self._wake_events[monitor.monitor_id] = wake_event
-            thread = threading.Thread(
-                target=self._loop,
-                args=(monitor, wake_event),
-                name=f"halpha-monitor:{monitor.monitor_id}",
-                daemon=True,
-            )
-            thread.start()
-            self._threads.append(thread)
+        try:
+            with self._lifecycle_lock:
+                if self._started:
+                    return
+                monitors = self.registry.all()
+                for monitor in monitors:
+                    self.store.ensure_control(
+                        monitor.monitor_id,
+                        default_enabled=bool(
+                            getattr(monitor, "default_enabled", True)
+                        ),
+                    )
+                self._stop_event.clear()
+                self._next_maintenance_at = 0.0
+                self._started_at = time.monotonic()
+                self._wake_events = {
+                    monitor.monitor_id: threading.Event() for monitor in monitors
+                }
+                self._manual_run_events = {
+                    monitor.monitor_id: threading.Event() for monitor in monitors
+                }
+                self._threads = {}
+                with self._worker_state_lock:
+                    self._worker_last_seen_at.clear()
+                    self._worker_last_error.clear()
+                    self._collecting.clear()
+                self._started = True
+                for monitor in monitors:
+                    if isinstance(monitor, CooperativeMonitor):
+                        monitor.bind_stop_event(self._stop_event)
+                    thread = threading.Thread(
+                        target=self._loop,
+                        args=(
+                            monitor,
+                            self._wake_events[monitor.monitor_id],
+                            self._manual_run_events[monitor.monitor_id],
+                        ),
+                        name=f"halpha-monitor:{monitor.monitor_id}",
+                        daemon=True,
+                    )
+                    self._threads[monitor.monitor_id] = thread
+                    thread.start()
+        except Exception:
+            self._stop_event.set()
+            with self._lifecycle_lock:
+                failed_threads = tuple(self._threads.values())
+                for wake_event in self._wake_events.values():
+                    wake_event.set()
+            deadline = time.monotonic() + self.stop_timeout_seconds
+            for thread in failed_threads:
+                if thread.ident is not None:
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            with self._lifecycle_lock:
+                self._threads.clear()
+                self._wake_events.clear()
+                self._manual_run_events.clear()
+                self._started = False
+            raise
 
     def stop(self) -> None:
-        self._stop_event.set()
-        for wake_event in self._wake_events.values():
-            wake_event.set()
-        for thread in self._threads:
-            thread.join(timeout=self.stop_timeout_seconds)
-        if any(thread.is_alive() for thread in self._threads):
+        with self._lifecycle_lock:
+            if not self._started and not self._threads:
+                return
+            self._stop_event.set()
+            threads = tuple(self._threads.values())
+            for wake_event in self._wake_events.values():
+                wake_event.set()
+        deadline = time.monotonic() + self.stop_timeout_seconds
+        for thread in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+        if any(thread.is_alive() for thread in threads):
             raise RuntimeError("MONITOR_STOP_TIMEOUT")
-        self._threads.clear()
-        self._wake_events.clear()
-        self._started = False
+        with self._lifecycle_lock:
+            self._threads.clear()
+            self._wake_events.clear()
+            self._manual_run_events.clear()
+            self._started = False
 
     def request_run(self, monitor_id: str) -> bool:
         self.registry.get(monitor_id)
         if not self.store.is_enabled(monitor_id):
             return False
-        wake_event = self._wake_events.get(monitor_id)
-        if not self._started or wake_event is None:
-            return False
-        wake_event.set()
+        with self._lifecycle_lock:
+            wake_event = self._wake_events.get(monitor_id)
+            manual_event = self._manual_run_events.get(monitor_id)
+            if not self._started or wake_event is None or manual_event is None:
+                return False
+            # Event semantics deliberately coalesce repeated clicks into one
+            # bounded pending run instead of building an in-memory queue.
+            manual_event.set()
+            wake_event.set()
         return True
 
     @property
     def started(self) -> bool:
-        return self._started
+        with self._lifecycle_lock:
+            return self._started
+
+    @property
+    def healthy(self) -> bool:
+        with self._lifecycle_lock:
+            if not self._started or len(self._threads) != len(self.registry):
+                return False
+            return all(thread.is_alive() for thread in self._threads.values())
+
+    def worker_states(self) -> tuple[WorkerState, ...]:
+        with self._lifecycle_lock:
+            threads = dict(self._threads)
+            manual_events = dict(self._manual_run_events)
+        with self._worker_state_lock:
+            last_seen = dict(self._worker_last_seen_at)
+            last_errors = dict(self._worker_last_error)
+            collecting = set(self._collecting)
+        return tuple(
+            WorkerState(
+                monitor_id=monitor.monitor_id,
+                alive=bool(
+                    (thread := threads.get(monitor.monitor_id))
+                    and thread.is_alive()
+                ),
+                collecting=monitor.monitor_id in collecting,
+                manual_run_pending=bool(
+                    (event := manual_events.get(monitor.monitor_id))
+                    and event.is_set()
+                ),
+                last_seen_at=last_seen.get(monitor.monitor_id),
+                last_error=last_errors.get(monitor.monitor_id),
+            )
+            for monitor in self.registry
+        )
+
+    def automatic_collection_state(
+        self,
+        monitor_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> AutomaticCollectionState | None:
+        monitor = self.registry.get(monitor_id)
+        if not isinstance(monitor, AutomaticCollectionMonitor):
+            return None
+        observed_at = now or utc_now()
+        try:
+            state = monitor.automatic_collection_state(now=observed_at)
+        except Exception as exc:
+            return AutomaticCollectionState(
+                allowed=False,
+                status="UNAVAILABLE",
+                reason_code=(
+                    f"AUTOMATIC_SCHEDULE_FAILED_{type(exc).__name__.upper()}"
+                ),
+                label="交易日历不可判定 · 自动刷新暂停",
+                detail="无法确认交易时段；为避免闭市误采集，当前只允许手动刷新。",
+            )
+        if not isinstance(state, AutomaticCollectionState):
+            return AutomaticCollectionState(
+                allowed=False,
+                status="UNAVAILABLE",
+                reason_code="AUTOMATIC_SCHEDULE_STATE_INVALID",
+                label="交易日历不可判定 · 自动刷新暂停",
+                detail="交易时段状态无效；当前只允许手动刷新。",
+            )
+        return state
 
     def set_enabled(self, monitor_id: str, enabled: bool) -> StoredControl:
         monitor = self.registry.get(monitor_id)
@@ -132,47 +285,64 @@ class MonitorScheduler:
             default_enabled=bool(getattr(monitor, "default_enabled", True)),
         )
         stored = self.store.set_enabled(monitor_id, enabled)
-        wake_event = self._wake_events.get(monitor_id)
-        if wake_event is not None:
-            wake_event.set()
+        with self._lifecycle_lock:
+            wake_event = self._wake_events.get(monitor_id)
+            manual_event = self._manual_run_events.get(monitor_id)
+            if not enabled and manual_event is not None:
+                manual_event.clear()
+            if wake_event is not None:
+                wake_event.set()
         return stored
 
     def run_once(self, monitor: RegisteredMonitor) -> None:
-        run_id = self.store.start_run(monitor.monitor_id)
+        self._set_collecting(monitor.monitor_id, True)
+        run_id: int | None = None
         try:
-            batch = monitor.collect()
-            if isinstance(monitor, ForwardEvaluatingMonitor):
-                evaluation_now = utc_now()
-                pending = self.store.pending_forward_evaluations(
+            run_id = self.store.start_run(monitor.monitor_id)
+            try:
+                batch = monitor.collect()
+                if isinstance(monitor, ForwardEvaluatingMonitor):
+                    evaluation_now = utc_now()
+                    pending = self.store.pending_forward_evaluations(
+                        monitor.monitor_id,
+                        due_before=evaluation_now,
+                        limit=monitor.evaluation_batch_limit,
+                    )
+                    if pending:
+                        try:
+                            resolved = monitor.evaluate(pending, now=evaluation_now)
+                        except CollectionCancelled:
+                            raise
+                        except Exception as exc:
+                            # Follow-up validation must not invalidate the current
+                            # market snapshot. Pending cases remain durable and are
+                            # retried by the next bounded collection cycle.
+                            _safe_runtime_log(
+                                "MONITOR_EVALUATION_FAILED "
+                                f"id={monitor.monitor_id} type={type(exc).__name__}"
+                            )
+                        else:
+                            batch = replace(
+                                batch,
+                                evaluation_results=(
+                                    *batch.evaluation_results,
+                                    *resolved,
+                                ),
+                            )
+                self.store.finish_run(run_id, monitor.monitor_id, batch)
+            except CollectionCancelled:
+                self.store.fail_run(
+                    run_id,
                     monitor.monitor_id,
-                    due_before=evaluation_now,
-                    limit=monitor.evaluation_batch_limit,
+                    "COLLECTION_CANCELLED",
                 )
-                if pending:
-                    try:
-                        resolved = monitor.evaluate(pending, now=evaluation_now)
-                    except Exception as exc:
-                        # Follow-up validation must not invalidate the current
-                        # market snapshot. Pending cases remain durable and are
-                        # retried by the next bounded collection cycle.
-                        print(
-                            "MONITOR_EVALUATION_FAILED "
-                            f"id={monitor.monitor_id} type={type(exc).__name__}",
-                            flush=True,
-                        )
-                    else:
-                        batch = replace(
-                            batch,
-                            evaluation_results=(
-                                *batch.evaluation_results,
-                                *resolved,
-                            ),
-                        )
-            self.store.finish_run(run_id, monitor.monitor_id, batch)
-        except Exception as exc:
-            reason_code = f"COLLECTION_FAILED_{type(exc).__name__.upper()}"
-            self.store.fail_run(run_id, monitor.monitor_id, reason_code)
-        self._run_maintenance_if_due()
+            except Exception as exc:
+                reason_code = f"COLLECTION_FAILED_{type(exc).__name__.upper()}"
+                self.store.fail_run(run_id, monitor.monitor_id, reason_code)
+            self._run_maintenance_if_due()
+        finally:
+            self._set_collecting(monitor.monitor_id, False)
+            self._touch_worker(monitor.monitor_id)
 
     def _run_maintenance_if_due(self) -> None:
         now = time.monotonic()
@@ -184,35 +354,131 @@ class MonitorScheduler:
                 return
             self._next_maintenance_at = now + self.maintenance_interval_seconds
             try:
-                self.store.prune(self.retention_days)
+                removed_runs = self.store.prune(self.retention_days)
             except Exception as exc:
-                print(
-                    f"MONITOR_MAINTENANCE_FAILED type={type(exc).__name__}",
-                    flush=True,
+                _safe_runtime_log(
+                    f"MONITOR_MAINTENANCE_FAILED type={type(exc).__name__}"
                 )
+                return
+            try:
+                storage = self.store.storage_metrics()
+            except Exception as exc:
+                _safe_runtime_log(
+                    f"MONITOR_RUNTIME_METRICS_FAILED type={type(exc).__name__}"
+                )
+                return
+            workers = self.worker_states()
+            _safe_runtime_log(
+                "MONITOR_RUNTIME "
+                f"uptime_seconds={max(0, round(now - self._started_at))} "
+                f"workers_alive={sum(worker.alive for worker in workers)}/"
+                f"{len(workers)} collecting={sum(worker.collecting for worker in workers)} "
+                f"python_threads={threading.active_count()} removed_runs={removed_runs} "
+                f"db_bytes={storage['database_bytes']} "
+                f"wal_bytes={storage['wal_bytes']} "
+                f"evidence_bytes={storage['buyback_evidence_bytes']}"
+            )
+
+    def _touch_worker(self, monitor_id: str) -> None:
+        with self._worker_state_lock:
+            self._worker_last_seen_at[monitor_id] = utc_now()
+
+    def _set_collecting(self, monitor_id: str, collecting: bool) -> None:
+        with self._worker_state_lock:
+            if collecting:
+                self._collecting.add(monitor_id)
+            else:
+                self._collecting.discard(monitor_id)
+
+    def _record_loop_error(self, monitor_id: str, exc: Exception) -> None:
+        error_type = type(exc).__name__
+        with self._worker_state_lock:
+            self._worker_last_error[monitor_id] = error_type
+            self._worker_last_seen_at[monitor_id] = utc_now()
+        _safe_runtime_log(
+            f"MONITOR_LOOP_FAILED id={monitor_id} type={error_type}"
+        )
+
+    def _regular_wait_seconds(self, monitor: RegisteredMonitor) -> float:
+        requested_delay = float(monitor.interval_seconds)
+        delay_provider = getattr(monitor, "next_collection_delay_seconds", None)
+        if callable(delay_provider):
+            try:
+                candidate = float(delay_provider())
+                if math.isfinite(candidate):
+                    requested_delay = candidate
+            except (TypeError, ValueError):
+                requested_delay = float(monitor.interval_seconds)
+        wait_seconds = max(
+            15.0,
+            min(float(monitor.interval_seconds), requested_delay),
+        )
+        if wait_seconds >= float(monitor.interval_seconds):
+            jitter_seconds = max(
+                0.0, float(getattr(monitor, "jitter_seconds", 0.0))
+            )
+            if math.isfinite(jitter_seconds) and jitter_seconds:
+                wait_seconds += random.uniform(0, jitter_seconds)
+        return wait_seconds
+
+    @staticmethod
+    def _scheduled_wait_seconds(
+        state: AutomaticCollectionState,
+        *,
+        now: datetime,
+    ) -> float:
+        if state.status == "UNAVAILABLE":
+            return 300.0
+        if state.next_open_at is None:
+            return 300.0
+        seconds = (state.next_open_at - now).total_seconds() + 1.0
+        # Recheck at least every six hours so a long-lived process observes
+        # calendar/timezone updates without creating closed-market load.
+        return max(15.0, min(seconds, 6 * 3600.0))
 
     def _loop(
         self,
         monitor: RegisteredMonitor,
         wake_event: threading.Event,
+        manual_event: threading.Event,
     ) -> None:
         while not self._stop_event.is_set():
-            if not self.store.is_enabled(monitor.monitor_id):
-                wake_event.wait()
-                wake_event.clear()
-                continue
+            self._touch_worker(monitor.monitor_id)
+            wait_seconds: float | None = None
             try:
-                self.run_once(monitor)
+                enabled = self.store.is_enabled(monitor.monitor_id)
+                if not enabled:
+                    manual_event.clear()
+                else:
+                    manual_requested = manual_event.is_set()
+                    schedule = self.automatic_collection_state(
+                        monitor.monitor_id,
+                        now=utc_now(),
+                    )
+                    if manual_requested or schedule is None or schedule.allowed:
+                        if manual_requested:
+                            manual_event.clear()
+                        self.run_once(monitor)
+                    if self._stop_event.is_set():
+                        break
+                    observed_at = utc_now()
+                    schedule = self.automatic_collection_state(
+                        monitor.monitor_id,
+                        now=observed_at,
+                    )
+                    if schedule is not None and not schedule.allowed:
+                        wait_seconds = self._scheduled_wait_seconds(
+                            schedule,
+                            now=observed_at,
+                        )
+                    else:
+                        wait_seconds = self._regular_wait_seconds(monitor)
+            except CollectionCancelled:
+                if self._stop_event.is_set():
+                    break
+                wait_seconds = 15.0
             except Exception as exc:
-                print(
-                    f"MONITOR_LOOP_FAILED id={monitor.monitor_id} type={type(exc).__name__}",
-                    flush=True,
-                )
-            jitter_seconds = max(
-                0.0, float(getattr(monitor, "jitter_seconds", 0.0))
-            )
-            wait_seconds = monitor.interval_seconds + (
-                random.uniform(0, jitter_seconds) if jitter_seconds else 0
-            )
+                self._record_loop_error(monitor.monitor_id, exc)
+                wait_seconds = 30.0
             wake_event.wait(wait_seconds)
             wake_event.clear()

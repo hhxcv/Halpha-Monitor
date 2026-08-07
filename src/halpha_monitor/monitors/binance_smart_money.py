@@ -9,8 +9,10 @@ producing a derived feature when the required source becomes ambiguous.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -23,6 +25,7 @@ from urllib.request import OpenerDirector, ProxyHandler, Request, build_opener
 from halpha_monitor.contracts import (
     CollectionArtifact,
     CollectionBatch,
+    CollectionCancelled,
     CollectionIssue,
     FilterChoice,
     MetricSample,
@@ -178,9 +181,13 @@ class BinanceSmartMoneySettings:
         symbols = tuple(
             dict.fromkeys(symbol.strip().upper() for symbol in self.symbols if symbol.strip())
         )
-        if not symbols or any(SYMBOL_PATTERN.fullmatch(symbol) is None for symbol in symbols):
+        if (
+            not symbols
+            or len(symbols) > 20
+            or any(SYMBOL_PATTERN.fullmatch(symbol) is None for symbol in symbols)
+        ):
             raise ValueError("SMART_MONEY_SYMBOLS_INVALID")
-        if self.interval_seconds < 60:
+        if not math.isfinite(self.interval_seconds) or self.interval_seconds < 60:
             raise ValueError("SMART_MONEY_INTERVAL_TOO_SHORT")
         if not 0 <= self.jitter_seconds <= 30:
             raise ValueError("SMART_MONEY_JITTER_INVALID")
@@ -188,7 +195,7 @@ class BinanceSmartMoneySettings:
             value not in SUPPORTED_TIME_RANGES for value in self.time_ranges
         ):
             raise ValueError("SMART_MONEY_TIME_RANGES_INVALID")
-        if self.timeout_seconds <= 0 or self.timeout_seconds > 60:
+        if not math.isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 60:
             raise ValueError("SMART_MONEY_TIMEOUT_INVALID")
         if self.overview_stale_seconds < 60 or self.market_stale_seconds < 30:
             raise ValueError("SMART_MONEY_FRESHNESS_THRESHOLD_INVALID")
@@ -251,11 +258,20 @@ class BinanceSmartMoneyClient:
         self._backoff_until: datetime | None = None
         self._throttle_failures = 0
         self._network_requests = NetworkRequestWindow()
+        self._stop_event: threading.Event | None = None
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        self._stop_event = stop_event
+
+    def _raise_if_cancelled(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise CollectionCancelled("SMART_MONEY_COLLECTION_CANCELLED")
 
     def network_request_count(self, *, window_seconds: float = 60) -> int:
         return self._network_requests.count(window_seconds=window_seconds)
 
     def ensure_available(self) -> None:
+        self._raise_if_cancelled()
         if self._backoff_until is not None and self._now() < self._backoff_until:
             raise SmartMoneyMonitorError("SMART_MONEY_BACKOFF_ACTIVE", throttled=True)
 
@@ -738,6 +754,11 @@ class BinanceSmartMoneyMonitor:
         if not callable(counter):
             return None
         return int(counter(window_seconds=window_seconds))
+
+    def bind_stop_event(self, stop_event: threading.Event) -> None:
+        binder = getattr(self.client, "bind_stop_event", None)
+        if callable(binder):
+            binder(stop_event)
 
     def collect(self) -> CollectionBatch:
         artifacts: list[CollectionArtifact] = []

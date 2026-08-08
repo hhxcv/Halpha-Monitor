@@ -276,6 +276,10 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert '.workspace[data-projection-kind="altcoin-radar"] #quote-scroll' in style.text
     assert "#quote-scroll thead th" in style.text
     assert '.monitor-link-status[data-status="ACTIVE"]' in style.text
+    assert '.monitor-link-status[data-status="IDLE"]' in style.text
+    assert '[data-status="IDLE"]::before' in style.text
+    assert "--idle: #356a8a" in style.text
+    assert "box-shadow: 0 0 0 2px var(--idle-soft)" in style.text
     assert page.headers["x-frame-options"] == "DENY"
     page_policy = page.headers["content-security-policy"]
     assert "default-src 'self'" in page_policy
@@ -1113,6 +1117,7 @@ def test_closed_buyback_view_is_static_and_uses_a_long_refresh_timer(
 
     assert payload["monitor"]["automatic_collection"]["status"] == "CLOSED"
     assert payload["monitor"]["operational_status"]["kind"] == "SCHEDULED_IDLE"
+    assert payload["monitor"]["operational_status"]["tone"] == "IDLE"
     assert payload["monitor"]["data_status"]["kind"] == "STATIC_CLOSED"
     assert payload["refresh_after_seconds"] > 15
     assert "source_url" not in payload["rows"][0]

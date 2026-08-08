@@ -51,6 +51,11 @@ DAILY_INTERVAL_SECONDS = 86_400
 DAILY_HISTORY_DAYS = 220
 DAILY_MINIMUM_DAYS = 90
 DAILY_CACHE_OVERLAP_DAYS = 3
+PUMP_BASELINE_DAYS = 7
+PUMP_DAILY_TRIGGER_PERCENT = 15.0
+PUMP_THREE_DAY_TRIGGER_PERCENT = 25.0
+PUMP_SEVEN_DAY_TRIGGER_PERCENT = 25.0
+PUMP_EPISODE_RESET_DRAWDOWN_PERCENT = -18.0
 PRICE_POSITION_SNAPSHOT_KEY = "price-position-v1"
 MARKET_SCOPE = "USDM_PERPETUAL"
 BASELINE_EVALUATION_SOURCE = "BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES"
@@ -397,6 +402,10 @@ class PricePositionFeatures:
     position_90d_percent: float
     distance_from_range_high_percent: float
     distance_from_range_low_percent: float
+    current_pump_multiple: float | None
+    pump_baseline_price: float | None
+    pump_start_at: datetime | None
+    pump_start_trigger: str | None
     distance_from_previous_pump_peak_percent: float | None
     previous_pump_peak_at: datetime | None
     previous_pump_peak_price: float | None
@@ -1387,6 +1396,101 @@ def _previous_pump_peak(
     return matches[-1] if matches else None
 
 
+def _current_pump_leg(
+    candles: Sequence[DailyContractCandle],
+    *,
+    current_price: float,
+    return_24h_percent: float,
+    state: str,
+) -> tuple[datetime, float, float, str] | None:
+    """Return the active rise start, pre-start baseline, multiple and trigger.
+
+    The start belongs to the earliest threshold window in the current episode.
+    For multi-day windows it is the first UTC day after that window's last low.
+    Only closed daily closes enter the seven-day pre-start baseline.  The live
+    UTC day may be the start when the rolling 24-hour trigger is already met.
+    """
+
+    if state not in {"SURGE", "PUMPING"}:
+        return None
+    if len(candles) < PUMP_BASELINE_DAYS + 1:
+        return None
+
+    observations = [
+        (candle.open_time, candle.close_price) for candle in candles
+    ]
+    current_day = candles[-1].open_time + timedelta(days=1)
+    observations.append((current_day, current_price))
+    prices = [price for _, price in observations]
+
+    # A completed close at least 18% below the running peak ends the prior
+    # episode.  The live, still-open UTC day never rewrites that boundary.
+    segment_start = 0
+    running_peak = prices[0]
+    for index in range(1, len(candles)):
+        drawdown = _percent_change(prices[index], running_peak)
+        if (
+            drawdown is not None
+            and drawdown <= PUMP_EPISODE_RESET_DRAWDOWN_PERCENT
+        ):
+            segment_start = index
+            running_peak = prices[index]
+        elif prices[index] > running_peak:
+            running_peak = prices[index]
+
+    triggers: list[tuple[int, int, str]] = []
+    current_index = len(observations) - 1
+    if return_24h_percent >= PUMP_DAILY_TRIGGER_PERCENT:
+        triggers.append((current_index, current_index, "ROLLING_24H_15"))
+
+    trigger_windows = (
+        (1, PUMP_DAILY_TRIGGER_PERCENT, "DAILY_WINDOW_1D_15"),
+        (3, PUMP_THREE_DAY_TRIGGER_PERCENT, "DAILY_WINDOW_3D_25"),
+        (7, PUMP_SEVEN_DAY_TRIGGER_PERCENT, "DAILY_WINDOW_7D_25"),
+    )
+    for end_index in range(segment_start + 1, len(observations)):
+        for window_days, threshold, trigger in trigger_windows:
+            base_index = end_index - window_days
+            if base_index < segment_start:
+                continue
+            window_return = _percent_change(
+                prices[end_index],
+                prices[base_index],
+            )
+            if window_return is None or window_return < threshold:
+                continue
+            pre_end_prices = prices[base_index:end_index]
+            window_low = min(pre_end_prices)
+            low_index = max(
+                index
+                for index in range(base_index, end_index)
+                if abs(prices[index] - window_low) <= 1e-12
+            )
+            start_index = min(low_index + 1, end_index)
+            triggers.append((start_index, end_index, trigger))
+
+    if not triggers:
+        return None
+    start_index, _, trigger = min(
+        triggers,
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    if start_index < PUMP_BASELINE_DAYS:
+        return None
+    baseline_prices = prices[
+        start_index - PUMP_BASELINE_DAYS : start_index
+    ]
+    baseline_price = sum(baseline_prices) / PUMP_BASELINE_DAYS
+    if baseline_price <= 0 or not math.isfinite(baseline_price):
+        return None
+    return (
+        observations[start_index][0],
+        baseline_price,
+        current_price / baseline_price,
+        trigger,
+    )
+
+
 def analyze_price_position(
     candles: Sequence[DailyContractCandle],
     *,
@@ -1498,10 +1602,17 @@ def analyze_price_position(
     if return_24h_percent <= -12.0 or return_3d <= -20.0:
         state = "CRASH"
         reason = f"{signed('24h')}，{signed('3日')}"
-    elif return_24h_percent >= 15.0 or return_3d >= 25.0:
+    elif (
+        return_24h_percent >= PUMP_DAILY_TRIGGER_PERCENT
+        or return_3d >= PUMP_THREE_DAY_TRIGGER_PERCENT
+    ):
         state = "SURGE"
         reason = f"{signed('24h')}，{signed('3日')}"
-    elif return_7d >= 25.0 and distance_high >= -12.0 and current_price > ma20:
+    elif (
+        return_7d >= PUMP_SEVEN_DAY_TRIGGER_PERCENT
+        and distance_high >= -12.0
+        and current_price > ma20
+    ):
         state = "PUMPING"
         reason = f"{signed('7日')}，距{len(range_window)}日高点 {distance_high:+.1f}%"
     elif previous_peak_distance is not None and -12.0 <= previous_peak_distance <= 8.0:
@@ -1535,6 +1646,13 @@ def analyze_price_position(
         state = "MID_RANGE"
         reason = f"90日位置 {position_90:.0f}%，{signed('30日')}"
 
+    current_pump = _current_pump_leg(
+        recent,
+        current_price=current_price,
+        return_24h_percent=return_24h_percent,
+        state=state,
+    )
+
     return PricePositionFeatures(
         daily_cutoff_at=recent[-1].close_time,
         history_days=len(recent),
@@ -1549,6 +1667,12 @@ def analyze_price_position(
         position_90d_percent=position_90,
         distance_from_range_high_percent=distance_high,
         distance_from_range_low_percent=distance_low,
+        current_pump_multiple=(
+            current_pump[2] if current_pump is not None else None
+        ),
+        pump_baseline_price=(current_pump[1] if current_pump is not None else None),
+        pump_start_at=(current_pump[0] if current_pump is not None else None),
+        pump_start_trigger=(current_pump[3] if current_pump is not None else None),
         distance_from_previous_pump_peak_percent=previous_peak_distance,
         previous_pump_peak_at=previous_peak_at,
         previous_pump_peak_price=previous_peak_price,
@@ -2029,6 +2153,8 @@ class BinanceAltcoinRadarMonitor:
     price_position_method_note = (
         "状态使用当前合约价与最多180根已闭合UTC日线计算；"
         "90日位置、距区间高低点、均线结构和独立收益窗口均保留为可排序事实。"
+        "暴涨或拉升中会以起点前7根闭合日线收盘均价计算当前拉升倍数，"
+        "起点日不进入均价。"
         "“上一轮拉升峰值”只认定先在14日内上涨至少30%、随后14日回撤至少18%的"
         "已完成价格段，不把当前上涨直接当作上一轮。"
     )
@@ -2066,6 +2192,39 @@ class BinanceAltcoinRadarMonitor:
             "number",
             maximum_fraction_digits=8,
             use_grouping=True,
+        ),
+        ViewColumn(
+            "current_pump_multiple",
+            "拉升倍数",
+            "number",
+            minimum_fraction_digits=2,
+            maximum_fraction_digits=2,
+            description=(
+                "仅在价格状态为暴涨或拉升中时计算：当前合约价 ÷ 拉升起点前"
+                "7根已闭合UTC日线收盘价的算术平均。1.50表示现价为基准价的1.5倍；"
+                "小于1表示短期虽触发暴涨，但当前价仍低于起点前均价；起点日不进入均价。"
+            ),
+        ),
+        ViewColumn(
+            "pump_start_date",
+            "拉升起点",
+            description=(
+                "当前活动价格段首次命中涨幅门槛的UTC日期：滚动24h涨幅≥15%，"
+                "或以当前价/历史收盘计算的1日涨幅≥15%、3日或7日涨幅≥25%。"
+                "多日窗口取窗口低点后的第一个UTC日；当前UTC日尚未收盘时可作为起点，"
+                "但不会进入基准均价。已闭合日线从峰值回撤18%后重新识别一轮。"
+            ),
+        ),
+        ViewColumn(
+            "pump_baseline_price",
+            "拉升基准价",
+            "number",
+            maximum_fraction_digits=8,
+            use_grouping=True,
+            description=(
+                "拉升起点之前连续7根已闭合UTC日线收盘价的算术平均；"
+                "严格不包含拉升起点日，也不使用当天尚未收盘的价格。"
+            ),
         ),
         ViewColumn(
             "return_24h_percent",
@@ -2246,6 +2405,38 @@ class BinanceAltcoinRadarMonitor:
                     description=(
                         "与“价格位置”标签同源、同轮且不晚于短线信号的日线状态；"
                         "连续日线不足90根时保持为空。"
+                    ),
+                ),
+                ViewColumn(
+                    "current_pump_multiple",
+                    "拉升倍数",
+                    "number",
+                    minimum_fraction_digits=2,
+                    maximum_fraction_digits=2,
+                    description=(
+                        "仅在信号时价格状态为暴涨或拉升中时计算：信号价 ÷ 拉升起点前"
+                        "7根已闭合UTC日线收盘价均值。1.50表示信号价为基准价的1.5倍；"
+                        "小于1表示短期虽触发暴涨，但信号价仍低于起点前均价；"
+                        "起点日不进入均价。"
+                    ),
+                ),
+                ViewColumn(
+                    "pump_start_date",
+                    "拉升起点",
+                    description=(
+                        "信号当时当前活动价格段的首个异动拉升UTC日。触发规则与价格位置"
+                        "标签一致；已闭合日线从峰值回撤18%后重新识别一轮。"
+                    ),
+                ),
+                ViewColumn(
+                    "pump_baseline_price",
+                    "拉升基准价",
+                    "number",
+                    maximum_fraction_digits=8,
+                    use_grouping=True,
+                    description=(
+                        "拉升起点之前连续7根已闭合UTC日线收盘价的算术平均；"
+                        "严格不包含拉升起点日。"
                     ),
                 ),
                 ViewColumn(
@@ -2828,6 +3019,23 @@ class BinanceAltcoinRadarMonitor:
                     "previous_pump_peak_price": peak_missing,
                 }
             )
+        if features.current_pump_multiple is None:
+            if features.state in {"SURGE", "PUMPING"}:
+                pump_missing = (
+                    "当前价格属于暴涨或拉升中，但未能取得起点前连续7根闭合UTC日线；"
+                    "拉升倍数、起点和基准价保持为空。"
+                )
+            else:
+                pump_missing = (
+                    "当前价格状态不是暴涨或拉升中；拉升倍数、起点和基准价不适用。"
+                )
+            missing_reasons.update(
+                {
+                    "current_pump_multiple": pump_missing,
+                    "pump_start_date": pump_missing,
+                    "pump_baseline_price": pump_missing,
+                }
+            )
         return {
             "symbol": item.seed.symbol,
             "entity_key": item.seed.symbol,
@@ -2841,6 +3049,20 @@ class BinanceAltcoinRadarMonitor:
             "row_tone": features.row_tone,
             "current_price": _float_text(features.current_price, 12),
             "current_price_at": iso_utc(item.seed.ticker_24h.close_time),
+            "current_pump_multiple": _float_text(
+                features.current_pump_multiple,
+                6,
+            ),
+            "pump_start_date": (
+                features.pump_start_at.date().isoformat()
+                if features.pump_start_at is not None
+                else None
+            ),
+            "pump_baseline_price": _float_text(
+                features.pump_baseline_price,
+                12,
+            ),
+            "pump_start_trigger": features.pump_start_trigger,
             "return_24h_percent": _float_text(features.return_24h_percent),
             "return_3d_percent": _float_text(features.return_3d_percent),
             "return_7d_percent": _float_text(features.return_7d_percent),
@@ -3603,6 +3825,26 @@ class BinanceAltcoinRadarMonitor:
             )
             missing_reasons["price_state_label"] = price_context_missing
             missing_reasons["price_position_90d_percent"] = price_context_missing
+        if price_position is None or price_position.current_pump_multiple is None:
+            if price_position is not None and price_position.state not in {
+                "SURGE",
+                "PUMPING",
+            }:
+                pump_context_missing = (
+                    "信号时价格状态不是暴涨或拉升中；拉升倍数、起点和基准价不适用。"
+                )
+            else:
+                pump_context_missing = (
+                    "信号时未取得可复核的拉升起点及起点前7根闭合UTC日线；"
+                    "相关字段保持为空。"
+                )
+            missing_reasons.update(
+                {
+                    "current_pump_multiple": pump_context_missing,
+                    "pump_start_date": pump_context_missing,
+                    "pump_baseline_price": pump_context_missing,
+                }
+            )
 
         alert_score = float(scoring["alert_score"])
         payload = {
@@ -3642,6 +3884,27 @@ class BinanceAltcoinRadarMonitor:
             "price_state": price_position.state if price_position is not None else None,
             "price_state_label": (
                 price_position.state_label if price_position is not None else None
+            ),
+            "current_pump_multiple": (
+                _float_text(price_position.current_pump_multiple, 6)
+                if price_position is not None
+                else None
+            ),
+            "pump_start_date": (
+                price_position.pump_start_at.date().isoformat()
+                if price_position is not None
+                and price_position.pump_start_at is not None
+                else None
+            ),
+            "pump_baseline_price": (
+                _float_text(price_position.pump_baseline_price, 12)
+                if price_position is not None
+                else None
+            ),
+            "pump_start_trigger": (
+                price_position.pump_start_trigger
+                if price_position is not None
+                else None
             ),
             "price_position_90d_percent": (
                 _float_text(price_position.position_90d_percent)

@@ -13,6 +13,8 @@
   --accent-text: #8a5800;
   --success: #157f5b;
   --success-soft: #eaf8f2;
+  --idle: #356a8a;
+  --idle-soft: #dbeaf2;
   --warning: #a66300;
   --warning-soft: #fff5db;
   --danger: #b42318;
@@ -124,6 +126,11 @@ textarea:focus-visible,
 .monitor-link .monitor-link-status[data-status="ACTIVE"]::before {
   background: var(--success);
 }
+[data-status="IDLE"]::before,
+.monitor-link .monitor-link-status[data-status="IDLE"]::before {
+  background: var(--idle);
+  box-shadow: 0 0 0 2px var(--idle-soft);
+}
 [data-status="PARTIAL"]::before,
 [data-status="DEGRADED"]::before,
 [data-status="STALE"]::before { background: var(--warning); }
@@ -231,6 +238,10 @@ textarea:focus-visible,
 
 .monitor-link-status[data-status="ACTIVE"] {
   color: var(--success);
+  font-weight: 600;
+}
+.monitor-link-status[data-status="IDLE"] {
+  color: var(--idle);
   font-weight: 600;
 }
 

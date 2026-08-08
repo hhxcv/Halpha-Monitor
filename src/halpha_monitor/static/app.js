@@ -1262,6 +1262,7 @@ function renderMonitorList(monitors) {
     const button = createElement("button", "monitor-link");
     button.type = "button";
     button.dataset.monitorId = monitor.monitor_id;
+    button.dataset.status = monitor.operational_status.tone;
     if (monitor.monitor_id === state.monitorId) button.setAttribute("aria-current", "page");
     button.setAttribute(
       "aria-label",

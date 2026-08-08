@@ -81,6 +81,9 @@ class EvaluationView:
     title: str
     method_note: str
     minimum_group_samples: int = 30
+    minimum_distinct_cutoffs: int = 20
+    minimum_distinct_entities: int = 15
+    minimum_observation_days: float = 14.0
 
 
 @dataclass(frozen=True)

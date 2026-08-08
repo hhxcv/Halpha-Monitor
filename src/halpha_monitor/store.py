@@ -2163,6 +2163,14 @@ class SQLiteMonitorStore:
                     SUM(CASE WHEN due_at <= ? THEN 1 ELSE 0 END) AS due_cases,
                     SUM(CASE WHEN status = 'COMPLETE' THEN 1 ELSE 0 END)
                         AS completed_cases,
+                    COUNT(DISTINCT CASE WHEN status = 'COMPLETE'
+                        THEN source_cutoff_at END) AS distinct_cutoff_count,
+                    COUNT(DISTINCT CASE WHEN status = 'COMPLETE'
+                        THEN entity_key END) AS distinct_entity_count,
+                    MIN(CASE WHEN status = 'COMPLETE'
+                        THEN source_cutoff_at END) AS first_cutoff_at,
+                    MAX(CASE WHEN status = 'COMPLETE'
+                        THEN outcome_cutoff_at END) AS last_outcome_at,
                     SUM(CASE WHEN status = 'UNAVAILABLE' THEN 1 ELSE 0 END)
                         AS unavailable_cases,
                     SUM(CASE WHEN status = 'PENDING' AND due_at <= ? THEN 1 ELSE 0 END)
@@ -2179,6 +2187,10 @@ class SQLiteMonitorStore:
                 f"""
                 SELECT stage, stage_label, horizon_minutes,
                        COUNT(*) AS sample_count,
+                       COUNT(DISTINCT source_cutoff_at) AS distinct_cutoff_count,
+                       COUNT(DISTINCT entity_key) AS distinct_entity_count,
+                       MIN(source_cutoff_at) AS first_cutoff_at,
+                       MAX(outcome_cutoff_at) AS last_outcome_at,
                        SUM(CASE WHEN verdict = 'ALIGNED' THEN 1 ELSE 0 END)
                            AS aligned_count,
                        AVG(relative_return_percent) AS average_relative_return_percent,
@@ -2200,6 +2212,8 @@ class SQLiteMonitorStore:
                 "total_cases",
                 "due_cases",
                 "completed_cases",
+                "distinct_cutoff_count",
+                "distinct_entity_count",
                 "unavailable_cases",
                 "pending_due_cases",
                 "pending_future_cases",
@@ -2207,12 +2221,26 @@ class SQLiteMonitorStore:
         }
         return {
             **count_payload,
+            "first_cutoff_at": (
+                parse_utc(str(counts["first_cutoff_at"]))
+                if counts["first_cutoff_at"] is not None
+                else None
+            ),
+            "last_outcome_at": (
+                parse_utc(str(counts["last_outcome_at"]))
+                if counts["last_outcome_at"] is not None
+                else None
+            ),
             "groups": [
                 {
                     "stage": str(row["stage"]),
                     "stage_label": str(row["stage_label"]),
                     "horizon_minutes": int(row["horizon_minutes"]),
                     "sample_count": int(row["sample_count"]),
+                    "distinct_cutoff_count": int(row["distinct_cutoff_count"]),
+                    "distinct_entity_count": int(row["distinct_entity_count"]),
+                    "first_cutoff_at": parse_utc(str(row["first_cutoff_at"])),
+                    "last_outcome_at": parse_utc(str(row["last_outcome_at"])),
                     "aligned_count": int(row["aligned_count"] or 0),
                     "average_relative_return_percent": row[
                         "average_relative_return_percent"
@@ -2235,7 +2263,7 @@ class SQLiteMonitorStore:
         primary_source: str,
         baseline_source: str,
     ) -> dict[str, Any]:
-        """Compare completed predictions on the exact same entity and horizon."""
+        """Compare predictions frozen for the exact same entity and horizon."""
 
         join = """
             FROM monitor_forward_evaluation AS primary_evaluation
@@ -2249,77 +2277,214 @@ class SQLiteMonitorStore:
             WHERE primary_evaluation.monitor_id = ?
               AND primary_evaluation.source = ?
               AND baseline_evaluation.source = ?
-              AND primary_evaluation.status = 'COMPLETE'
-              AND baseline_evaluation.status = 'COMPLETE'
+        """
+        complete_pair = """
+            primary_evaluation.status = 'COMPLETE'
+            AND baseline_evaluation.status = 'COMPLETE'
+        """
+        direction_relation = """
+            CASE WHEN primary_evaluation.direction = baseline_evaluation.direction
+                 THEN 'SAME_DIRECTION' ELSE 'DIRECTION_FLIP' END
         """
         parameters = (monitor_id, primary_source, baseline_source)
         with self._connect() as connection:
             totals = connection.execute(
                 f"""
-                SELECT COUNT(*) AS sample_count,
-                       SUM(CASE WHEN primary_evaluation.verdict = 'ALIGNED'
+                SELECT COUNT(*) AS paired_case_count,
+                       SUM(CASE WHEN {complete_pair} THEN 1 ELSE 0 END)
+                           AS sample_count,
+                       SUM(CASE WHEN (
+                           primary_evaluation.status = 'UNAVAILABLE'
+                           OR baseline_evaluation.status = 'UNAVAILABLE'
+                       ) THEN 1 ELSE 0 END) AS unavailable_pair_count,
+                       SUM(CASE WHEN
+                           primary_evaluation.status != 'UNAVAILABLE'
+                           AND baseline_evaluation.status != 'UNAVAILABLE'
+                           AND (
+                               primary_evaluation.status = 'PENDING'
+                               OR baseline_evaluation.status = 'PENDING'
+                           ) THEN 1 ELSE 0 END) AS pending_pair_count,
+                       SUM(CASE WHEN {complete_pair}
+                           AND primary_evaluation.verdict = 'ALIGNED'
                            THEN 1 ELSE 0 END) AS primary_aligned_count,
-                       SUM(CASE WHEN primary_evaluation.verdict = 'OPPOSED'
+                       SUM(CASE WHEN {complete_pair}
+                           AND primary_evaluation.verdict = 'OPPOSED'
                            THEN 1 ELSE 0 END) AS primary_opposed_count,
-                       SUM(CASE WHEN baseline_evaluation.verdict = 'ALIGNED'
+                       SUM(CASE WHEN {complete_pair}
+                           AND baseline_evaluation.verdict = 'ALIGNED'
                            THEN 1 ELSE 0 END) AS baseline_aligned_count,
-                       SUM(CASE WHEN baseline_evaluation.verdict = 'OPPOSED'
+                       SUM(CASE WHEN {complete_pair}
+                           AND baseline_evaluation.verdict = 'OPPOSED'
                            THEN 1 ELSE 0 END) AS baseline_opposed_count,
-                       MIN(primary_evaluation.source_cutoff_at) AS first_cutoff_at,
-                       MAX(primary_evaluation.outcome_cutoff_at) AS last_outcome_at
+                       COUNT(DISTINCT CASE WHEN {complete_pair}
+                           THEN primary_evaluation.source_cutoff_at END)
+                           AS distinct_cutoff_count,
+                       COUNT(DISTINCT CASE WHEN {complete_pair}
+                           THEN primary_evaluation.entity_key END)
+                           AS distinct_entity_count,
+                       MIN(CASE WHEN {complete_pair}
+                           THEN primary_evaluation.source_cutoff_at END)
+                           AS first_cutoff_at,
+                       MAX(CASE WHEN {complete_pair}
+                           THEN primary_evaluation.outcome_cutoff_at END)
+                           AS last_outcome_at
                 {join}
                 """,
                 parameters,
             ).fetchone()
+            relations = connection.execute(
+                f"""
+                SELECT {direction_relation} AS direction_relation,
+                       COUNT(*) AS paired_case_count,
+                       SUM(CASE WHEN {complete_pair} THEN 1 ELSE 0 END)
+                           AS sample_count,
+                       SUM(CASE WHEN (
+                           primary_evaluation.status = 'UNAVAILABLE'
+                           OR baseline_evaluation.status = 'UNAVAILABLE'
+                       ) THEN 1 ELSE 0 END) AS unavailable_pair_count,
+                       SUM(CASE WHEN
+                           primary_evaluation.status != 'UNAVAILABLE'
+                           AND baseline_evaluation.status != 'UNAVAILABLE'
+                           AND (
+                               primary_evaluation.status = 'PENDING'
+                               OR baseline_evaluation.status = 'PENDING'
+                           ) THEN 1 ELSE 0 END) AS pending_pair_count,
+                       SUM(CASE WHEN {complete_pair}
+                           AND primary_evaluation.verdict = 'ALIGNED'
+                           THEN 1 ELSE 0 END) AS primary_aligned_count,
+                       SUM(CASE WHEN {complete_pair}
+                           AND primary_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS primary_opposed_count,
+                       SUM(CASE WHEN {complete_pair}
+                           AND baseline_evaluation.verdict = 'ALIGNED'
+                           THEN 1 ELSE 0 END) AS baseline_aligned_count,
+                       SUM(CASE WHEN {complete_pair}
+                           AND baseline_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS baseline_opposed_count,
+                       COUNT(DISTINCT CASE WHEN {complete_pair}
+                           THEN primary_evaluation.source_cutoff_at END)
+                           AS distinct_cutoff_count,
+                       COUNT(DISTINCT CASE WHEN {complete_pair}
+                           THEN primary_evaluation.entity_key END)
+                           AS distinct_entity_count,
+                       MIN(CASE WHEN {complete_pair}
+                           THEN primary_evaluation.source_cutoff_at END)
+                           AS first_cutoff_at,
+                       MAX(CASE WHEN {complete_pair}
+                           THEN primary_evaluation.outcome_cutoff_at END)
+                           AS last_outcome_at
+                {join}
+                GROUP BY {direction_relation}
+                """,
+                parameters,
+            ).fetchall()
             groups = connection.execute(
                 f"""
                 SELECT primary_evaluation.stage AS stage,
                        primary_evaluation.stage_label AS stage_label,
                        primary_evaluation.horizon_minutes AS horizon_minutes,
-                       COUNT(*) AS sample_count,
-                       SUM(CASE WHEN primary_evaluation.verdict = 'ALIGNED'
+                       {direction_relation} AS direction_relation,
+                       COUNT(*) AS paired_case_count,
+                       SUM(CASE WHEN {complete_pair} THEN 1 ELSE 0 END)
+                           AS sample_count,
+                       SUM(CASE WHEN (
+                           primary_evaluation.status = 'UNAVAILABLE'
+                           OR baseline_evaluation.status = 'UNAVAILABLE'
+                       ) THEN 1 ELSE 0 END) AS unavailable_pair_count,
+                       SUM(CASE WHEN
+                           primary_evaluation.status != 'UNAVAILABLE'
+                           AND baseline_evaluation.status != 'UNAVAILABLE'
+                           AND (
+                               primary_evaluation.status = 'PENDING'
+                               OR baseline_evaluation.status = 'PENDING'
+                           ) THEN 1 ELSE 0 END) AS pending_pair_count,
+                       SUM(CASE WHEN {complete_pair}
+                           AND primary_evaluation.verdict = 'ALIGNED'
                            THEN 1 ELSE 0 END) AS primary_aligned_count,
-                       SUM(CASE WHEN primary_evaluation.verdict = 'OPPOSED'
+                       SUM(CASE WHEN {complete_pair}
+                           AND primary_evaluation.verdict = 'OPPOSED'
                            THEN 1 ELSE 0 END) AS primary_opposed_count,
-                       SUM(CASE WHEN baseline_evaluation.verdict = 'ALIGNED'
+                       SUM(CASE WHEN {complete_pair}
+                           AND baseline_evaluation.verdict = 'ALIGNED'
                            THEN 1 ELSE 0 END) AS baseline_aligned_count,
-                       SUM(CASE WHEN baseline_evaluation.verdict = 'OPPOSED'
-                           THEN 1 ELSE 0 END) AS baseline_opposed_count
+                       SUM(CASE WHEN {complete_pair}
+                           AND baseline_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS baseline_opposed_count,
+                       COUNT(DISTINCT CASE WHEN {complete_pair}
+                           THEN primary_evaluation.source_cutoff_at END)
+                           AS distinct_cutoff_count,
+                       COUNT(DISTINCT CASE WHEN {complete_pair}
+                           THEN primary_evaluation.entity_key END)
+                           AS distinct_entity_count,
+                       MIN(CASE WHEN {complete_pair}
+                           THEN primary_evaluation.source_cutoff_at END)
+                           AS first_cutoff_at,
+                       MAX(CASE WHEN {complete_pair}
+                           THEN primary_evaluation.outcome_cutoff_at END)
+                           AS last_outcome_at
                 {join}
                 GROUP BY primary_evaluation.stage,
                          primary_evaluation.stage_label,
-                         primary_evaluation.horizon_minutes
+                         primary_evaluation.horizon_minutes,
+                         {direction_relation}
                 ORDER BY primary_evaluation.stage_label,
-                         primary_evaluation.horizon_minutes
+                         primary_evaluation.horizon_minutes,
+                         direction_relation
                 """,
                 parameters,
             ).fetchall()
 
         count_keys = (
+            "paired_case_count",
             "sample_count",
+            "pending_pair_count",
+            "unavailable_pair_count",
             "primary_aligned_count",
             "primary_opposed_count",
             "baseline_aligned_count",
             "baseline_opposed_count",
+            "distinct_cutoff_count",
+            "distinct_entity_count",
         )
+
+        def metrics(row: sqlite3.Row | None) -> dict[str, Any]:
+            if row is None:
+                return {
+                    **{key: 0 for key in count_keys},
+                    "first_cutoff_at": None,
+                    "last_outcome_at": None,
+                }
+            return {
+                **{key: int(row[key] or 0) for key in count_keys},
+                "first_cutoff_at": (
+                    parse_utc(str(row["first_cutoff_at"]))
+                    if row["first_cutoff_at"] is not None
+                    else None
+                ),
+                "last_outcome_at": (
+                    parse_utc(str(row["last_outcome_at"]))
+                    if row["last_outcome_at"] is not None
+                    else None
+                ),
+            }
+
+        relation_rows = {str(row["direction_relation"]): row for row in relations}
         return {
-            **{key: int(totals[key] or 0) for key in count_keys},
-            "first_cutoff_at": (
-                parse_utc(str(totals["first_cutoff_at"]))
-                if totals["first_cutoff_at"] is not None
-                else None
-            ),
-            "last_outcome_at": (
-                parse_utc(str(totals["last_outcome_at"]))
-                if totals["last_outcome_at"] is not None
-                else None
-            ),
+            **metrics(totals),
+            "relations": [
+                {
+                    "direction_relation": relation,
+                    **metrics(relation_rows.get(relation)),
+                }
+                for relation in ("DIRECTION_FLIP", "SAME_DIRECTION")
+            ],
             "groups": [
                 {
                     "stage": str(row["stage"]),
                     "stage_label": str(row["stage_label"]),
                     "horizon_minutes": int(row["horizon_minutes"]),
-                    **{key: int(row[key] or 0) for key in count_keys},
+                    "direction_relation": str(row["direction_relation"]),
+                    **metrics(row),
                 }
                 for row in groups
             ],

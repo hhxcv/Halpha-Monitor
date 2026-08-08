@@ -2433,9 +2433,14 @@ class BinanceAltcoinRadarMonitor:
                     "方向一致要求绝对方向正确且相对BTC超出±0.5个百分点；"
                     "该带宽是暂定噪声区间，不含手续费、滑点或可成交性。"
                     "页面用同一币种、同一信号截止和同一期限同步比较原短线规则；"
-                    "每组完成少于30例时只显示样本积累，不报告一致率。"
+                    "只有价格位置改变原规则方向的样本才用于衡量增量，同方向样本只"
+                    "用于检查筛选表现。每组需同时达到30个完成样本、20个独立信号"
+                    "截止、15个币种和14天观测跨度，才报告一致率与均值。"
                 ),
                 minimum_group_samples=30,
+                minimum_distinct_cutoffs=20,
+                minimum_distinct_entities=15,
+                minimum_observation_days=14.0,
             ),
         )
 

@@ -6,6 +6,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+import pytest
 
 from halpha_monitor.contracts import (
     AutomaticCollectionState,
@@ -654,8 +655,15 @@ def test_altcoin_radar_projection_excludes_legacy_spot_samples(
     ]
 
 
+@pytest.mark.parametrize(
+    ("minimum_observation_days", "expected_ready", "expected_primary_rate"),
+    ((0.0, True, 100.0), (1.0, False, None)),
+)
 def test_forward_evaluation_payload_compares_exact_primary_and_baseline_pairs(
     tmp_path: Path,
+    minimum_observation_days: float,
+    expected_ready: bool,
+    expected_primary_rate: float | None,
 ) -> None:
     @dataclass
     class EvaluationMonitor:
@@ -674,6 +682,9 @@ def test_forward_evaluation_payload_compares_exact_primary_and_baseline_pairs(
                 title="后续行情检验",
                 method_note="同批比较。",
                 minimum_group_samples=1,
+                minimum_distinct_cutoffs=1,
+                minimum_distinct_entities=1,
+                minimum_observation_days=minimum_observation_days,
             ),
         )
 
@@ -769,11 +780,23 @@ def test_forward_evaluation_payload_compares_exact_primary_and_baseline_pairs(
         ).json()
 
     comparison = payload["evaluation"]["comparison"]
+    assert comparison["paired_case_count"] == 1
     assert comparison["sample_count"] == 1
-    assert comparison["primary_agreement_rate_percent"] == 100.0
-    assert comparison["baseline_agreement_rate_percent"] == 0.0
-    assert comparison["agreement_change_percentage_points"] == 100.0
+    flip_relation = comparison["relations"][0]
+    assert flip_relation["direction_relation"] == "DIRECTION_FLIP"
+    assert flip_relation["maturity"]["ready"] is expected_ready
+    assert flip_relation["primary_agreement_rate_percent"] == expected_primary_rate
+    assert flip_relation["baseline_agreement_rate_percent"] == (
+        0.0 if expected_ready else None
+    )
+    assert flip_relation["agreement_change_percentage_points"] == (
+        100.0 if expected_ready else None
+    )
+    assert comparison["relations"][1]["direction_relation"] == "SAME_DIRECTION"
+    assert comparison["relations"][1]["sample_count"] == 0
     assert comparison["groups"][0]["stage"] == "BLOWOFF_RISK"
+    assert comparison["groups"][0]["direction_relation"] == "DIRECTION_FLIP"
+    assert payload["evaluation"]["maturity"]["ready"] is expected_ready
 
 
 def test_view_promotes_uniform_opt_in_columns_and_restores_differing_values(

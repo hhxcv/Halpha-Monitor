@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 import json
 from pathlib import Path
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
@@ -12,21 +15,32 @@ from halpha_monitor.monitors.market_events import (
     BLS_API_URL,
     CONSENSUS_CALENDAR_URL,
     FOMC_CALENDAR_URL,
+    HK_CSD_SCHEDULE_URL_TEMPLATE,
+    NBS_NOTICE_INDEX_URL,
     NYFED_CALENDAR_URL,
+    SFC_REGULATORY_CALENDAR_URL,
     MarketEventMonitor,
     MarketEventSettings,
     MarketEventSourceError,
+    discover_nbs_schedule_url,
+    nbs_notice_index_urls,
     nyfed_month_urls,
     parse_bea_schedule,
     parse_bls_indicators,
     parse_consensus_calendar,
     parse_fomc_calendar,
+    parse_hk_csd_schedule,
+    parse_nbs_schedule,
     parse_nyfed_calendar,
+    parse_sfc_regulatory_calendar,
 )
 from halpha_monitor.store import SQLiteMonitorStore
 
 
 NOW = datetime(2026, 8, 7, 6, 0, tzinfo=UTC)
+NBS_SCHEDULE_FIXTURE_URL = (
+    "https://www.stats.gov.cn/xw/tjxw/tzgg/202512/t20251224_1962137.html"
+)
 
 
 def bea_payload(release_at: str = "2026-08-08T12:30:00+00:00") -> dict[str, object]:
@@ -57,11 +71,9 @@ def nyfed_html(*, employment_time: str = "08:30") -> str:
                 '<a href="https://www.bls.gov/news.release/cpi.toc.htm">'
                 "Consumer Price Index</a><br>(08:30)<br><br></span>"
             )
-        cells.append(
-            f'<td class="somatdR dirColL"><div>{day}{content}</div></td>'
-        )
+        cells.append(f'<td class="somatdR dirColL"><div>{day}{content}</div></td>')
     return (
-        "<html><body><div align=\"center\">August 2026</div><table><tr>"
+        '<html><body><div align="center">August 2026</div><table><tr>'
         + "".join(cells)
         + "</tr></table></body></html>"
     )
@@ -102,8 +114,144 @@ def fomc_html() -> str:
     )
 
 
+def nbs_index_html() -> str:
+    return (
+        '<html><a href="./202512/t20251224_1962137.html">'
+        "2026年国家统计局主要统计信息发布日程表</a></html>"
+    )
+
+
+def nbs_html() -> str:
+    header = "".join(f"<th>{month}月</th>" for month in range(1, 13))
+
+    def release_rows(sequence: int, title: str, hour: str) -> str:
+        dates = ["……"] * 12
+        dates[7] = "8/六"
+        times = ["……"] * 12
+        times[7] = hour
+        return (
+            "<tr>"
+            f'<td rowspan="2">{sequence}</td><td rowspan="2">{title}</td>'
+            + "".join(f"<td>{value}</td>" for value in dates)
+            + "</tr><tr>"
+            + "".join(f"<td>{value}</td>" for value in times)
+            + "</tr>"
+        )
+
+    return (
+        '<html><head><meta name="PubDate" content="2025/12/25 09:30"></head>'
+        "<body><h1>2026年国家统计局主要统计信息发布日程表</h1><table>"
+        f"<tr><th>序号</th><th>内容</th>{header}</tr>"
+        + release_rows(1, "国民经济运行情况", "10:00")
+        + release_rows(2, "采购经理指数月度报告", "9:30")
+        + release_rows(3, "居民消费价格指数月度报告", "9:30")
+        + release_rows(4, "工业生产者价格指数月度报告", "9:30")
+        + "</table></body></html>"
+    )
+
+
+def hk_csd_xlsx() -> bytes:
+    rows = [
+        ("Release Date", "Subject", "Sub-subject", "Series", "Title"),
+        (
+            "2026-08-08",
+            "Economy",
+            "National Accounts",
+            "Gross Domestic Product",
+            "Advance estimates on Gross Domestic Product for 2nd Quarter 2026",
+        ),
+        (
+            "2026-08-08",
+            "Prices",
+            "Consumer Prices",
+            "Consumer Price Index",
+            "Consumer Price Index for July 2026",
+        ),
+        (
+            "2026-08-08",
+            "Labour",
+            "Employment",
+            "Unemployment and Underemployment Statistics",
+            "Unemployment statistics",
+        ),
+        (
+            "2026-08-08",
+            "Industry",
+            "Retail",
+            "Retail Sales Statistics",
+            "Retail sales statistics",
+        ),
+        (
+            "2026-08-08",
+            "External Trade",
+            "Merchandise Trade",
+            "External Merchandise Trade Statistics",
+            "External merchandise trade statistics",
+        ),
+        (
+            "2026-08-08",
+            "Economy",
+            "Business Prospects",
+            "Business Expectations",
+            "Business expectations",
+        ),
+    ]
+    xml_rows = []
+    for row_index, values in enumerate(rows, start=1):
+        cells = "".join(
+            (
+                f'<c r="{column}{row_index}" t="inlineStr"><is><t>'
+                f"{escape(value)}</t></is></c>"
+            )
+            for column, value in zip(("A", "B", "C", "D", "E"), values, strict=True)
+        )
+        xml_rows.append(f'<row r="{row_index}">{cells}</row>')
+    worksheet = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(xml_rows)}</sheetData></worksheet>"
+    )
+    output = BytesIO()
+    with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    return output.getvalue()
+
+
+def sfc_html() -> str:
+    rows = [
+        {
+            "id": "policy-cross-market",
+            "date": "2026-08-08",
+            "display-date": "2026年8月8日",
+            "type": "諮詢",
+            "description": "就債券通跨境結算安排展開諮詢",
+            "dateSort": "2026-08-08T00:00:00+08:00",
+        },
+        {
+            "id": "speech-hk",
+            "date": "2026-08-08",
+            "display-date": "2026年8月8日",
+            "type": "演講辭",
+            "description": "在香港資本市場論壇發表演說",
+            "dateSort": "2026-08-08T00:00:00+08:00",
+        },
+        {
+            "id": "publication",
+            "date": "2026-08-08",
+            "display-date": "2026年8月8日",
+            "type": "刊物",
+            "description": "普通刊物",
+            "dateSort": "2026-08-08T00:00:00+08:00",
+        },
+    ]
+    encoded = json.dumps(json.dumps(rows, ensure_ascii=False))
+    return f"<html><script>var jsonString = {encoded};</script></html>"
+
+
 def bls_payload() -> dict[str, object]:
-    def series(series_id: str, values: list[tuple[int, int, float]]) -> dict[str, object]:
+    def series(
+        series_id: str, values: list[tuple[int, int, float]]
+    ) -> dict[str, object]:
         return {
             "seriesID": series_id,
             "data": [
@@ -113,9 +261,11 @@ def bls_payload() -> dict[str, object]:
                     "periodName": "fixture",
                     "value": str(value),
                     "latest": "true" if index == 0 else "false",
-                    "footnotes": ([{"code": "P", "text": "preliminary"}]
-                                  if series_id == "CES0000000001" and index == 0
-                                  else [{}]),
+                    "footnotes": (
+                        [{"code": "P", "text": "preliminary"}]
+                        if series_id == "CES0000000001" and index == 0
+                        else [{}]
+                    ),
                 }
                 for index, (year, month, value) in enumerate(values)
             ],
@@ -202,9 +352,11 @@ def bls_payload_july() -> dict[str, object]:
                 "periodName": "fixture",
                 "value": str(value),
                 "latest": "true" if index == 0 else "false",
-                "footnotes": ([{"code": "P", "text": "preliminary"}]
-                              if series["seriesID"] == "CES0000000001" and index == 0
-                              else [{}]),
+                "footnotes": (
+                    [{"code": "P", "text": "preliminary"}]
+                    if series["seriesID"] == "CES0000000001" and index == 0
+                    else [{}]
+                ),
             }
             for index, (year, month, value) in enumerate(values)
         ]
@@ -263,6 +415,33 @@ def test_official_schedule_parsers_preserve_precision_and_source_contracts() -> 
         history_days=0,
         lookahead_days=30,
     )
+    discovered = discover_nbs_schedule_url(
+        nbs_index_html(),
+        year=2026,
+        page_url=NBS_NOTICE_INDEX_URL,
+    )
+    nbs = parse_nbs_schedule(
+        nbs_html(),
+        expected_year=2026,
+        page_url=NBS_SCHEDULE_FIXTURE_URL,
+        now=NOW,
+        history_days=0,
+        lookahead_days=30,
+    )
+    hk_csd = parse_hk_csd_schedule(
+        hk_csd_xlsx(),
+        expected_year=2026,
+        page_url=HK_CSD_SCHEDULE_URL_TEMPLATE.format(year=2026),
+        now=NOW,
+        history_days=0,
+        lookahead_days=30,
+    )
+    sfc = parse_sfc_regulatory_calendar(
+        sfc_html(),
+        now=NOW,
+        history_days=0,
+        lookahead_days=30,
+    )
 
     assert len(bea) == 4
     assert all(event.time_precision == "EXACT" for event in bea)
@@ -276,6 +455,29 @@ def test_official_schedule_parsers_preserve_precision_and_source_contracts() -> 
     assert fomc[0].time_precision == "DATE"
     assert fomc[0].scheduled_at is None
     assert fomc[0].definition.title == "美联储利率决议与经济预测"
+    assert discovered == NBS_SCHEDULE_FIXTURE_URL
+    assert len(nbs_notice_index_urls()) == 4
+    assert {event.definition.title for event in nbs} == {
+        "中国国民经济运行发布",
+        "中国官方PMI",
+        "中国CPI",
+        "中国PPI",
+    }
+    assert all(event.source_timezone == "Asia/Shanghai" for event in nbs)
+    assert all(
+        event.definition.market_scopes == ("A_STOCKS", "HK_STOCKS") for event in nbs
+    )
+    assert len(hk_csd) == 6
+    assert next(
+        event for event in hk_csd if event.definition.key == "hk-gdp"
+    ).definition.market_scopes == ("A_STOCKS", "HK_STOCKS")
+    assert all(event.scheduled_at is not None for event in hk_csd)
+    assert [event.entity_key for event in sfc] == [
+        "sfc:policy-cross-market",
+        "sfc:speech-hk",
+    ]
+    assert sfc[0].definition.market_scopes == ("A_STOCKS", "HK_STOCKS")
+    assert sfc[1].definition.market_scopes == ("HK_STOCKS",)
 
 
 def test_parsers_fail_closed_when_an_official_contract_changes() -> None:
@@ -295,6 +497,31 @@ def test_parsers_fail_closed_when_an_official_contract_changes() -> None:
         )
     with pytest.raises(MarketEventSourceError, match="FOMC_SCHEMA_CHANGED"):
         parse_fomc_calendar(
+            "<html></html>",
+            now=NOW,
+            history_days=0,
+            lookahead_days=30,
+        )
+    with pytest.raises(MarketEventSourceError, match="NBS_SCHEMA_CHANGED"):
+        parse_nbs_schedule(
+            "<html>2026年国家统计局主要统计信息发布日程表</html>",
+            expected_year=2026,
+            page_url=NBS_SCHEDULE_FIXTURE_URL,
+            now=NOW,
+            history_days=0,
+            lookahead_days=30,
+        )
+    with pytest.raises(MarketEventSourceError, match="HK_CSD_XLSX_INVALID"):
+        parse_hk_csd_schedule(
+            b"not-an-xlsx",
+            expected_year=2026,
+            page_url=HK_CSD_SCHEDULE_URL_TEMPLATE.format(year=2026),
+            now=NOW,
+            history_days=0,
+            lookahead_days=30,
+        )
+    with pytest.raises(MarketEventSourceError, match="SFC_SCHEMA_CHANGED"):
+        parse_sfc_regulatory_calendar(
             "<html></html>",
             now=NOW,
             history_days=0,
@@ -334,6 +561,10 @@ def test_release_uses_pre_release_consensus_and_official_actual_for_direction(
         BEA_RELEASE_DATES_URL: json.dumps(bea_payload()).encode(),
         NYFED_CALENDAR_URL: nyfed_html().encode(),
         FOMC_CALENDAR_URL: fomc_html().encode(),
+        NBS_NOTICE_INDEX_URL: nbs_index_html().encode(),
+        NBS_SCHEDULE_FIXTURE_URL: nbs_html().encode(),
+        HK_CSD_SCHEDULE_URL_TEMPLATE.format(year=2026): hk_csd_xlsx(),
+        SFC_REGULATORY_CALENDAR_URL: sfc_html().encode(),
         BLS_API_URL: json.dumps(bls_payload()).encode(),
         CONSENSUS_CALENDAR_URL: json.dumps(consensus_payload()).encode(),
     }
@@ -405,6 +636,10 @@ def test_monitor_isolates_macro_result_failure_and_tracks_schedule_changes(
         BEA_RELEASE_DATES_URL: json.dumps(bea_payload()).encode(),
         NYFED_CALENDAR_URL: nyfed_html().encode(),
         FOMC_CALENDAR_URL: fomc_html().encode(),
+        NBS_NOTICE_INDEX_URL: nbs_index_html().encode(),
+        NBS_SCHEDULE_FIXTURE_URL: nbs_html().encode(),
+        HK_CSD_SCHEDULE_URL_TEMPLATE.format(year=2026): hk_csd_xlsx(),
+        SFC_REGULATORY_CALENDAR_URL: sfc_html().encode(),
         BLS_API_URL: b"{not-json",
         CONSENSUS_CALENDAR_URL: json.dumps(consensus_payload()).encode(),
     }
@@ -439,7 +674,7 @@ def test_monitor_isolates_macro_result_failure_and_tracks_schedule_changes(
     assert changed.payload["schedule_change_count"] == 1
     assert changed.payload["previous_schedule_label"] == "2026-08-08 20:30"
     assert changed.payload["schedule_label"] == "2026-08-08 21:00"
-    assert monitor.network_request_count(window_seconds=60) == 9
+    assert monitor.network_request_count(window_seconds=60) == 16
 
 
 def test_month_requests_are_bounded_by_the_configured_window() -> None:

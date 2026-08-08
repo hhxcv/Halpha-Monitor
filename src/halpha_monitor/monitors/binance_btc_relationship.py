@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from halpha_monitor.contracts import (
+    AutomaticCollectionState,
     CollectionBatch,
     CollectionCancelled,
     CollectionIssue,
@@ -33,7 +34,7 @@ from halpha_monitor.monitors.btc_relationship_symbols import (
     UNIVERSE_SNAPSHOT_AT,
     UNIVERSE_SOURCE_SHA256,
 )
-from halpha_monitor.store import iso_utc
+from halpha_monitor.store import SQLiteMonitorStore, iso_utc
 from halpha_monitor.telemetry import NetworkRequestWindow
 
 
@@ -526,6 +527,8 @@ class BinanceBtcRelationshipMonitor:
         self,
         settings: BinanceBtcRelationshipSettings,
         client: DailySeriesProvider | None = None,
+        *,
+        store: SQLiteMonitorStore | None = None,
     ) -> None:
         self.settings = settings
         self.interval_seconds = settings.interval_seconds
@@ -534,6 +537,8 @@ class BinanceBtcRelationshipMonitor:
             settings.cache_root,
             timeout_seconds=settings.timeout_seconds,
         )
+        self.store = store
+        self._last_computed_cutoff: datetime | None = None
         self.view = MonitorView(
             filters=(),
             columns=(
@@ -607,6 +612,57 @@ class BinanceBtcRelationshipMonitor:
             ),
             table_title="BTC 关联与相对强弱",
             chart_title="BTC Pearson 相关性历史",
+        )
+
+    def _persisted_cutoff(self) -> datetime | None:
+        objects = tuple(
+            symbol for symbol in self.settings.symbols if symbol != REFERENCE_SYMBOL
+        )
+        if self.store is None:
+            return self._last_computed_cutoff
+        if not objects:
+            return None
+        latest_finished = self.store.latest_finished_run(self.monitor_id)
+        if latest_finished is None or latest_finished.status != "SUCCESS":
+            return None
+        samples = self.store.latest_samples_by_entity(
+            self.monitor_id,
+            (objects[0],),
+        )
+        if not samples:
+            return None
+        value = samples[0].payload.get("data_cutoff_at")
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(UTC)
+
+    def automatic_collection_state(
+        self,
+        *,
+        now: datetime,
+    ) -> AutomaticCollectionState:
+        cutoff = latest_closed_cutoff(now)
+        persisted_cutoff = self._persisted_cutoff()
+        if persisted_cutoff is None or persisted_cutoff < cutoff:
+            return AutomaticCollectionState(
+                allowed=True,
+                status="OPEN",
+                reason_code="BTC_RELATIONSHIP_DAILY_CUTOFF_PENDING",
+                label="新闭合日线待计算",
+                detail="最新UTC日线尚未计算；完成后会等待下一根日线闭合。",
+            )
+        next_open_at = cutoff + timedelta(days=1, milliseconds=1)
+        return AutomaticCollectionState(
+            allowed=False,
+            status="CLOSED",
+            reason_code="BTC_RELATIONSHIP_DAILY_CUTOFF_CURRENT",
+            label="等待下一根日线",
+            detail="最新闭合UTC日线已经计算；下一根日线闭合后自动重算。",
+            next_open_at=next_open_at,
         )
 
     def network_request_count(self, *, window_seconds: float = 60) -> int | None:
@@ -727,6 +783,7 @@ class BinanceBtcRelationshipMonitor:
                 sample.entity_key,
             )
         )
+        self._last_computed_cutoff = cutoff
         return CollectionBatch(samples=tuple(samples), issues=tuple(issues))
 
     @staticmethod

@@ -35,7 +35,7 @@ from halpha_monitor.monitors.a_hk_buyback import AHKBuybackMonitor
 from halpha_monitor.monitors.market_events import MarketEventMonitor
 from halpha_monitor.service import MonitorRegistry
 from halpha_monitor.service import MonitorScheduler
-from halpha_monitor.store import SQLiteMonitorStore
+from halpha_monitor.store import SQLiteMonitorStore, iso_utc
 from halpha_monitor.web import create_app
 
 
@@ -176,6 +176,8 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert 'id="monitoring-count"' not in page.text
     assert 'id="diagnostics-open"' in page.text
     assert 'id="diagnostics-dialog"' in page.text
+    assert "发生时间 / 运行" in page.text
+    assert "原因与定位" in page.text
     assert 'id="diagnostics-region"' not in page.text
     assert page.text.index('id="diagnostics-open"') < page.text.index(
         'id="monitor-control-button"'
@@ -187,6 +189,9 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     )
     assert 'document.visibilityState === "visible"' in script.text
     assert "maintainForegroundObservation" in script.text
+    assert "syncForegroundObservation" in script.text
+    assert "state.observationTimer = setInterval" in script.text
+    assert "state.observationMonitorId === payload.monitor.monitor_id" in script.text
     assert "payload.refresh_after_seconds" in script.text
     assert "ui.btcRegime.textContent = regime?.label" in script.text
     assert "String(sourceState).replaceAll" not in script.text
@@ -220,6 +225,12 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert "table-column-help-tooltip" in script.text
     assert ".table-column-help-tooltip" in style.text
     assert "ui.diagnosticsDialog.showModal()" in script.text
+    assert "renderIssues(payload.issues, payload.current_issues, payload.monitor)" in script.text
+    assert '"stock-announcements": "公司公告索引"' in script.text
+    assert "STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED" in script.text
+    assert "运行 #${issue.run_id} · 记录 #${issue.issue_id}" in script.text
+    assert "issueContextEntries(issue.context)" in script.text
+    assert '.issue-state-badge[data-state="RECOVERED"]' in style.text
     assert "ui.buybackSourceRegion.hidden = !hasVisibleProblem" in script.text
     assert '"a-share-documents": "A股公告原文"' in script.text
     assert 'return "公开来源连接中断"' in script.text
@@ -288,11 +299,27 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert 'id="market-event-how-to-read"' in page.text
     assert 'id="market-event-direction-formula"' in page.text
     assert "function renderMarketEvents" in script.text
+    assert 'id="stock-events"' in page.text
+    assert 'id="stock-selector-dialog"' in page.text
+    assert 'id="stock-selector-add-query"' in page.text
+    assert 'aria-autocomplete="list"' in page.text
+    assert 'id="stock-selector-suggestions"' in page.text
+    assert 'id="stock-calendar-grid"' in page.text
+    assert "function renderStockEvents" in script.text
+    assert "function renderStockSelector" in script.text
+    assert "function scheduleStockDirectorySearch" in script.text
+    assert "/stocks/search?${params.toString()}" in script.text
+    assert "manual_stock_codes: manual" in script.text
+    assert '.workspace[data-projection-kind="stock-events"]' in style.text
+    assert ".stock-calendar-layout" in style.text
+    assert ".stock-selector-suggestions" in style.text
+    assert ".stock-selector-dialog {\n  --stock-blue: #0b6cf0;" in style.text
     assert "function renderEventHistory" in script.text
     assert "function applyEventTabState" in script.text
     assert "function applyRadarTabState" in script.text
     assert "function radarTabFromLocation" in script.text
     assert 'POSITION: "position"' in script.text
+    assert 'params.set(\n      "view"' in script.text
     assert "function renderRadarPriceFilter" in script.text
     assert "function renderRadarTableView" in script.text
     assert "RADAR_POSITION_TABLE_PAGE_SIZE = 50" in script.text
@@ -639,6 +666,27 @@ def test_altcoin_radar_projection_excludes_legacy_spot_samples(
             "/api/view",
             params={"monitor_id": "binance-altcoin-radar"},
         ).json()
+        candidates = client.get(
+            "/api/view",
+            params={
+                "monitor_id": "binance-altcoin-radar",
+                "view": "candidates",
+            },
+        ).json()
+        position = client.get(
+            "/api/view",
+            params={
+                "monitor_id": "binance-altcoin-radar",
+                "view": "position",
+            },
+        ).json()
+        invalid = client.get(
+            "/api/view",
+            params={
+                "monitor_id": "binance-altcoin-radar",
+                "view": "unsupported",
+            },
+        )
 
     assert payload["monitor"]["projection_kind"] == "altcoin_radar"
     assert [row["symbol"] for row in payload["rows"]] == ["NEWUSDT"]
@@ -653,6 +701,16 @@ def test_altcoin_radar_projection_excludes_legacy_spot_samples(
         "price_state_label",
         "return_24h_percent",
     ]
+    assert [row["symbol"] for row in candidates["rows"]] == ["NEWUSDT"]
+    assert candidates["altcoin_price_position"] is None
+    assert candidates["history"] == []
+    assert position["rows"] == []
+    assert [row["symbol"] for row in position["altcoin_price_position"]["rows"]] == [
+        "NEWUSDT"
+    ]
+    assert position["evaluation"] is None
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"] == "RADAR_VIEW_UNSUPPORTED"
 
 
 @pytest.mark.parametrize(
@@ -1137,6 +1195,9 @@ def test_view_marks_expected_no_match_in_place_without_degrading_service(
             "occurred_at": payload["current_issues"][0]["occurred_at"],
             "scope": "BUY:ETH",
             "reason_code": "NO_ELIGIBLE_C2C_AD",
+            "context": {},
+            "state": "ACTIVE",
+            "recovered_at": None,
             "classification": "EXPECTED_ABSENCE",
             "tone": "NOTICE",
         }
@@ -1178,6 +1239,128 @@ def test_view_keeps_real_partial_issue_local_and_explicit(tmp_path: Path) -> Non
     assert payload["service_status_label"] == "监控运行中"
     assert payload["current_issues"][0]["classification"] == "DATA_ISSUE"
     assert payload["current_issues"][0]["tone"] == "WARNING"
+    assert payload["current_issues"][0]["state"] == "ACTIVE"
+    assert payload["current_issues"][0]["context"] == {}
+
+
+def test_view_marks_an_old_issue_recovered_after_a_successful_run(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    issue_time = datetime.now(UTC) - timedelta(minutes=2)
+    issue_run = store.start_run(
+        "fake-monitor",
+        started_at=issue_time - timedelta(seconds=1),
+    )
+    store.finish_run(
+        issue_run,
+        "fake-monitor",
+        CollectionBatch(
+            samples=(
+                MetricSample(
+                    series_key="BUY|BTC",
+                    entity_key="BTC",
+                    observed_at=issue_time,
+                    value_text="6.75",
+                    unit="CNY_PER_USDT",
+                    payload={"asset": "BTC", "trade_type": "BUY", "value": "6.75"},
+                ),
+            ),
+            issues=(
+                CollectionIssue(
+                    "stock-announcements",
+                    "STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED",
+                    context={"page_limit": 2, "upstream_total_hits": 238},
+                ),
+            ),
+        ),
+        completed_at=issue_time,
+    )
+    recovered_at = issue_time + timedelta(minutes=1)
+    success_run = store.start_run("fake-monitor", started_at=recovered_at)
+    store.finish_run(
+        success_run,
+        "fake-monitor",
+        CollectionBatch(
+            samples=(
+                MetricSample(
+                    series_key="BUY|BTC",
+                    entity_key="BTC",
+                    observed_at=recovered_at,
+                    value_text="6.76",
+                    unit="CNY_PER_USDT",
+                    payload={"asset": "BTC", "trade_type": "BUY", "value": "6.76"},
+                ),
+            ),
+        ),
+        completed_at=recovered_at,
+    )
+    registry = MonitorRegistry()
+    registry.register(FakeMonitor())
+
+    with TestClient(
+        create_app(store, registry, None, start_scheduler=False),
+        base_url="http://127.0.0.1:8790",
+    ) as client:
+        payload = client.get("/api/view").json()
+
+    assert payload["current_issues"] == []
+    recovered = payload["issues"][0]
+    assert recovered["run_id"] == issue_run
+    assert recovered["state"] == "RECOVERED"
+    assert recovered["recovered_at"] == iso_utc(recovered_at)
+    assert recovered["context"] == {
+        "page_limit": 2,
+        "upstream_total_hits": 238,
+    }
+
+
+def test_view_keeps_last_finished_issue_active_while_next_run_is_running(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    issue_time = datetime.now(UTC) - timedelta(minutes=1)
+    registry = MonitorRegistry()
+    registry.register(FakeMonitor())
+
+    with TestClient(
+        create_app(store, registry, None, start_scheduler=False),
+        base_url="http://127.0.0.1:8790",
+    ) as client:
+        issue_run = store.start_run(
+            "fake-monitor",
+            started_at=issue_time - timedelta(seconds=1),
+        )
+        store.finish_run(
+            issue_run,
+            "fake-monitor",
+            CollectionBatch(
+                samples=(
+                    MetricSample(
+                        series_key="BUY|BTC",
+                        entity_key="BTC",
+                        observed_at=issue_time,
+                        value_text="6.75",
+                        unit="CNY_PER_USDT",
+                        payload={"asset": "BTC", "trade_type": "BUY", "value": "6.75"},
+                    ),
+                ),
+                issues=(CollectionIssue("BUY:ETH", "UPSTREAM_UNAVAILABLE"),),
+            ),
+            completed_at=issue_time,
+        )
+        running_id = store.start_run(
+            "fake-monitor",
+            started_at=issue_time + timedelta(seconds=30),
+        )
+        payload = client.get("/api/view").json()
+
+    assert payload["monitor"]["latest_run"]["run_id"] == running_id
+    assert payload["monitor"]["latest_run"]["status"] == "RUNNING"
+    assert payload["current_issues"][0]["run_id"] == issue_run
+    assert payload["current_issues"][0]["state"] == "ACTIVE"
 
 
 def test_view_keeps_empty_state_explicit_when_no_validated_data_exists(
@@ -1574,8 +1757,8 @@ def test_buyback_projection_is_cached_for_repeated_view_reads(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(web_module, "project_buyback_metrics", counted_projection)
-    fixed_now = datetime.now(UTC).replace(second=0, microsecond=0)
-    monkeypatch.setattr(web_module, "utc_now", lambda: fixed_now)
+    clock = [datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)]
+    monkeypatch.setattr(web_module, "utc_now", lambda: clock[0])
     with client:
         first = client.get(
             "/api/view",
@@ -1585,9 +1768,15 @@ def test_buyback_projection_is_cached_for_repeated_view_reads(
             "/api/view",
             params={"monitor_id": "a-hk-buyback"},
         )
+        clock[0] += timedelta(minutes=5)
+        third = client.get(
+            "/api/view",
+            params={"monitor_id": "a-hk-buyback"},
+        )
 
     assert first.status_code == 200
     assert second.status_code == 200
+    assert third.status_code == 200
     assert calls == 1
 
 
@@ -1856,6 +2045,7 @@ def _event_sample(
             "schedule_source_url": "https://example.com/calendar",
             "official_release_url": "https://example.com/release",
             "source_timezone_label": "北京时间",
+            "source_timezone": "America/New_York",
             "source_checked_at": (scheduled_at - timedelta(hours=12)).isoformat(),
             "schedule_change_count": 0,
             "last_schedule_changed_at": None,
@@ -1877,7 +2067,7 @@ def make_market_event_client(tmp_path: Path) -> TestClient:
         importance="HIGH",
         category="LABOR",
         category_label="就业",
-        markets=["CRYPTO", "US_STOCKS", "A_HK_STOCKS"],
+        markets=["CRYPTO", "US_STOCKS", "A_STOCKS", "HK_STOCKS"],
     )
     historical.payload.update(
         {
@@ -1908,7 +2098,7 @@ def make_market_event_client(tmp_path: Path) -> TestClient:
                     importance="HIGH",
                     category="INFLATION",
                     category_label="通胀",
-                    markets=["CRYPTO", "US_STOCKS", "A_HK_STOCKS"],
+                    markets=["CRYPTO", "US_STOCKS", "A_STOCKS", "HK_STOCKS"],
                     latest_result="同比 +2.8% · 环比 +0.2%",
                 ),
                 _event_sample(
@@ -1927,7 +2117,7 @@ def make_market_event_client(tmp_path: Path) -> TestClient:
                     importance="HIGH",
                     category="MONETARY_POLICY",
                     category_label="货币政策",
-                    markets=["CRYPTO", "US_STOCKS", "A_HK_STOCKS"],
+                    markets=["CRYPTO", "US_STOCKS", "A_STOCKS", "HK_STOCKS"],
                 ),
                 MetricSample(
                     series_key="macro-indicator",
@@ -1988,12 +2178,13 @@ def test_market_event_projection_prioritizes_upcoming_risk_and_filters(
                 "time_range": "NEXT_24H",
             },
         ).json()
-        a_h_market = client.get(
+        a_h_markets = client.get(
             "/api/view",
-            params={
-                "monitor_id": "market-event-calendar",
-                "affected_market": "A_HK_STOCKS",
-            },
+            params=[
+                ("monitor_id", "market-event-calendar"),
+                ("affected_market", "A_STOCKS"),
+                ("affected_market", "HK_STOCKS"),
+            ],
         ).json()
         searched = client.get(
             "/api/view",
@@ -2023,10 +2214,27 @@ def test_market_event_projection_prioritizes_upcoming_risk_and_filters(
     assert payload["market_events"]["history_event_count"] == 1
     assert payload["market_events"]["history_events"][0]["direction"]["label"] == "偏空"
     assert payload["market_events"]["history_started_at"] is not None
+    market_filter = next(
+        item
+        for item in payload["monitor"]["filters"]
+        if item["key"] == "affected_market"
+    )
+    assert market_filter["multiple"] is True
+    assert market_filter["selected"] == [
+        "US_STOCKS",
+        "A_STOCKS",
+        "HK_STOCKS",
+        "CRYPTO",
+    ]
     assert [row["event_title"] for row in next_day["rows"]] == ["美国CPI"]
-    assert [row["event_title"] for row in a_h_market["rows"]] == [
+    assert [row["event_title"] for row in a_h_markets["rows"]] == [
         "美国CPI",
         "美联储利率决议",
+    ]
+    assert "A股、港股" in a_h_markets["rows"][0]["markets_label"]
+    assert a_h_markets["monitor"]["filters"][3]["selected"] == [
+        "A_STOCKS",
+        "HK_STOCKS",
     ]
     assert [row["event_title"] for row in searched["rows"]] == ["美国新屋销售"]
     assert unsupported.status_code == 422

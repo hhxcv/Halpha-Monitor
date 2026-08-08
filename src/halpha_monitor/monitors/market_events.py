@@ -13,12 +13,16 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
 import hashlib
 import html
+from html.parser import HTMLParser
+from io import BytesIO
 import json
 import re
 import threading
 from typing import Any, Protocol
 from urllib.parse import urljoin
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
+from zipfile import BadZipFile, ZipFile
 
 from halpha_monitor.contracts import (
     CollectionArtifact,
@@ -45,17 +49,19 @@ NEW_YORK_TZ = ZoneInfo("America/New_York")
 
 BEA_RELEASE_DATES_URL = "https://apps.bea.gov/API/signup/release_dates.json"
 BEA_SCHEDULE_URL = "https://www.bea.gov/news/schedule"
-FOMC_CALENDAR_URL = (
-    "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
-)
-NYFED_CALENDAR_URL = (
-    "https://www.newyorkfed.org/research/calendars/nationalecon_cal"
-)
+FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+NYFED_CALENDAR_URL = "https://www.newyorkfed.org/research/calendars/nationalecon_cal"
 BLS_API_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
-CONSENSUS_CALENDAR_URL = (
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-)
+CONSENSUS_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 CONSENSUS_SOURCE_PAGE_URL = "https://www.forexfactory.com/calendar"
+NBS_NOTICE_INDEX_URL = "https://www.stats.gov.cn/xw/tjxw/tzgg/index.html"
+NBS_RELEASE_URL = "https://www.stats.gov.cn/sj/zxfb/"
+HK_CSD_SCHEDULE_URL_TEMPLATE = (
+    "https://www.censtatd.gov.hk/FileManager/EN/Common/"
+    "Regular_Press_Releases_Schedule_{year}.xlsx"
+)
+HK_CSD_RELEASE_URL = "https://www.censtatd.gov.hk/en/press_release.html?selType=1"
+SFC_REGULATORY_CALENDAR_URL = "https://www.sfc.hk/TC/Quick-links/Regulatory-Calendar"
 
 MONTH_NAMES = {
     name: month
@@ -167,6 +173,7 @@ class ScheduledEvent:
     schedule_source_url: str
     official_release_url: str | None
     source_timezone_label: str
+    source_timezone: str = "America/New_York"
     source_updated_at: datetime | None = None
     source_checked_at: datetime | None = None
 
@@ -184,8 +191,9 @@ class ConsensusObservation:
     observed_at: datetime
 
 
-ALL_MARKETS = ("CRYPTO", "US_STOCKS", "A_HK_STOCKS")
+ALL_MARKETS = ("CRYPTO", "US_STOCKS", "A_STOCKS", "HK_STOCKS")
 US_AND_CRYPTO = ("CRYPTO", "US_STOCKS")
+A_HK_MARKETS = ("A_STOCKS", "HK_STOCKS")
 
 BEA_DEFINITIONS = {
     "Gross Domestic Product": EventDefinition(
@@ -225,7 +233,7 @@ BEA_DEFINITIONS = {
         "企业盈利",
         "MEDIUM",
         "企业利润是总量盈利周期与股票估值判断的宏观参考。",
-        ("US_STOCKS", "A_HK_STOCKS"),
+        ("US_STOCKS", "A_STOCKS", "HK_STOCKS"),
         "美国经济分析局随国民经济账户更新企业利润。",
     ),
 }
@@ -428,6 +436,165 @@ FOMC_DEFINITION = EventDefinition(
     "联邦公开市场委员会公布政策决定；带经济预测的会议同时更新SEP。",
 )
 
+NBS_DEFINITIONS: tuple[tuple[str, EventDefinition], ...] = (
+    (
+        "国民经济运行情况",
+        EventDefinition(
+            "china-economy-briefing",
+            "中国国民经济运行发布",
+            "GROWTH",
+            "经济增长",
+            "HIGH",
+            "工业、消费、投资和增长数据集中发布，会共同影响A股及港股的增长与政策预期。",
+            A_HK_MARKETS,
+            "国家统计局按官方日程发布月度、季度或年度国民经济运行情况。",
+        ),
+    ),
+    (
+        "采购经理指数月度报告",
+        EventDefinition(
+            "china-pmi",
+            "中国官方PMI",
+            "ACTIVITY",
+            "经济活动",
+            "HIGH",
+            "官方PMI是制造业和非制造业景气变化的高频信号，会影响周期行业与中国资产风险偏好。",
+            A_HK_MARKETS,
+            "国家统计局发布制造业、非制造业及综合PMI。",
+        ),
+    ),
+    (
+        "居民消费价格指数月度报告",
+        EventDefinition(
+            "china-cpi",
+            "中国CPI",
+            "INFLATION",
+            "通胀",
+            "HIGH",
+            "居民消费价格会影响实际需求、货币政策空间和消费相关行业判断。",
+            A_HK_MARKETS,
+            "国家统计局发布居民消费价格指数月度报告。",
+        ),
+    ),
+    (
+        "工业生产者价格指数月度报告",
+        EventDefinition(
+            "china-ppi",
+            "中国PPI",
+            "INFLATION",
+            "通胀",
+            "MEDIUM",
+            "工业品出厂价格反映上游价格和企业利润压力，是周期行业与盈利判断的重要补充。",
+            A_HK_MARKETS,
+            "国家统计局发布工业生产者出厂价格指数月度报告。",
+        ),
+    ),
+)
+
+HK_CSD_DEFINITIONS = {
+    "Consumer Price Index": EventDefinition(
+        "hk-cpi",
+        "香港CPI",
+        "INFLATION",
+        "通胀",
+        "MEDIUM",
+        "香港消费价格影响本地实际购买力、利率环境和消费行业判断。",
+        ("HK_STOCKS",),
+        "香港政府统计处发布综合消费物价指数。",
+    ),
+    "Unemployment and Underemployment Statistics": EventDefinition(
+        "hk-unemployment",
+        "香港失业及就业不足统计",
+        "LABOR",
+        "就业",
+        "MEDIUM",
+        "就业市场变化反映香港本地需求与服务业景气。",
+        ("HK_STOCKS",),
+        "香港政府统计处发布失业及就业不足统计。",
+    ),
+    "Retail Sales Statistics": EventDefinition(
+        "hk-retail-sales",
+        "香港零售业销货额",
+        "CONSUMPTION",
+        "消费",
+        "MEDIUM",
+        "零售数据反映香港本地及访港消费需求，对消费、地产和服务行业有参考价值。",
+        ("HK_STOCKS",),
+        "香港政府统计处发布零售业销货额统计。",
+    ),
+    "External Merchandise Trade Statistics": EventDefinition(
+        "hk-external-trade",
+        "香港对外商品贸易",
+        "TRADE",
+        "贸易",
+        "MEDIUM",
+        "香港商品贸易与内地供应链和转口活动紧密相关，会补充A股与港股外需判断。",
+        A_HK_MARKETS,
+        "香港政府统计处发布对外商品贸易统计。",
+    ),
+    "Business Expectations": EventDefinition(
+        "hk-business-expectations",
+        "香港业务展望",
+        "SENTIMENT",
+        "信心",
+        "MEDIUM",
+        "企业业务展望反映香港主要行业对短期经营环境的判断。",
+        ("HK_STOCKS",),
+        "香港政府统计处发布季度业务展望统计。",
+    ),
+}
+
+HK_GDP_DEFINITION = EventDefinition(
+    "hk-gdp",
+    "香港本地生产总值（GDP）",
+    "GROWTH",
+    "经济增长",
+    "HIGH",
+    "香港GDP会影响本地盈利、财政与增长预期，也会补充离岸中国资产的宏观判断。",
+    A_HK_MARKETS,
+    "香港政府统计处发布本地生产总值预估或修订数字。",
+)
+
+SFC_POLICY_MARKETS = (
+    "中國",
+    "中国",
+    "內地",
+    "内地",
+    "滬",
+    "沪",
+    "深交所",
+    "債券通",
+    "债券通",
+    "北向",
+    "南向",
+    "跨境",
+    "人民幣",
+    "人民币",
+    "國債",
+    "国债",
+)
+SFC_SIGNIFICANT_SPEECH_TERMS = (
+    "香港交易所",
+    "港交所",
+    "國債",
+    "国债",
+    "債券通",
+    "债券通",
+    "固定收益",
+    "金融科技",
+    "虛擬資產",
+    "虚拟资产",
+    "資本市場",
+    "资本市场",
+    "上市",
+    "結算",
+    "结算",
+    "監管",
+    "监管",
+    "政策",
+    "衍生",
+)
+
 
 def _strict_json(body: bytes, reason_code: str) -> Any:
     try:
@@ -437,9 +604,7 @@ def _strict_json(body: bytes, reason_code: str) -> Any:
 
 
 def _strip_tags(value: str) -> str:
-    return " ".join(
-        html.unescape(re.sub(r"<[^>]+>", " ", value)).split()
-    )
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())
 
 
 def _artifact(
@@ -488,11 +653,544 @@ def _event_in_window(
             <= event.scheduled_at
             <= now + timedelta(days=lookahead_days)
         )
-    today = now.astimezone(NEW_YORK_TZ).date()
+    try:
+        source_timezone = ZoneInfo(event.source_timezone)
+    except (KeyError, ValueError):
+        source_timezone = NEW_YORK_TZ
+    today = now.astimezone(source_timezone).date()
     return (
         today - timedelta(days=history_days)
         <= event.scheduled_date
         <= today + timedelta(days=lookahead_days)
+    )
+
+
+@dataclass(frozen=True)
+class _HtmlTableCell:
+    text: str
+    rowspan: int
+    colspan: int
+
+
+class _HtmlTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[_HtmlTableCell]]] = []
+        self._table_depth = 0
+        self._rows: list[list[_HtmlTableCell]] | None = None
+        self._row: list[_HtmlTableCell] | None = None
+        self._cell_parts: list[str] | None = None
+        self._cell_span = (1, 1)
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        lowered = tag.casefold()
+        if lowered == "table":
+            self._table_depth += 1
+            if self._table_depth == 1:
+                self._rows = []
+            return
+        if self._table_depth != 1:
+            return
+        if lowered == "tr":
+            self._row = []
+        elif lowered in {"td", "th"} and self._row is not None:
+            attributes = {key.casefold(): value for key, value in attrs}
+            try:
+                rowspan = max(1, min(24, int(attributes.get("rowspan") or "1")))
+                colspan = max(1, min(24, int(attributes.get("colspan") or "1")))
+            except ValueError:
+                rowspan, colspan = 1, 1
+            self._cell_parts = []
+            self._cell_span = (rowspan, colspan)
+        elif lowered == "br" and self._cell_parts is not None:
+            self._cell_parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self._cell_parts is not None:
+            self._cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        if self._table_depth == 1 and lowered in {"td", "th"}:
+            if self._row is not None and self._cell_parts is not None:
+                self._row.append(
+                    _HtmlTableCell(
+                        " ".join("".join(self._cell_parts).split()),
+                        self._cell_span[0],
+                        self._cell_span[1],
+                    )
+                )
+            self._cell_parts = None
+            self._cell_span = (1, 1)
+        elif self._table_depth == 1 and lowered == "tr":
+            if self._rows is not None and self._row:
+                self._rows.append(self._row)
+            self._row = None
+        if lowered == "table" and self._table_depth:
+            if self._table_depth == 1 and self._rows is not None:
+                self.tables.append(self._rows)
+                self._rows = None
+            self._table_depth -= 1
+
+
+def _expanded_table(rows: list[list[_HtmlTableCell]]) -> list[list[str]]:
+    cells: dict[tuple[int, int], str] = {}
+    width = 0
+    for row_index, row in enumerate(rows):
+        column = 0
+        for cell in row:
+            while (row_index, column) in cells:
+                column += 1
+            for row_offset in range(cell.rowspan):
+                for column_offset in range(cell.colspan):
+                    cells[(row_index + row_offset, column + column_offset)] = cell.text
+            column += cell.colspan
+        width = max(width, column)
+    return [
+        [cells.get((row_index, column), "") for column in range(width)]
+        for row_index in range(len(rows))
+    ]
+
+
+def nbs_notice_index_urls() -> tuple[str, ...]:
+    return (
+        NBS_NOTICE_INDEX_URL,
+        *(
+            NBS_NOTICE_INDEX_URL.replace("index.html", f"index_{page}.html")
+            for page in range(1, 4)
+        ),
+    )
+
+
+def discover_nbs_schedule_url(
+    body: str,
+    *,
+    year: int,
+    page_url: str,
+) -> str | None:
+    target = f"{year}年国家统计局主要统计信息发布日程表"
+    for match in re.finditer(
+        r'<a\s+([^>]*?)href=["\']([^"\']+)["\']([^>]*)>(.*?)</a>',
+        body,
+        re.I | re.S,
+    ):
+        link_text = _strip_tags(match.group(4))
+        attributes = html.unescape(f"{match.group(1)} {match.group(3)}")
+        if target not in link_text and target not in attributes:
+            continue
+        url = urljoin(page_url, html.unescape(match.group(2)))
+        if not url.startswith("https://www.stats.gov.cn/"):
+            raise MarketEventSourceError("MARKET_EVENTS_NBS_SCHEDULE_URL_INVALID")
+        return url
+    return None
+
+
+def _nbs_definition(value: str) -> EventDefinition | None:
+    normalized = "".join(value.split())
+    for source_name, definition in NBS_DEFINITIONS:
+        if "".join(source_name.split()) in normalized:
+            return definition
+    return None
+
+
+def _nbs_source_updated_at(body: str) -> datetime | None:
+    match = re.search(
+        r'<meta\s+[^>]*name=["\']PubDate["\'][^>]*content=["\']([^"\']+)["\']',
+        body,
+        re.I,
+    )
+    if match is None:
+        match = re.search(
+            r'<meta\s+[^>]*content=["\']([^"\']+)["\'][^>]*name=["\']PubDate["\']',
+            body,
+            re.I,
+        )
+    if match is None:
+        return None
+    for pattern in ("%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return (
+                datetime.strptime(match.group(1).strip(), pattern)
+                .replace(tzinfo=SHANGHAI_TZ)
+                .astimezone(UTC)
+            )
+        except ValueError:
+            continue
+    raise MarketEventSourceError("MARKET_EVENTS_NBS_UPDATED_AT_INVALID")
+
+
+def parse_nbs_schedule(
+    body: str,
+    *,
+    expected_year: int,
+    page_url: str,
+    now: datetime,
+    history_days: int,
+    lookahead_days: int,
+) -> tuple[ScheduledEvent, ...]:
+    if re.search(rf"{expected_year}\s*年.*?主要统计信息发布日程表", body, re.S) is None:
+        raise MarketEventSourceError("MARKET_EVENTS_NBS_YEAR_MISMATCH")
+    parser = _HtmlTableParser()
+    parser.feed(body)
+    source_updated_at = _nbs_source_updated_at(body)
+    events: dict[str, ScheduledEvent] = {}
+    recognized_definitions: set[str] = set()
+    calendar_found = False
+    for raw_table in parser.tables:
+        table = _expanded_table(raw_table)
+        month_columns: dict[int, int] = {}
+        for row in table:
+            candidates: dict[int, int] = {}
+            for column, value in enumerate(row):
+                month_match = re.fullmatch(r"\s*(1[0-2]|[1-9])\s*月\s*", value)
+                if month_match:
+                    candidates[column] = int(month_match.group(1))
+            if len(candidates) >= 10:
+                month_columns = candidates
+                calendar_found = True
+                break
+        if not month_columns:
+            continue
+        first_month_column = min(month_columns)
+        for row_index, row in enumerate(table):
+            definition = next(
+                (
+                    matched
+                    for value in row[:first_month_column]
+                    if (matched := _nbs_definition(value)) is not None
+                ),
+                None,
+            )
+            if definition is None:
+                continue
+            date_cells = {
+                column: re.match(r"\s*(\d{1,2})\s*(?:/|日)", row[column])
+                for column in month_columns
+                if column < len(row)
+            }
+            if not any(date_cells.values()):
+                continue
+            recognized_definitions.add(definition.key)
+            time_row = table[row_index + 1] if row_index + 1 < len(table) else []
+            for column, month in month_columns.items():
+                day_match = date_cells.get(column)
+                if day_match is None:
+                    continue
+                try:
+                    scheduled_date = date(expected_year, month, int(day_match.group(1)))
+                except ValueError:
+                    raise MarketEventSourceError(
+                        "MARKET_EVENTS_NBS_DATE_INVALID"
+                    ) from None
+                time_text = time_row[column] if column < len(time_row) else ""
+                time_match = re.search(r"(\d{1,2})\s*[：:]\s*(\d{2})", time_text)
+                scheduled_at: datetime | None = None
+                precision = "DATE"
+                if time_match is not None:
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2))
+                    if "下午" in time_text and hour < 12:
+                        hour += 12
+                    elif "上午" in time_text and hour == 12:
+                        hour = 0
+                    try:
+                        scheduled_at = datetime.combine(
+                            scheduled_date,
+                            datetime_time(hour=hour, minute=minute),
+                            tzinfo=SHANGHAI_TZ,
+                        ).astimezone(UTC)
+                    except ValueError:
+                        raise MarketEventSourceError(
+                            "MARKET_EVENTS_NBS_TIME_INVALID"
+                        ) from None
+                    precision = "EXACT"
+                event = ScheduledEvent(
+                    entity_key=f"nbs:{definition.key}:{scheduled_date.isoformat()}",
+                    definition=definition,
+                    scheduled_date=scheduled_date,
+                    scheduled_at=scheduled_at,
+                    time_precision=precision,
+                    source_key="nbs-schedule",
+                    source_label="国家统计局主要统计信息发布日程",
+                    schedule_source_url=page_url,
+                    official_release_url=NBS_RELEASE_URL,
+                    source_timezone_label=(
+                        "北京时间"
+                        if scheduled_at is not None
+                        else "中国日期；具体时间待公布"
+                    ),
+                    source_timezone="Asia/Shanghai",
+                    source_updated_at=source_updated_at,
+                )
+                if _event_in_window(
+                    event,
+                    now=now,
+                    history_days=history_days,
+                    lookahead_days=lookahead_days,
+                ):
+                    events[event.entity_key] = event
+    if not calendar_found or len(recognized_definitions) != len(NBS_DEFINITIONS):
+        raise MarketEventSourceError("MARKET_EVENTS_NBS_SCHEMA_CHANGED")
+    return tuple(
+        sorted(events.values(), key=lambda item: (_sort_at(item), item.entity_key))
+    )
+
+
+_XLSX_NAMESPACE = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+
+def _xlsx_rows(body: bytes) -> list[dict[str, str]]:
+    try:
+        with ZipFile(BytesIO(body)) as archive:
+            infos = archive.infolist()
+            if (
+                len(infos) > 100
+                or sum(item.file_size for item in infos) > 8 * 1024 * 1024
+            ):
+                raise MarketEventSourceError("MARKET_EVENTS_HK_CSD_XLSX_TOO_LARGE")
+            shared_strings: list[str] = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                shared_root = ElementTree.fromstring(
+                    archive.read("xl/sharedStrings.xml")
+                )
+                shared_strings = [
+                    "".join(
+                        node.text or ""
+                        for node in item.findall(".//m:t", _XLSX_NAMESPACE)
+                    )
+                    for item in shared_root.findall("m:si", _XLSX_NAMESPACE)
+                ]
+            sheet_root = ElementTree.fromstring(
+                archive.read("xl/worksheets/sheet1.xml")
+            )
+    except MarketEventSourceError:
+        raise
+    except (BadZipFile, KeyError, ElementTree.ParseError, OSError):
+        raise MarketEventSourceError("MARKET_EVENTS_HK_CSD_XLSX_INVALID") from None
+
+    rows: list[dict[str, str]] = []
+    for row in sheet_root.findall(".//m:row", _XLSX_NAMESPACE):
+        values: dict[str, str] = {}
+        for cell in row.findall("m:c", _XLSX_NAMESPACE):
+            reference = str(cell.get("r") or "")
+            column_match = re.match(r"([A-Z]+)", reference)
+            if column_match is None:
+                continue
+            column = column_match.group(1)
+            value_node = cell.find("m:v", _XLSX_NAMESPACE)
+            raw_value = (
+                value_node.text if value_node is not None and value_node.text else ""
+            )
+            if cell.get("t") == "s" and raw_value:
+                try:
+                    raw_value = shared_strings[int(raw_value)]
+                except (IndexError, ValueError):
+                    raise MarketEventSourceError(
+                        "MARKET_EVENTS_HK_CSD_XLSX_INVALID"
+                    ) from None
+            elif cell.get("t") == "inlineStr":
+                raw_value = "".join(
+                    node.text or "" for node in cell.findall(".//m:t", _XLSX_NAMESPACE)
+                )
+            values[column] = " ".join(raw_value.split())
+        if values:
+            rows.append(values)
+    return rows
+
+
+def _excel_date(value: str) -> date:
+    try:
+        serial = float(value)
+    except ValueError:
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise MarketEventSourceError("MARKET_EVENTS_HK_CSD_DATE_INVALID") from None
+    if serial < 1 or serial > 100000:
+        raise MarketEventSourceError("MARKET_EVENTS_HK_CSD_DATE_INVALID")
+    return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
+
+
+def parse_hk_csd_schedule(
+    body: bytes,
+    *,
+    expected_year: int,
+    page_url: str,
+    now: datetime,
+    history_days: int,
+    lookahead_days: int,
+) -> tuple[ScheduledEvent, ...]:
+    rows = _xlsx_rows(body)
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if row.get("A") == "Release Date" and row.get("D") == "Series"
+        ),
+        None,
+    )
+    if header_index is None:
+        raise MarketEventSourceError("MARKET_EVENTS_HK_CSD_SCHEMA_CHANGED")
+    events: dict[str, ScheduledEvent] = {}
+    recognized_series: set[str] = set()
+    for row in rows[header_index + 1 :]:
+        series = row.get("D", "")
+        title = row.get("E", "")
+        definition = HK_CSD_DEFINITIONS.get(series)
+        variant = ""
+        if series == "Gross Domestic Product":
+            definition = HK_GDP_DEFINITION
+            if title.casefold().startswith("advance estimates"):
+                definition = replace(definition, title="香港GDP预估")
+                variant = "advance"
+            elif title.casefold().startswith("revised figures"):
+                definition = replace(definition, title="香港GDP修订")
+                variant = "revised"
+            else:
+                variant = "release"
+        if definition is None:
+            continue
+        recognized_series.add(series)
+        scheduled_date = _excel_date(row.get("A", ""))
+        scheduled_local = datetime.combine(
+            scheduled_date,
+            datetime_time(hour=16, minute=30),
+            tzinfo=SHANGHAI_TZ,
+        )
+        entity_variant = f":{variant}" if variant else ""
+        event = ScheduledEvent(
+            entity_key=(
+                f"hk-csd:{definition.key}:{scheduled_date.isoformat()}{entity_variant}"
+            ),
+            definition=definition,
+            scheduled_date=scheduled_date,
+            scheduled_at=scheduled_local.astimezone(UTC),
+            time_precision="EXACT",
+            source_key=f"hk-csd-calendar-{expected_year}",
+            source_label="香港政府统计处定期新闻稿发布日程",
+            schedule_source_url=page_url,
+            official_release_url=HK_CSD_RELEASE_URL,
+            source_timezone_label="香港时间（与北京时间相同）",
+            source_timezone="Asia/Hong_Kong",
+        )
+        if _event_in_window(
+            event,
+            now=now,
+            history_days=history_days,
+            lookahead_days=lookahead_days,
+        ):
+            events[event.entity_key] = event
+    expected_series = set(HK_CSD_DEFINITIONS) | {"Gross Domestic Product"}
+    if not expected_series.issubset(recognized_series):
+        raise MarketEventSourceError("MARKET_EVENTS_HK_CSD_SCHEMA_CHANGED")
+    return tuple(
+        sorted(events.values(), key=lambda item: (_sort_at(item), item.entity_key))
+    )
+
+
+def parse_sfc_regulatory_calendar(
+    body: str,
+    *,
+    now: datetime,
+    history_days: int,
+    lookahead_days: int,
+) -> tuple[ScheduledEvent, ...]:
+    match = re.search(
+        r"var\s+jsonString\s*=\s*(\"(?:\\.|[^\"\\])*\")\s*;",
+        body,
+        re.S,
+    )
+    if match is None:
+        raise MarketEventSourceError("MARKET_EVENTS_SFC_SCHEMA_CHANGED")
+    try:
+        encoded_json = json.loads(match.group(1))
+        rows = json.loads(encoded_json)
+    except json.JSONDecodeError:
+        raise MarketEventSourceError("MARKET_EVENTS_SFC_JSON_INVALID") from None
+    if not isinstance(rows, list) or not rows:
+        raise MarketEventSourceError("MARKET_EVENTS_SFC_SCHEMA_CHANGED")
+    events: dict[str, ScheduledEvent] = {}
+    valid_rows = 0
+    for row in rows:
+        if not isinstance(row, dict) or not all(
+            isinstance(row.get(key), str)
+            for key in ("id", "date", "type", "description")
+        ):
+            raise MarketEventSourceError("MARKET_EVENTS_SFC_SCHEMA_CHANGED")
+        valid_rows += 1
+        event_type = str(row["type"]).strip()
+        description = _strip_tags(str(row["description"]))
+        if not description:
+            continue
+        if event_type in {"諮詢", "咨询", "其他"}:
+            category = "POLICY"
+            category_label = "重要政策"
+            importance = "HIGH" if event_type in {"諮詢", "咨询"} else "MEDIUM"
+        elif event_type in {"演講辭", "演讲辞"} and any(
+            term in description for term in SFC_SIGNIFICANT_SPEECH_TERMS
+        ):
+            category = "MEETING"
+            category_label = "重要会议"
+            importance = "MEDIUM"
+        else:
+            continue
+        cross_market = any(term in description for term in SFC_POLICY_MARKETS)
+        markets = A_HK_MARKETS if cross_market else ("HK_STOCKS",)
+        try:
+            scheduled_date = date.fromisoformat(str(row["date"]))
+        except ValueError:
+            try:
+                scheduled_date = (
+                    datetime.fromisoformat(
+                        str(row.get("dateSort") or "").replace("Z", "+00:00")
+                    )
+                    .astimezone(SHANGHAI_TZ)
+                    .date()
+                )
+            except ValueError:
+                raise MarketEventSourceError("MARKET_EVENTS_SFC_DATE_INVALID") from None
+        definition = EventDefinition(
+            key=f"sfc-{category.casefold()}",
+            title=f"香港证监会：{description}",
+            category=category,
+            category_label=category_label,
+            importance=importance,
+            impact_reason=(
+                "该香港监管事件涉及内地或跨境市场安排，需同时评估A股与港股的制度和风险偏好影响。"
+                if cross_market
+                else "该香港监管事件可能影响港股市场制度、产品供给或风险偏好。"
+            ),
+            market_scopes=markets,
+            description="香港证监会监管日历记录的官方政策、咨询或重要市场活动。",
+        )
+        event = ScheduledEvent(
+            entity_key=f"sfc:{row['id']}",
+            definition=definition,
+            scheduled_date=scheduled_date,
+            scheduled_at=None,
+            time_precision="DATE",
+            source_key="sfc-regulatory-calendar",
+            source_label="香港证监会监管日历",
+            schedule_source_url=SFC_REGULATORY_CALENDAR_URL,
+            official_release_url=SFC_REGULATORY_CALENDAR_URL,
+            source_timezone_label="香港日期；具体时间未提供",
+            source_timezone="Asia/Hong_Kong",
+        )
+        if _event_in_window(
+            event,
+            now=now,
+            history_days=history_days,
+            lookahead_days=lookahead_days,
+        ):
+            events[event.entity_key] = event
+    if valid_rows == 0:
+        raise MarketEventSourceError("MARKET_EVENTS_SFC_SCHEMA_CHANGED")
+    return tuple(
+        sorted(events.values(), key=lambda item: (_sort_at(item), item.entity_key))
     )
 
 
@@ -541,8 +1239,7 @@ def parse_bea_schedule(
             month_occurrences[month_key] += 1
             event = ScheduledEvent(
                 entity_key=(
-                    f"bea:{definition.key}:{month_key}:"
-                    f"{month_occurrences[month_key]}"
+                    f"bea:{definition.key}:{month_key}:{month_occurrences[month_key]}"
                 ),
                 definition=definition,
                 scheduled_date=local.date(),
@@ -618,9 +1315,7 @@ def parse_nyfed_calendar(
                 continue
             known_titles_seen += 1
             following_end = (
-                anchors[index + 1].start()
-                if index + 1 < len(anchors)
-                else len(content)
+                anchors[index + 1].start() if index + 1 < len(anchors) else len(content)
             )
             following = content[anchor.end() : following_end]
             time_match = re.search(
@@ -629,9 +1324,7 @@ def parse_nyfed_calendar(
                 re.I,
             )
             if time_match is None:
-                raise MarketEventSourceError(
-                    "MARKET_EVENTS_NYFED_EVENT_TIME_MISSING"
-                )
+                raise MarketEventSourceError("MARKET_EVENTS_NYFED_EVENT_TIME_MISSING")
             try:
                 scheduled_local = datetime(
                     expected_year,
@@ -647,12 +1340,8 @@ def parse_nyfed_calendar(
                 ) from None
             official_url = urljoin(page_url, html.unescape(anchor.group(1)))
             if not official_url.startswith("https://"):
-                raise MarketEventSourceError(
-                    "MARKET_EVENTS_NYFED_EVENT_URL_INVALID"
-                )
-            parsed.append(
-                (scheduled_local.astimezone(UTC), definition, official_url)
-            )
+                raise MarketEventSourceError("MARKET_EVENTS_NYFED_EVENT_URL_INVALID")
+            parsed.append((scheduled_local.astimezone(UTC), definition, official_url))
     if matched_cells < 20 or known_titles_seen < 2:
         raise MarketEventSourceError("MARKET_EVENTS_NYFED_SCHEMA_CHANGED")
 
@@ -667,9 +1356,7 @@ def parse_nyfed_calendar(
         local = scheduled_at.astimezone(NEW_YORK_TZ)
         events.append(
             ScheduledEvent(
-                entity_key=(
-                    f"nyfed:{occurrence_key}:{occurrences[occurrence_key]}"
-                ),
+                entity_key=(f"nyfed:{occurrence_key}:{occurrences[occurrence_key]}"),
                 definition=definition,
                 scheduled_date=local.date(),
                 scheduled_at=scheduled_at,
@@ -843,12 +1530,8 @@ def parse_bls_indicators(payload: Any) -> tuple[dict[str, Any], ...]:
         raise MarketEventSourceError("MARKET_EVENTS_BLS_SERIES_INSUFFICIENT")
     cpi_yoy = (cpi_nsa[0]["number"] / prior_year["number"] - 1) * 100
     cpi_mom = (cpi_sa[0]["number"] / cpi_sa[1]["number"] - 1) * 100
-    core_cpi_yoy = (
-        core_cpi_nsa[0]["number"] / core_prior_year["number"] - 1
-    ) * 100
-    core_cpi_mom = (
-        core_cpi_sa[0]["number"] / core_cpi_sa[1]["number"] - 1
-    ) * 100
+    core_cpi_yoy = (core_cpi_nsa[0]["number"] / core_prior_year["number"] - 1) * 100
+    core_cpi_mom = (core_cpi_sa[0]["number"] / core_cpi_sa[1]["number"] - 1) * 100
 
     employment_period = (
         payroll[0]["year_value"],
@@ -949,9 +1632,7 @@ def _consensus_number(value: str, unit: str) -> float:
     try:
         result = float(normalized) * multiplier
     except ValueError:
-        raise MarketEventSourceError(
-            "MARKET_EVENTS_CONSENSUS_VALUE_INVALID"
-        ) from None
+        raise MarketEventSourceError("MARKET_EVENTS_CONSENSUS_VALUE_INVALID") from None
     if not (-1e9 < result < 1e9):
         raise MarketEventSourceError("MARKET_EVENTS_CONSENSUS_VALUE_INVALID")
     return result
@@ -998,9 +1679,7 @@ def parse_consensus_calendar(
                 scheduled_at=scheduled_at.astimezone(UTC),
                 forecast_value=_consensus_number(forecast_text, unit),
                 forecast_text=forecast_text,
-                previous_text=(
-                    str(item.get("previous") or "").strip() or None
-                ),
+                previous_text=(str(item.get("previous") or "").strip() or None),
                 unit=unit,
                 observed_at=observed_at,
             )
@@ -1068,13 +1747,9 @@ def _direction_payload(
             actual_values["cpi_mom"] - expectations["cpi_mom"].forecast_value
         )
         core_surprise = (
-            actual_values["core_cpi_mom"]
-            - expectations["core_cpi_mom"].forecast_value
+            actual_values["core_cpi_mom"] - expectations["core_cpi_mom"].forecast_value
         )
-        score = -(
-            0.4 * headline_surprise / 0.1
-            + 0.6 * core_surprise / 0.1
-        )
+        score = -(0.4 * headline_surprise / 0.1 + 0.6 * core_surprise / 0.1)
         formula = (
             "方向分 = -[40% × (CPI环比预期差 ÷ 0.1个百分点) + "
             "60% × (核心CPI环比预期差 ÷ 0.1个百分点)]"
@@ -1096,8 +1771,7 @@ def _direction_payload(
             - expectations["unemployment_rate"].forecast_value
         )
         labor_heat = (
-            0.65 * payroll_surprise / 50
-            + 0.35 * (-unemployment_surprise) / 0.1
+            0.65 * payroll_surprise / 50 + 0.35 * (-unemployment_surprise) / 0.1
         )
         score = -labor_heat
         formula = (
@@ -1118,7 +1792,9 @@ def _direction_payload(
     elif score <= -0.5:
         label = "偏空"
         tone = "BEARISH"
-        action = "利率压力较预期上升；优先检查多头敞口，并等待美元、利率与价格走势确认。"
+        action = (
+            "利率压力较预期上升；优先检查多头敞口，并等待美元、利率与价格走势确认。"
+        )
     else:
         label = "中性"
         tone = "NEUTRAL"
@@ -1243,10 +1919,14 @@ def nyfed_month_urls(
 def _sort_at(event: ScheduledEvent) -> datetime:
     if event.scheduled_at is not None:
         return event.scheduled_at
+    try:
+        source_timezone = ZoneInfo(event.source_timezone)
+    except (KeyError, ValueError):
+        source_timezone = NEW_YORK_TZ
     return datetime.combine(
         event.scheduled_date,
         datetime_time(hour=12),
-        tzinfo=NEW_YORK_TZ,
+        tzinfo=source_timezone,
     ).astimezone(UTC)
 
 
@@ -1269,8 +1949,8 @@ class MarketEventMonitor:
     monitor_id = MONITOR_ID
     display_name = "市场关键事件日历"
     description = (
-        "跟踪会影响加密资产与股票定价的宏观发布和央行决议，"
-        "突出当前交易需要提前准备的事件。"
+        "跟踪会影响美股、A股、港股与加密资产定价的官方宏观发布、"
+        "政策和重要会议，突出当前交易需要提前准备的事件。"
     )
     projection_kind = "market_events"
     default_enabled = True
@@ -1293,6 +1973,7 @@ class MarketEventMonitor:
         )
         self._now = now
         self._schedule_cache: dict[str, tuple[ScheduledEvent, ...]] = {}
+        self._nbs_schedule_urls: dict[int, str] = {}
         self._schedule_refreshed_at: datetime | None = None
         self._consensus_cache: dict[
             tuple[str, str, datetime],
@@ -1349,18 +2030,21 @@ class MarketEventMonitor:
                         FilterChoice("EARNINGS", "企业盈利"),
                         FilterChoice("SENTIMENT", "信心"),
                         FilterChoice("HOUSING", "房地产"),
+                        FilterChoice("POLICY", "重要政策"),
+                        FilterChoice("MEETING", "重要会议"),
                     ),
                 ),
                 ViewFilter(
                     key="affected_market",
                     label="需考虑市场",
-                    default="*",
+                    default=("US_STOCKS", "A_STOCKS", "HK_STOCKS", "CRYPTO"),
                     choices=(
-                        FilterChoice("*", "全部"),
-                        FilterChoice("CRYPTO", "加密资产"),
                         FilterChoice("US_STOCKS", "美股"),
-                        FilterChoice("A_HK_STOCKS", "A股 / 港股"),
+                        FilterChoice("A_STOCKS", "A股"),
+                        FilterChoice("HK_STOCKS", "港股"),
+                        FilterChoice("CRYPTO", "加密资产"),
                     ),
+                    multiple=True,
                 ),
             ),
             columns=(
@@ -1478,7 +2162,9 @@ class MarketEventMonitor:
                     )
                 )
             except (BuybackSourceError, MarketEventSourceError) as error:
-                issues.append(CollectionIssue("bea-schedule", _source_error_code("BEA", error)))
+                issues.append(
+                    CollectionIssue("bea-schedule", _source_error_code("BEA", error))
+                )
 
             active_nyfed_scopes: set[str] = set()
             for year, month, url in nyfed_month_urls(
@@ -1510,9 +2196,14 @@ class MarketEventMonitor:
                         )
                     )
                 except (BuybackSourceError, MarketEventSourceError) as error:
-                    issues.append(CollectionIssue(scope, _source_error_code("NYFED", error)))
+                    issues.append(
+                        CollectionIssue(scope, _source_error_code("NYFED", error))
+                    )
             for scope in tuple(self._schedule_cache):
-                if scope.startswith("nyfed-calendar:") and scope not in active_nyfed_scopes:
+                if (
+                    scope.startswith("nyfed-calendar:")
+                    and scope not in active_nyfed_scopes
+                ):
                     del self._schedule_cache[scope]
 
             try:
@@ -1537,7 +2228,176 @@ class MarketEventMonitor:
                     )
                 )
             except (BuybackSourceError, MarketEventSourceError) as error:
-                issues.append(CollectionIssue("fomc-calendar", _source_error_code("FOMC", error)))
+                issues.append(
+                    CollectionIssue("fomc-calendar", _source_error_code("FOMC", error))
+                )
+
+            local_start = now.astimezone(SHANGHAI_TZ).date() - timedelta(
+                days=self.settings.history_days
+            )
+            local_end = now.astimezone(SHANGHAI_TZ).date() + timedelta(
+                days=self.settings.lookahead_days
+            )
+            schedule_years = range(local_start.year, local_end.year + 1)
+            active_nbs_scopes: set[str] = set()
+            active_hk_csd_scopes: set[str] = set()
+            for year in schedule_years:
+                nbs_scope = f"nbs-schedule:{year}"
+                active_nbs_scopes.add(nbs_scope)
+                try:
+                    schedule_url = self._nbs_schedule_urls.get(year)
+                    if schedule_url is None:
+                        for index_url in nbs_notice_index_urls():
+                            index_response, index_body = self._get_text(
+                                index_url,
+                                max_bytes=512 * 1024,
+                            )
+                            schedule_url = discover_nbs_schedule_url(
+                                index_body,
+                                year=year,
+                                page_url=index_url,
+                            )
+                            if schedule_url is not None:
+                                self._nbs_schedule_urls[year] = schedule_url
+                                artifacts.append(
+                                    _artifact(
+                                        f"nbs-schedule-index-{year}",
+                                        "国家统计局通知公告",
+                                        index_response,
+                                        body_text=index_body,
+                                        record_count=1,
+                                        schema_contract="nbs-notice-index:v1:annual-schedule-anchor",
+                                    )
+                                )
+                                break
+                    if schedule_url is None:
+                        raise MarketEventSourceError(
+                            "MARKET_EVENTS_NBS_SCHEDULE_NOT_FOUND"
+                        )
+                    response, body = self._get_text(
+                        schedule_url,
+                        max_bytes=1024 * 1024,
+                    )
+                    parsed = parse_nbs_schedule(
+                        body,
+                        expected_year=year,
+                        page_url=schedule_url,
+                        now=now,
+                        history_days=self.settings.history_days,
+                        lookahead_days=self.settings.lookahead_days,
+                    )
+                    self._schedule_cache[nbs_scope] = tuple(
+                        replace(item, source_checked_at=now) for item in parsed
+                    )
+                    artifacts.append(
+                        _artifact(
+                            f"nbs-schedule-{year}",
+                            "国家统计局主要统计信息发布日程",
+                            response,
+                            body_text=body,
+                            record_count=len(parsed),
+                            schema_contract="nbs-schedule:v1:year-month-release-date-time",
+                        )
+                    )
+                except (BuybackSourceError, MarketEventSourceError) as error:
+                    issues.append(
+                        CollectionIssue(nbs_scope, _source_error_code("NBS", error))
+                    )
+
+                hk_scope = f"hk-csd-calendar:{year}"
+                active_hk_csd_scopes.add(hk_scope)
+                hk_url = HK_CSD_SCHEDULE_URL_TEMPLATE.format(year=year)
+                try:
+                    response = self.client.request(
+                        hk_url,
+                        max_bytes=1024 * 1024,
+                        attempts=2,
+                    )
+                    parsed = parse_hk_csd_schedule(
+                        response.body,
+                        expected_year=year,
+                        page_url=hk_url,
+                        now=now,
+                        history_days=self.settings.history_days,
+                        lookahead_days=self.settings.lookahead_days,
+                    )
+                    self._schedule_cache[hk_scope] = tuple(
+                        replace(item, source_checked_at=now) for item in parsed
+                    )
+                    normalized_body = json.dumps(
+                        [
+                            {
+                                "event_key": item.entity_key,
+                                "scheduled_date": item.scheduled_date.isoformat(),
+                                "scheduled_at": (
+                                    iso_utc(item.scheduled_at)
+                                    if item.scheduled_at is not None
+                                    else None
+                                ),
+                                "title": item.definition.title,
+                            }
+                            for item in parsed
+                        ],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    artifacts.append(
+                        _artifact(
+                            f"hk-csd-calendar-{year}",
+                            "香港政府统计处定期新闻稿发布日程",
+                            response,
+                            body_text=normalized_body,
+                            record_count=len(parsed),
+                            schema_contract="hk-csd-xlsx:v1:release-date-series-title",
+                        )
+                    )
+                except (BuybackSourceError, MarketEventSourceError) as error:
+                    issues.append(
+                        CollectionIssue(
+                            hk_scope,
+                            _source_error_code("HK_CSD", error),
+                        )
+                    )
+            for scope in tuple(self._schedule_cache):
+                if scope.startswith("nbs-schedule:") and scope not in active_nbs_scopes:
+                    del self._schedule_cache[scope]
+                if (
+                    scope.startswith("hk-csd-calendar:")
+                    and scope not in active_hk_csd_scopes
+                ):
+                    del self._schedule_cache[scope]
+
+            try:
+                response, body = self._get_text(
+                    SFC_REGULATORY_CALENDAR_URL,
+                    max_bytes=512 * 1024,
+                )
+                parsed = parse_sfc_regulatory_calendar(
+                    body,
+                    now=now,
+                    history_days=self.settings.history_days,
+                    lookahead_days=self.settings.lookahead_days,
+                )
+                self._schedule_cache["sfc-regulatory-calendar"] = tuple(
+                    replace(item, source_checked_at=now) for item in parsed
+                )
+                artifacts.append(
+                    _artifact(
+                        "sfc-regulatory-calendar",
+                        "香港证监会监管日历",
+                        response,
+                        body_text=body,
+                        record_count=len(parsed),
+                        schema_contract="sfc-regulatory-calendar:v1:id-date-type-description",
+                    )
+                )
+            except (BuybackSourceError, MarketEventSourceError) as error:
+                issues.append(
+                    CollectionIssue(
+                        "sfc-regulatory-calendar",
+                        _source_error_code("SFC", error),
+                    )
+                )
 
         events = {
             event.entity_key: event
@@ -1550,7 +2410,9 @@ class MarketEventMonitor:
                 lookahead_days=self.settings.lookahead_days,
             )
         }
-        return tuple(sorted(events.values(), key=lambda item: (_sort_at(item), item.entity_key)))
+        return tuple(
+            sorted(events.values(), key=lambda item: (_sort_at(item), item.entity_key))
+        )
 
     def _consensus_observations(
         self,
@@ -1695,7 +2557,9 @@ class MarketEventMonitor:
                 )
             )
         except (BuybackSourceError, MarketEventSourceError) as error:
-            issues.append(CollectionIssue("bls-macro-data", _source_error_code("BLS", error)))
+            issues.append(
+                CollectionIssue("bls-macro-data", _source_error_code("BLS", error))
+            )
         return self._indicator_cache
 
     @staticmethod
@@ -1743,9 +2607,7 @@ class MarketEventMonitor:
         events = self._schedule_events(now, issues, artifacts)
         consensus = self._consensus_observations(now, issues, artifacts)
         indicator_payloads = self._official_indicators(now, events, issues, artifacts)
-        indicators = {
-            str(item["indicator_key"]): item for item in indicator_payloads
-        }
+        indicators = {str(item["indicator_key"]): item for item in indicator_payloads}
         previous_samples = {
             sample.entity_key: sample
             for sample in self.store.latest_samples_by_entity(
@@ -1763,7 +2625,9 @@ class MarketEventMonitor:
             change_count = 0
             last_changed_at = None
             if previous is not None:
-                previous_schedule = str(previous.payload.get("schedule_label") or "") or None
+                previous_schedule = (
+                    str(previous.payload.get("schedule_label") or "") or None
+                )
                 change_count = int(previous.payload.get("schedule_change_count") or 0)
                 last_changed_at = previous.payload.get("last_schedule_changed_at")
             schedule_label = _schedule_label(event)
@@ -1779,7 +2643,9 @@ class MarketEventMonitor:
                         continue
                     observed_text = str(item.get("observed_at") or "")
                     try:
-                        observed_at = datetime.fromisoformat(observed_text.replace("Z", "+00:00"))
+                        observed_at = datetime.fromisoformat(
+                            observed_text.replace("Z", "+00:00")
+                        )
                     except ValueError:
                         continue
                     if event.scheduled_at is None or observed_at > event.scheduled_at:
@@ -1793,7 +2659,11 @@ class MarketEventMonitor:
                                 scheduled_at=event.scheduled_at,
                                 forecast_value=float(item["forecast_value"]),
                                 forecast_text=str(item["forecast_text"]),
-                                previous_text=(str(item["previous_text"]) if item.get("previous_text") else None),
+                                previous_text=(
+                                    str(item["previous_text"])
+                                    if item.get("previous_text")
+                                    else None
+                                ),
                                 unit=str(item["unit"]),
                                 observed_at=observed_at.astimezone(UTC),
                             )
@@ -1817,8 +2687,12 @@ class MarketEventMonitor:
             ]
             expected_period = _expected_release_period(event)
             indicator = indicators.get(event.definition.indicator_key or "")
-            official_actual = indicator if self._indicator_matches_event(event, indicator) else None
-            actual_values = dict(official_actual.get("values") or {}) if official_actual else {}
+            official_actual = (
+                indicator if self._indicator_matches_event(event, indicator) else None
+            )
+            actual_values = (
+                dict(official_actual.get("values") or {}) if official_actual else {}
+            )
             actual_definitions = (
                 (
                     ("cpi_mom", "CPI环比", "%"),
@@ -1869,7 +2743,9 @@ class MarketEventMonitor:
                 _direction_payload(
                     event,
                     expectations=expectation_map,
-                    actual_values={key: float(value) for key, value in actual_values.items()},
+                    actual_values={
+                        key: float(value) for key, value in actual_values.items()
+                    },
                 )
                 if official_actual is not None
                 else None
@@ -1884,22 +2760,31 @@ class MarketEventMonitor:
                 release_state = "AWAITING_OFFICIAL"
             else:
                 release_state = "OCCURRED"
-            expectation_summary = " · ".join(
-                f"{item['label']} {item['display']}" for item in expectations[:2]
-            ) or None
-            actual_summary = " · ".join(
-                f"{item['label']} {item['display']}" for item in actuals[:2]
-            ) or None
-            surprise_summary = " · ".join(
-                f"{item['label']} {item['display']}" for item in surprises[:2]
-            ) or None
+            expectation_summary = (
+                " · ".join(
+                    f"{item['label']} {item['display']}" for item in expectations[:2]
+                )
+                or None
+            )
+            actual_summary = (
+                " · ".join(f"{item['label']} {item['display']}" for item in actuals[:2])
+                or None
+            )
+            surprise_summary = (
+                " · ".join(
+                    f"{item['label']} {item['display']}" for item in surprises[:2]
+                )
+                or None
+            )
             release_summary = (
                 " · ".join(
                     value
                     for value in (
                         actual_summary,
                         f"预期差 {surprise_summary}" if surprise_summary else None,
-                        f"{direction['scope']} {direction['label']}" if direction else None,
+                        f"{direction['scope']} {direction['label']}"
+                        if direction
+                        else None,
                     )
                     if value
                 )
@@ -1929,7 +2814,9 @@ class MarketEventMonitor:
                 "event_description": event.definition.description,
                 "interpretation": _interpretation_payload(event),
                 "market_scopes": list(event.definition.market_scopes),
-                "scheduled_at": iso_utc(event.scheduled_at) if event.scheduled_at is not None else None,
+                "scheduled_at": iso_utc(event.scheduled_at)
+                if event.scheduled_at is not None
+                else None,
                 "scheduled_date": event.scheduled_date.isoformat(),
                 "scheduled_sort_at": iso_utc(sort_at),
                 "schedule_label": schedule_label,
@@ -1939,8 +2826,13 @@ class MarketEventMonitor:
                 "schedule_source_url": event.schedule_source_url,
                 "official_release_url": event.official_release_url,
                 "source_timezone_label": event.source_timezone_label,
-                "source_updated_at": iso_utc(event.source_updated_at) if event.source_updated_at is not None else None,
-                "source_checked_at": iso_utc(max(checked_times)) if checked_times else None,
+                "source_timezone": event.source_timezone,
+                "source_updated_at": iso_utc(event.source_updated_at)
+                if event.source_updated_at is not None
+                else None,
+                "source_checked_at": iso_utc(max(checked_times))
+                if checked_times
+                else None,
                 "schedule_change_count": change_count,
                 "last_schedule_changed_at": last_changed_at,
                 "previous_schedule_label": (
@@ -1964,17 +2856,27 @@ class MarketEventMonitor:
                 }[release_state],
                 "expectations": expectations,
                 "expectation_summary": expectation_summary,
-                "consensus_source_label": "Forex Factory市场一致预期" if expectations else None,
-                "consensus_source_url": CONSENSUS_SOURCE_PAGE_URL if expectations else None,
+                "consensus_source_label": "Forex Factory市场一致预期"
+                if expectations
+                else None,
+                "consensus_source_url": CONSENSUS_SOURCE_PAGE_URL
+                if expectations
+                else None,
                 "consensus_observed_at": max(
                     (iso_utc(item.observed_at) for item in matched_consensus),
                     default=None,
                 ),
                 "actuals": actuals,
                 "actual_summary": actual_summary,
-                "actual_source_label": official_actual.get("source_label") if official_actual else None,
-                "actual_source_url": official_actual.get("source_url") if official_actual else None,
-                "actual_checked_at": official_actual.get("source_checked_at") if official_actual else None,
+                "actual_source_label": official_actual.get("source_label")
+                if official_actual
+                else None,
+                "actual_source_url": official_actual.get("source_url")
+                if official_actual
+                else None,
+                "actual_checked_at": official_actual.get("source_checked_at")
+                if official_actual
+                else None,
                 "surprises": surprises,
                 "surprise_summary": surprise_summary,
                 "direction": direction,
@@ -1983,7 +2885,9 @@ class MarketEventMonitor:
                 "direction_score": direction.get("score") if direction else None,
                 "release_summary": release_summary,
                 "latest_result": indicator.get("latest_result") if indicator else None,
-                "latest_result_period": indicator.get("period_label") if indicator else None,
+                "latest_result_period": indicator.get("period_label")
+                if indicator
+                else None,
             }
             samples.append(
                 MetricSample(
@@ -2038,9 +2942,14 @@ __all__ = [
     "MarketEventSettings",
     "MarketEventSourceError",
     "ScheduledEvent",
+    "discover_nbs_schedule_url",
+    "nbs_notice_index_urls",
     "nyfed_month_urls",
     "parse_bea_schedule",
     "parse_bls_indicators",
+    "parse_hk_csd_schedule",
+    "parse_nbs_schedule",
     "parse_fomc_calendar",
     "parse_nyfed_calendar",
+    "parse_sfc_regulatory_calendar",
 ]

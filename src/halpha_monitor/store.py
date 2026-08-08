@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -26,8 +27,11 @@ from halpha_monitor.contracts import (
 
 
 RunStatus = Literal["RUNNING", "SUCCESS", "PARTIAL", "FAILED"]
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MAX_PROJECTION_SNAPSHOT_BYTES = 4 * 1024 * 1024
+MAX_ISSUE_CONTEXT_BYTES = 2 * 1024
+MAX_ISSUE_CONTEXT_FIELDS = 16
+MAX_ISSUE_CONTEXT_STRING_LENGTH = 512
 MAX_BUYBACK_DOCUMENT_BYTES = 20 * 1024 * 1024
 DEFAULT_BUYBACK_RETENTION_DAYS = 1095
 DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024 * 1024
@@ -67,6 +71,41 @@ def parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
 
 
+def _issue_context_json(
+    context: dict[str, str | int | float | bool | None] | None,
+) -> str:
+    if context is None:
+        return "{}"
+    if not isinstance(context, dict) or len(context) > MAX_ISSUE_CONTEXT_FIELDS:
+        raise RuntimeError("MONITOR_ISSUE_CONTEXT_INVALID")
+    normalized: dict[str, str | int | float | bool | None] = {}
+    for key, value in context.items():
+        if not isinstance(key, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key) is None:
+            raise RuntimeError("MONITOR_ISSUE_CONTEXT_KEY_INVALID")
+        if isinstance(value, str):
+            if (
+                len(value) > MAX_ISSUE_CONTEXT_STRING_LENGTH
+                or "\n" in value
+                or "\r" in value
+            ):
+                raise RuntimeError("MONITOR_ISSUE_CONTEXT_VALUE_INVALID")
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise RuntimeError("MONITOR_ISSUE_CONTEXT_VALUE_INVALID")
+        elif value is not None and not isinstance(value, (bool, int)):
+            raise RuntimeError("MONITOR_ISSUE_CONTEXT_VALUE_INVALID")
+        normalized[key] = value
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > MAX_ISSUE_CONTEXT_BYTES:
+        raise RuntimeError("MONITOR_ISSUE_CONTEXT_TOO_LARGE")
+    return encoded
+
+
 @dataclass(frozen=True)
 class StoredRun:
     run_id: int
@@ -99,6 +138,7 @@ class StoredIssue:
     occurred_at: datetime
     scope: str
     reason_code: str
+    context: dict[str, str | int | float | bool | None]
 
 
 @dataclass(frozen=True)
@@ -401,11 +441,14 @@ class SQLiteMonitorStore:
                     monitor_id TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
                     scope TEXT NOT NULL,
-                    reason_code TEXT NOT NULL
+                    reason_code TEXT NOT NULL,
+                    context_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE INDEX IF NOT EXISTS monitor_issue_latest_idx
                     ON monitor_issue (monitor_id, issue_id DESC);
+                CREATE INDEX IF NOT EXISTS monitor_issue_run_idx
+                    ON monitor_issue (run_id, issue_id);
 
                 CREATE TABLE IF NOT EXISTS monitor_artifact (
                     artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -717,6 +760,15 @@ class SQLiteMonitorStore:
                     );
                 """
             )
+            issue_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(monitor_issue)")
+            }
+            if "context_json" not in issue_columns:
+                connection.execute(
+                    "ALTER TABLE monitor_issue "
+                    "ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'"
+                )
             interrupted = connection.execute(
                 "SELECT run_id, monitor_id FROM monitor_run WHERE status = 'RUNNING'"
             ).fetchall()
@@ -1658,8 +1710,9 @@ class SQLiteMonitorStore:
                 connection.execute(
                     """
                     INSERT INTO monitor_issue (
-                        run_id, monitor_id, occurred_at, scope, reason_code
-                    ) VALUES (?, ?, ?, ?, ?)
+                        run_id, monitor_id, occurred_at, scope, reason_code,
+                        context_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -1667,6 +1720,7 @@ class SQLiteMonitorStore:
                         completed_text,
                         issue.scope,
                         issue.reason_code,
+                        _issue_context_json(issue.context),
                     ),
                 )
             error_code = batch.issues[0].reason_code if batch.issues else None
@@ -1919,6 +1973,7 @@ class SQLiteMonitorStore:
         reason_code: str,
         *,
         completed_at: datetime | None = None,
+        context: dict[str, str | int | float | bool | None] | None = None,
     ) -> None:
         completed_text = iso_utc(completed_at or utc_now())
         with self._connect() as connection:
@@ -1933,10 +1988,17 @@ class SQLiteMonitorStore:
             connection.execute(
                 """
                 INSERT INTO monitor_issue (
-                    run_id, monitor_id, occurred_at, scope, reason_code
-                ) VALUES (?, ?, ?, 'monitor', ?)
+                    run_id, monitor_id, occurred_at, scope, reason_code,
+                    context_json
+                ) VALUES (?, ?, ?, 'monitor', ?, ?)
                 """,
-                (run_id, monitor_id, completed_text, reason_code),
+                (
+                    run_id,
+                    monitor_id,
+                    completed_text,
+                    reason_code,
+                    _issue_context_json(context),
+                ),
             )
             connection.execute(
                 """
@@ -1987,6 +2049,40 @@ class SQLiteMonitorStore:
                        sample_count, error_code
                 FROM monitor_run
                 WHERE monitor_id = ? AND status IN ('SUCCESS', 'PARTIAL')
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (monitor_id,),
+            ).fetchone()
+        return self._run_from_row(row) if row is not None else None
+
+    def latest_finished_run(self, monitor_id: str) -> StoredRun | None:
+        """Return the latest terminal run, including collection failures."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, monitor_id, started_at, completed_at, status,
+                       sample_count, error_code
+                FROM monitor_run
+                WHERE monitor_id = ? AND status != 'RUNNING'
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (monitor_id,),
+            ).fetchone()
+        return self._run_from_row(row) if row is not None else None
+
+    def latest_successful_run(self, monitor_id: str) -> StoredRun | None:
+        """Return the latest issue-free run for diagnostic recovery state."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, monitor_id, started_at, completed_at, status,
+                       sample_count, error_code
+                FROM monitor_run
+                WHERE monitor_id = ? AND status = 'SUCCESS'
                 ORDER BY run_id DESC
                 LIMIT 1
                 """,
@@ -2523,7 +2619,8 @@ class SQLiteMonitorStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT issue_id, run_id, monitor_id, occurred_at, scope, reason_code
+                SELECT issue_id, run_id, monitor_id, occurred_at, scope,
+                       reason_code, context_json
                 FROM monitor_issue
                 WHERE monitor_id = ?
                 ORDER BY issue_id DESC
@@ -2539,7 +2636,8 @@ class SQLiteMonitorStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT issue_id, run_id, monitor_id, occurred_at, scope, reason_code
+                SELECT issue_id, run_id, monitor_id, occurred_at, scope,
+                       reason_code, context_json
                 FROM monitor_issue
                 WHERE run_id = ?
                 ORDER BY issue_id
@@ -3736,6 +3834,14 @@ class SQLiteMonitorStore:
 
     @staticmethod
     def _issue_from_row(row: sqlite3.Row) -> StoredIssue:
+        try:
+            context = json.loads(str(row["context_json"]))
+        except (json.JSONDecodeError, TypeError):
+            context = {}
+        try:
+            context = json.loads(_issue_context_json(context))
+        except RuntimeError:
+            context = {}
         return StoredIssue(
             issue_id=int(row["issue_id"]),
             run_id=int(row["run_id"]),
@@ -3743,6 +3849,7 @@ class SQLiteMonitorStore:
             occurred_at=parse_utc(str(row["occurred_at"])),
             scope=str(row["scope"]),
             reason_code=str(row["reason_code"]),
+            context=context,
         )
 
     @staticmethod

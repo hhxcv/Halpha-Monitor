@@ -101,6 +101,12 @@ def test_one_monitor_failure_does_not_block_another(tmp_path: Path) -> None:
     assert healthy is not None and healthy.status == "SUCCESS"
     assert failed is not None and failed.status == "FAILED"
     assert failed.error_code == "COLLECTION_FAILED_RUNTIMEERROR"
+    issue = store.issues_for_run(failed.run_id)[0]
+    assert issue.context["exception_type"] == "RuntimeError"
+    assert str(issue.context["origin_module"]).endswith("test_service")
+    assert issue.context["origin_function"] == "collect"
+    assert int(issue.context["origin_line"]) > 0
+    assert "fixture failure" not in str(issue.context)
 
 
 def test_request_run_wakes_only_requested_monitor(tmp_path: Path) -> None:

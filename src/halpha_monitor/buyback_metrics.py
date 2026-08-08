@@ -931,15 +931,48 @@ def _fundamental_features(
 
 
 def _is_recent_reference(record: dict[str, Any], *, now: datetime) -> bool:
-    raw = record.get("updated_at") or record.get("trade_date")
-    parsed = _source_datetime(raw)
-    if parsed is None and record.get("trade_date"):
-        try:
-            parsed_date = date.fromisoformat(str(record["trade_date"])[:10])
-        except ValueError:
-            return False
-        parsed = datetime.combine(parsed_date, datetime.min.time(), tzinfo=UTC)
+    parsed = _source_datetime(record.get("updated_at") or record.get("trade_date"))
     return parsed is not None and now - timedelta(days=7) <= parsed <= now + timedelta(minutes=5)
+
+
+def buyback_projection_valid_until(
+    source_payloads: dict[str, dict[str, Any]],
+    *,
+    now: datetime,
+) -> datetime:
+    """Return the next instant at which a time-derived projection can change."""
+
+    if now.utcoffset() is None:
+        raise ValueError("BUYBACK_PROJECTION_NOW_MUST_BE_TIMEZONE_AWARE")
+    current = now.astimezone(UTC)
+    next_midnight = datetime.combine(
+        current.date() + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=UTC,
+    )
+    transitions = [next_midnight]
+    reference_groups = (
+        source_payloads.get("a-share-buyback-reference", {}).get("programmes"),
+        source_payloads.get("hk-market-reference", {}).get("quotes"),
+    )
+    for records in reference_groups:
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            observed_at = _source_datetime(
+                record.get("updated_at") or record.get("trade_date")
+            )
+            if observed_at is None:
+                continue
+            becomes_current_at = observed_at - timedelta(minutes=5)
+            expires_at = observed_at + timedelta(days=7, microseconds=1)
+            if current < becomes_current_at:
+                transitions.append(becomes_current_at)
+            elif current < expires_at:
+                transitions.append(expires_at)
+    return min(transitions)
 
 
 def _enrich_a_share_row(
@@ -1637,6 +1670,7 @@ def project_buyback_metrics(
 
 __all__ = [
     "BuybackMetricError",
+    "buyback_projection_valid_until",
     "match_a_share_program",
     "parse_a_share_reference",
     "parse_hk_market_reference",

@@ -95,6 +95,7 @@ def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> 
         "binance-btc-relationship",
         "a-hk-buyback",
         "market-event-calendar",
+        "stock-event-calendar",
     )
     (
         c2c,
@@ -103,6 +104,7 @@ def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> 
         btc_relationship,
         buyback,
         market_events,
+        stock_events,
     ) = registry.all()
     assert c2c.settings.assets == ("USDT", "BTC")
     assert c2c.settings.target_fiat == Decimal("2500")
@@ -134,6 +136,12 @@ def test_builtin_monitors_share_one_explicit_cli_integration_point(tmp_path) -> 
     assert market_events.settings.lookahead_days == 60
     assert market_events.interval_seconds == 21600
     assert market_events.jitter_seconds == 900
+    assert stock_events.default_enabled is True
+    assert stock_events.settings.history_days == 30
+    assert stock_events.settings.lookahead_days == 60
+    assert stock_events.settings.auto_limit == 80
+    assert stock_events.interval_seconds == 3600
+    assert stock_events.jitter_seconds == 300
     assert args.buyback_retention_days == 1095
     assert args.buyback_evidence_max_mib == 2048
     assert args.btc_structure_retention_days == 1825

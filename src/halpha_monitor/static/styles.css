@@ -15,6 +15,8 @@
   --success-soft: #eaf8f2;
   --idle: #356a8a;
   --idle-soft: #dbeaf2;
+  --disabled: #687386;
+  --disabled-soft: #e4e7ec;
   --warning: #a66300;
   --warning-soft: #fff5db;
   --danger: #b42318;
@@ -109,8 +111,7 @@ textarea:focus-visible,
 }
 
 .status-text::before,
-.monitor-state::before,
-.monitor-link .monitor-link-status::before {
+.monitor-state::before {
   content: "";
   display: inline-block;
   width: 7px;
@@ -122,12 +123,10 @@ textarea:focus-visible,
 }
 
 [data-status="HEALTHY"]::before,
-[data-status="ACTIVE"]::before,
-.monitor-link .monitor-link-status[data-status="ACTIVE"]::before {
+[data-status="ACTIVE"]::before {
   background: var(--success);
 }
-[data-status="IDLE"]::before,
-.monitor-link .monitor-link-status[data-status="IDLE"]::before {
+[data-status="IDLE"]::before {
   background: var(--idle);
   box-shadow: 0 0 0 2px var(--idle-soft);
 }
@@ -204,23 +203,47 @@ textarea:focus-visible,
 }
 
 .monitor-link {
+  --monitor-status-color: transparent;
   width: 100%;
   min-height: 58px;
   padding: 10px 14px 10px 18px;
   border: 0;
   border-left: 3px solid transparent;
   background: transparent;
+  box-shadow: inset -5px 0 0 var(--monitor-status-color);
   color: var(--text);
   text-align: left;
   cursor: pointer;
+  transition: background-color 120ms ease, box-shadow 120ms ease;
 }
 
 .monitor-link:hover { background: #e9ecf2; }
+
+.monitor-link[data-status="ACTIVE"] {
+  --monitor-status-color: var(--success);
+  background: var(--success-soft);
+}
+
+.monitor-link[data-status="IDLE"] {
+  --monitor-status-color: var(--idle);
+  background: var(--idle-soft);
+}
+
+.monitor-link[data-status="DISABLED"] {
+  --monitor-status-color: var(--disabled);
+  background: var(--disabled-soft);
+}
+
+.monitor-link[data-status="ACTIVE"]:hover { background: #dff2e9; }
+.monitor-link[data-status="IDLE"]:hover { background: #cee2ee; }
+.monitor-link[data-status="DISABLED"]:hover { background: #d8dde5; }
 
 .monitor-link[aria-current="page"] {
   border-left-color: var(--accent);
   background: var(--accent-soft);
 }
+
+.monitor-link[aria-current="page"]:hover { background: #ffed9b; }
 
 .monitor-link-name {
   display: block;
@@ -242,6 +265,11 @@ textarea:focus-visible,
 }
 .monitor-link-status[data-status="IDLE"] {
   color: var(--idle);
+  font-weight: 600;
+}
+
+.monitor-link-status[data-status="DISABLED"] {
+  color: var(--disabled);
   font-weight: 600;
 }
 
@@ -270,6 +298,8 @@ textarea:focus-visible,
   .app-shell[data-rail-collapsed="true"] .monitor-link {
     min-height: 56px;
     padding: 9px 4px;
+    display: grid;
+    place-items: center;
     text-align: center;
   }
 
@@ -287,18 +317,7 @@ textarea:focus-visible,
   }
 
   .app-shell[data-rail-collapsed="true"] .monitor-link-status {
-    height: 9px;
-    margin-top: 6px;
-    font-size: 0;
-    line-height: 1;
-    text-align: center;
-  }
-
-  .app-shell[data-rail-collapsed="true"] .monitor-link-status::before {
-    width: 8px;
-    height: 8px;
-    margin-right: 0;
-    vertical-align: 0;
+    display: none;
   }
 }
 

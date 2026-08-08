@@ -218,6 +218,14 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert 'ui.quoteHorizontalScrollbar.addEventListener("scroll"' in script.text
     assert 'ui.quoteScroll.addEventListener("wheel"' in script.text
     assert "usesPageLengthTable" in script.text
+    assert "button.dataset.status = monitor.operational_status.tone" in script.text
+    assert '.monitor-link[data-status="ACTIVE"]' in style.text
+    assert '.monitor-link[data-status="IDLE"]' in style.text
+    assert '.monitor-link[data-status="DISABLED"]' in style.text
+    assert "box-shadow: inset -5px 0 0 var(--monitor-status-color)" in style.text
+    assert ".monitor-link .monitor-link-status::before" not in style.text
+    assert 'app-shell[data-rail-collapsed="true"] .monitor-link-status' in style.text
+    assert "place-items: center" in style.text
     assert ".table-pagination" in style.text
     assert ".back-to-top" in style.text
     assert "BUYBACK_TABLE_PAGE_SIZE = 50" in script.text

@@ -6,6 +6,7 @@ not claim a calibrated probability, causal prediction, or trading instruction.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 from dataclasses import dataclass
@@ -48,19 +49,35 @@ USER_AGENT = "Halpha-Monitor/0.1 public-market-read-only"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 KLINE_INTERVAL_MINUTES = 5
 DAILY_INTERVAL_SECONDS = 86_400
-DAILY_HISTORY_DAYS = 220
+DAILY_HISTORY_DAYS = 730
 DAILY_MINIMUM_DAYS = 90
 DAILY_CACHE_OVERLAP_DAYS = 3
+DAILY_REQUEST_LIMIT = 500
+DAILY_MAX_REQUEST_PAGES = 3
+DAILY_MEMORY_CACHE_MAX_ENTRIES = 500
 PUMP_BASELINE_DAYS = 7
 PUMP_DAILY_TRIGGER_PERCENT = 15.0
 PUMP_THREE_DAY_TRIGGER_PERCENT = 25.0
 PUMP_SEVEN_DAY_TRIGGER_PERCENT = 25.0
 PUMP_EPISODE_RESET_DRAWDOWN_PERCENT = -18.0
-PRICE_POSITION_SNAPSHOT_KEY = "price-position-v1"
+PUMP_HISTORY_CACHE_SCHEMA_VERSION = 1
+PUMP_HISTORY_RULE_VERSION = "pump-episodes-v2"
+PUMP_EPISODE_SEED_LOOKBACK_DAYS = 60
+PUMP_EPISODE_MIN_ADVANCE_PERCENT = 30.0
+PUMP_EPISODE_TRIGGER_WINDOWS = (
+    (1, 15.0),
+    (3, 25.0),
+    (7, 25.0),
+    (14, 30.0),
+    (30, 50.0),
+)
+PUMP_EPISODE_EXIT_DRAWDOWN_PERCENT = -18.0
+PUMP_EPISODE_EXIT_CONFIRMATION_DAYS = 3
+PRICE_POSITION_SNAPSHOT_KEY = "price-position-v2"
 MARKET_SCOPE = "USDM_PERPETUAL"
 BASELINE_EVALUATION_SOURCE = "BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES"
-EVALUATION_SOURCE = "BINANCE_USDM_PRICE_CONTEXT_V1_CLOSED_5M_KLINES"
-PRICE_CONTEXT_MODEL_VERSION = "price-context-v1"
+EVALUATION_SOURCE = "BINANCE_USDM_PRICE_CONTEXT_V2_CLOSED_5M_KLINES"
+PRICE_CONTEXT_MODEL_VERSION = "price-context-v2"
 EVALUATION_HORIZONS_MINUTES = (15, 60, 240)
 EVALUATION_REPEAT_AFTER = timedelta(hours=4)
 EVALUATION_GRACE = timedelta(hours=1)
@@ -349,6 +366,62 @@ class DailySeriesResult:
     @property
     def current(self) -> bool:
         return self.status in {"FETCHED", "CACHE_CURRENT"}
+
+
+@dataclass(frozen=True)
+class _DailyMemoryCacheRecord:
+    candles: tuple[DailyContractCandle, ...]
+    acquired_at: datetime | None
+    requested_start_at: datetime | None
+
+
+@dataclass(frozen=True)
+class PumpEpisode:
+    start_at: datetime
+    trigger_at: datetime
+    peak_at: datetime
+    peak_price: float
+    completed_at: datetime
+    advance_percent: float
+    confirmed_drawdown_percent: float
+
+
+@dataclass(frozen=True)
+class PumpDetectorState:
+    search_start_at: datetime
+    active_start_at: datetime | None = None
+    active_start_price: float | None = None
+    active_trigger_at: datetime | None = None
+    active_peak_at: datetime | None = None
+    active_peak_price: float | None = None
+    below_peak_close_count: int = 0
+
+
+@dataclass(frozen=True)
+class PumpDetectorCheckpoint:
+    candle_open_at: datetime
+    state: PumpDetectorState
+    episode_count: int
+
+
+@dataclass(frozen=True)
+class PumpHistoryResult:
+    episodes: tuple[PumpEpisode, ...]
+    status: str
+    processed_candles: int
+
+
+@dataclass(frozen=True)
+class PumpHistoryCacheRecord:
+    source: tuple[tuple[int, str], ...]
+    episodes: tuple[PumpEpisode, ...]
+    checkpoints: tuple[PumpDetectorCheckpoint, ...]
+
+
+@dataclass(frozen=True)
+class _PumpHistoryMemoryEntry:
+    record: PumpHistoryCacheRecord
+    source_object: object | None
 
 
 @dataclass(frozen=True)
@@ -1007,6 +1080,62 @@ def latest_closed_daily_cutoff(now: datetime | None = None) -> datetime:
     )
 
 
+def _symbol_cache_key(symbol: str) -> str:
+    return (
+        symbol
+        if symbol.isascii()
+        else f"unicode-{hashlib.sha256(symbol.encode('utf-8')).hexdigest()}"
+    )
+
+
+def _daily_cache_metadata_path(cache_path: Path) -> Path:
+    return cache_path.with_name(f"{cache_path.name}.meta.json")
+
+
+def _read_daily_cache_requested_start(cache_path: Path) -> datetime | None:
+    path = _daily_cache_metadata_path(cache_path)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 1:
+            return None
+        value = datetime.fromisoformat(
+            str(payload["requested_start_at"]).replace("Z", "+00:00")
+        )
+        if value.tzinfo is None:
+            return None
+        return value.astimezone(UTC)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_daily_cache_metadata(
+    cache_path: Path,
+    *,
+    requested_start_at: datetime,
+) -> None:
+    path = _daily_cache_metadata_path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "requested_start_at": iso_utc(requested_start_at),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _read_daily_cache(path: Path) -> tuple[DailyContractCandle, ...]:
     if not path.is_file() or path.is_symlink():
         return ()
@@ -1068,6 +1197,20 @@ def _read_daily_cache(path: Path) -> tuple[DailyContractCandle, ...]:
     return tuple(parsed[key] for key in sorted(parsed))
 
 
+def _daily_candles_contiguous(
+    candles: Sequence[DailyContractCandle],
+) -> bool:
+    return not any(
+        current.open_time <= previous.open_time
+        or abs(
+            (current.open_time - previous.open_time).total_seconds()
+            - DAILY_INTERVAL_SECONDS
+        )
+        > 5
+        for previous, current in zip(candles, candles[1:])
+    )
+
+
 def _write_daily_cache(
     candles: Sequence[DailyContractCandle],
     path: Path,
@@ -1110,9 +1253,96 @@ def _write_daily_cache(
 class BinanceUsdmDailyCache:
     """Bounded normalized daily cache backed by the radar's public client."""
 
-    def __init__(self, cache_root: Path, client: AltcoinRadarProvider) -> None:
+    def __init__(
+        self,
+        cache_root: Path,
+        client: AltcoinRadarProvider,
+        *,
+        max_memory_entries: int = DAILY_MEMORY_CACHE_MAX_ENTRIES,
+    ) -> None:
+        if not 1 <= max_memory_entries <= DAILY_MEMORY_CACHE_MAX_ENTRIES:
+            raise ValueError("RADAR_DAILY_MEMORY_CACHE_LIMIT_INVALID")
         self.cache_root = cache_root.resolve()
         self.client = client
+        self._max_memory_entries = max_memory_entries
+        self._memory: OrderedDict[str, _DailyMemoryCacheRecord] = OrderedDict()
+        self._memory_lock = threading.Lock()
+
+    def _memory_get(self, cache_key: str) -> _DailyMemoryCacheRecord | None:
+        with self._memory_lock:
+            record = self._memory.get(cache_key)
+            if record is not None:
+                self._memory.move_to_end(cache_key)
+            return record
+
+    def _memory_put(
+        self,
+        cache_key: str,
+        record: _DailyMemoryCacheRecord,
+    ) -> None:
+        with self._memory_lock:
+            self._memory[cache_key] = record
+            self._memory.move_to_end(cache_key)
+            while len(self._memory) > self._max_memory_entries:
+                self._memory.popitem(last=False)
+
+    def _download_range(
+        self,
+        symbol: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> tuple[tuple[DailyContractCandle, ...], datetime | None, int]:
+        cursor = start_at
+        pages = 0
+        merged: dict[int, DailyContractCandle] = {}
+        completed_at: datetime | None = None
+        malformed_count = 0
+        while cursor <= end_at:
+            if pages >= DAILY_MAX_REQUEST_PAGES:
+                raise RadarSourceError("RADAR_DAILY_PAGE_LIMIT_EXCEEDED")
+            requested_days = math.ceil(
+                max(1.0, (end_at - cursor).total_seconds() + 0.001)
+                / DAILY_INTERVAL_SECONDS
+            )
+            try:
+                result = self.client.daily_klines(
+                    symbol,
+                    start_at=cursor,
+                    end_at=end_at,
+                    limit=min(DAILY_REQUEST_LIMIT, max(1, requested_days)),
+                )
+            except RadarSourceError as exc:
+                if exc.reason_code == "RADAR_DAILY_KLINES_EMPTY":
+                    break
+                raise
+            pages += 1
+            malformed_count += result.malformed_count
+            completed_at = (
+                result.completed_at
+                if completed_at is None
+                else max(completed_at, result.completed_at)
+            )
+            page = tuple(
+                candle
+                for candle in result.value
+                if candle.open_time >= start_at and candle.close_time <= end_at
+            )
+            for candle in page:
+                merged[int(candle.open_time.timestamp() * 1000)] = candle
+            if not page:
+                break
+            next_cursor = max(candle.close_time for candle in page) + timedelta(
+                milliseconds=1
+            )
+            if next_cursor <= cursor:
+                raise RadarSourceError("RADAR_DAILY_PAGINATION_INVALID")
+            cursor = next_cursor
+        return (
+            tuple(merged[key] for key in sorted(merged)),
+            completed_at,
+            malformed_count,
+        )
 
     def fetch(self, symbol: str, cutoff: datetime) -> DailySeriesResult:
         if (
@@ -1129,21 +1359,42 @@ class BinanceUsdmDailyCache:
                 None,
                 "RADAR_DAILY_SYMBOL_INVALID",
             )
-        cache_key = (
-            symbol
-            if symbol.isascii()
-            else f"unicode-{hashlib.sha256(symbol.encode('utf-8')).hexdigest()}"
-        )
+        cache_key = _symbol_cache_key(symbol)
         cache_path = self.cache_root / f"{cache_key}.csv.gz"
-        current = _read_daily_cache(cache_path)
+        memory_record = self._memory_get(cache_key)
+        if memory_record is not None:
+            current = memory_record.candles
+            acquired_at = memory_record.acquired_at
+            requested_start = memory_record.requested_start_at
+        else:
+            current = _read_daily_cache(cache_path)
+            if not _daily_candles_contiguous(current):
+                current = ()
+            acquired_at = (
+                datetime.fromtimestamp(cache_path.stat().st_mtime, tz=UTC)
+                if cache_path.is_file() and not cache_path.is_symlink()
+                else None
+            )
+            requested_start = _read_daily_cache_requested_start(cache_path)
+            if current:
+                self._memory_put(
+                    cache_key,
+                    _DailyMemoryCacheRecord(
+                        candles=current,
+                        acquired_at=acquired_at,
+                        requested_start_at=requested_start,
+                    ),
+                )
         cutoff = cutoff.astimezone(UTC)
         latest = current[-1].close_time if current else None
-        acquired_at = (
-            datetime.fromtimestamp(cache_path.stat().st_mtime, tz=UTC)
-            if cache_path.is_file() and not cache_path.is_symlink()
-            else None
+        next_midnight = cutoff + timedelta(milliseconds=1)
+        earliest_open = next_midnight - timedelta(days=DAILY_HISTORY_DAYS)
+        history_attempted = (
+            bool(current)
+            and requested_start is not None
+            and requested_start <= earliest_open
         )
-        if latest is not None and latest >= cutoff:
+        if latest is not None and latest >= cutoff and history_attempted:
             return DailySeriesResult(
                 symbol,
                 "CACHE_CURRENT",
@@ -1152,25 +1403,41 @@ class BinanceUsdmDailyCache:
                 acquired_at,
             )
 
-        next_midnight = cutoff + timedelta(milliseconds=1)
-        earliest_open = next_midnight - timedelta(days=DAILY_HISTORY_DAYS)
-        start_at = earliest_open
-        if current:
+        ranges: list[tuple[datetime, datetime]] = []
+        if not history_attempted:
+            prefix_end = (
+                current[0].open_time - timedelta(milliseconds=1)
+                if current
+                else cutoff
+            )
+            if prefix_end >= earliest_open:
+                ranges.append((earliest_open, prefix_end))
+        if current and (latest is None or latest < cutoff):
             overlap_index = max(0, len(current) - DAILY_CACHE_OVERLAP_DAYS)
-            start_at = max(earliest_open, current[overlap_index].open_time)
-        requested_days = (
-            math.ceil(
-                max(1.0, (cutoff - start_at).total_seconds()) / DAILY_INTERVAL_SECONDS
+            ranges.append(
+                (max(earliest_open, current[overlap_index].open_time), cutoff)
             )
-            + 2
-        )
+
+        downloaded: list[DailyContractCandle] = []
+        completed_at: datetime | None = None
+        malformed_count = 0
         try:
-            result = self.client.daily_klines(
-                symbol,
-                start_at=start_at,
-                end_at=cutoff,
-                limit=min(500, max(1, requested_days)),
-            )
+            for start_at, end_at in ranges:
+                page_candles, page_completed_at, page_malformed = (
+                    self._download_range(
+                        symbol,
+                        start_at=start_at,
+                        end_at=end_at,
+                    )
+                )
+                downloaded.extend(page_candles)
+                malformed_count += page_malformed
+                if page_completed_at is not None:
+                    completed_at = (
+                        page_completed_at
+                        if completed_at is None
+                        else max(completed_at, page_completed_at)
+                    )
         except RadarSourceError as exc:
             return DailySeriesResult(
                 symbol,
@@ -1192,30 +1459,49 @@ class BinanceUsdmDailyCache:
 
         merged = {
             int(candle.open_time.timestamp() * 1000): candle
-            for candle in (*current, *tuple(result.value))
+            for candle in (*current, *downloaded)
             if candle.open_time >= earliest_open and candle.close_time <= cutoff
         }
-        candles = tuple(merged[key] for key in sorted(merged))[
-            -(DAILY_HISTORY_DAYS + DAILY_CACHE_OVERLAP_DAYS) :
-        ]
+        candles = tuple(merged[key] for key in sorted(merged))[-DAILY_HISTORY_DAYS:]
         latest = candles[-1].close_time if candles else None
-        if latest is None or latest < cutoff:
+        if (
+            latest is None
+            or latest < cutoff
+            or not _daily_candles_contiguous(candles)
+        ):
             return DailySeriesResult(
                 symbol,
                 "FAILED" if not candles else "STALE",
                 candles,
                 latest,
-                result.completed_at,
+                completed_at,
                 "RADAR_DAILY_KLINES_STALE",
             )
         _write_daily_cache(candles, cache_path)
+        _write_daily_cache_metadata(
+            cache_path,
+            requested_start_at=earliest_open,
+        )
+        cache_acquired_at = datetime.fromtimestamp(cache_path.stat().st_mtime, tz=UTC)
+        self._memory_put(
+            cache_key,
+            _DailyMemoryCacheRecord(
+                candles=candles,
+                acquired_at=cache_acquired_at,
+                requested_start_at=earliest_open,
+            ),
+        )
         return DailySeriesResult(
             symbol,
             "FETCHED",
             candles,
             latest,
-            result.completed_at,
-            ("RADAR_DAILY_SOURCE_ROWS_MALFORMED" if result.malformed_count else None),
+            completed_at,
+            (
+                "RADAR_DAILY_SOURCE_ROWS_MALFORMED"
+                if malformed_count
+                else None
+            ),
         )
 
 
@@ -1361,39 +1647,512 @@ def _daily_return(
     return result
 
 
-def _previous_pump_peak(
+def _pump_episode_trigger(
     candles: Sequence[DailyContractCandle],
-) -> tuple[datetime, float] | None:
-    """Return the most recent completed price-spike peak in the lookback.
-
-    A peak must be a local 11-day high, rise at least 30% from the prior
-    14-day low, and then draw down at least 18% in the following 14 days.
-    Requiring the subsequent drawdown prevents the current move from being
-    mislabeled as a completed previous episode.
-    """
-
-    if len(candles) < 43:
+    *,
+    index: int,
+    search_start_at: datetime,
+) -> tuple[datetime, float, datetime] | None:
+    current = candles[index]
+    window_start = max(0, index - PUMP_EPISODE_SEED_LOOKBACK_DAYS)
+    while (
+        window_start < index
+        and candles[window_start].open_time < search_start_at
+    ):
+        window_start += 1
+    if window_start >= index:
         return None
-    matches: list[tuple[datetime, float]] = []
-    for index in range(14, len(candles) - 14):
-        peak = candles[index].high_price
-        local = candles[max(0, index - 5) : index + 6]
-        if peak < max(candle.high_price for candle in local) - 1e-12:
+    trough_price = min(
+        candles[candidate].close_price
+        for candidate in range(window_start, index)
+    )
+    trough_index = max(
+        candidate
+        for candidate in range(window_start, index)
+        if abs(candles[candidate].close_price - trough_price) <= 1e-12
+    )
+    trough = candles[trough_index]
+    advance = _percent_change(current.close_price, trough.close_price)
+    if advance is None or advance < PUMP_EPISODE_MIN_ADVANCE_PERCENT:
+        return None
+    triggered = False
+    for window_days, threshold in PUMP_EPISODE_TRIGGER_WINDOWS:
+        base_index = index - window_days
+        if base_index < window_start:
             continue
-        prior_low = min(candle.low_price for candle in candles[index - 14 : index])
-        following_low = min(
-            candle.low_price for candle in candles[index + 1 : index + 15]
+        window_return = _percent_change(
+            current.close_price,
+            candles[base_index].close_price,
         )
-        advance = _percent_change(peak, prior_low)
-        drawdown = _percent_change(following_low, peak)
+        if window_return is not None and window_return >= threshold:
+            triggered = True
+            break
+    if not triggered:
+        return None
+    return trough.open_time, trough.close_price, current.close_time
+
+
+def _run_pump_detector(
+    candles: Sequence[DailyContractCandle],
+    *,
+    start_index: int = 0,
+    initial_state: PumpDetectorState | None = None,
+    initial_episodes: Sequence[PumpEpisode] = (),
+) -> tuple[tuple[PumpEpisode, ...], tuple[PumpDetectorCheckpoint, ...]]:
+    if not candles:
+        return tuple(initial_episodes), ()
+    state = initial_state or PumpDetectorState(
+        search_start_at=candles[0].open_time
+    )
+    episodes = list(initial_episodes)
+    checkpoints: list[PumpDetectorCheckpoint] = []
+    for index in range(start_index, len(candles)):
+        candle = candles[index]
+        if state.active_peak_price is None:
+            trigger = _pump_episode_trigger(
+                candles,
+                index=index,
+                search_start_at=state.search_start_at,
+            )
+            if trigger is not None:
+                start_at, start_price, trigger_at = trigger
+                state = PumpDetectorState(
+                    search_start_at=state.search_start_at,
+                    active_start_at=start_at,
+                    active_start_price=start_price,
+                    active_trigger_at=trigger_at,
+                    active_peak_at=candle.close_time,
+                    active_peak_price=candle.high_price,
+                )
+        else:
+            if (
+                state.active_start_at is None
+                or state.active_start_price is None
+                or state.active_trigger_at is None
+                or state.active_peak_at is None
+            ):
+                raise RuntimeError("RADAR_PUMP_DETECTOR_STATE_INVALID")
+            peak_at = state.active_peak_at
+            peak_price = state.active_peak_price
+            prior_below_count = state.below_peak_close_count
+            if candle.high_price > peak_price:
+                peak_at = candle.close_time
+                peak_price = candle.high_price
+                prior_below_count = 0
+            drawdown = _percent_change(candle.close_price, peak_price)
+            below_count = (
+                prior_below_count + 1
+                if drawdown is not None
+                and drawdown <= PUMP_EPISODE_EXIT_DRAWDOWN_PERCENT
+                else 0
+            )
+            if below_count >= PUMP_EPISODE_EXIT_CONFIRMATION_DAYS:
+                advance = _percent_change(peak_price, state.active_start_price)
+                if advance is None or drawdown is None:
+                    raise RuntimeError("RADAR_PUMP_EPISODE_COMPUTATION_INVALID")
+                episodes.append(
+                    PumpEpisode(
+                        start_at=state.active_start_at,
+                        trigger_at=state.active_trigger_at,
+                        peak_at=peak_at,
+                        peak_price=peak_price,
+                        completed_at=candle.close_time,
+                        advance_percent=advance,
+                        confirmed_drawdown_percent=drawdown,
+                    )
+                )
+                state = PumpDetectorState(search_start_at=candle.open_time)
+            else:
+                state = PumpDetectorState(
+                    search_start_at=state.search_start_at,
+                    active_start_at=state.active_start_at,
+                    active_start_price=state.active_start_price,
+                    active_trigger_at=state.active_trigger_at,
+                    active_peak_at=peak_at,
+                    active_peak_price=peak_price,
+                    below_peak_close_count=below_count,
+                )
+        checkpoints.append(
+            PumpDetectorCheckpoint(
+                candle_open_at=candle.open_time,
+                state=state,
+                episode_count=len(episodes),
+            )
+        )
+    return tuple(episodes), tuple(checkpoints)
+
+
+def detect_pump_episodes(
+    candles: Sequence[DailyContractCandle],
+) -> tuple[PumpEpisode, ...]:
+    episodes, _ = _run_pump_detector(candles)
+    return episodes
+
+
+def _pump_candle_fingerprint(candle: DailyContractCandle) -> str:
+    material = "|".join(
+        (
+            str(int(candle.open_time.timestamp() * 1000)),
+            str(int(candle.close_time.timestamp() * 1000)),
+            format(candle.open_price, ".12g"),
+            format(candle.high_price, ".12g"),
+            format(candle.low_price, ".12g"),
+            format(candle.close_price, ".12g"),
+            format(candle.quote_volume, ".12g"),
+        )
+    )
+    return hashlib.sha256(material.encode("ascii")).hexdigest()
+
+
+def _cache_datetime(value: Any) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("RADAR_PUMP_CACHE_DATETIME_INVALID")
+    return parsed.astimezone(UTC)
+
+
+def _pump_state_payload(state: PumpDetectorState) -> dict[str, Any]:
+    def optional(value: datetime | None) -> str | None:
+        return iso_utc(value) if value is not None else None
+
+    return {
+        "search_start_at": iso_utc(state.search_start_at),
+        "active_start_at": optional(state.active_start_at),
+        "active_start_price": state.active_start_price,
+        "active_trigger_at": optional(state.active_trigger_at),
+        "active_peak_at": optional(state.active_peak_at),
+        "active_peak_price": state.active_peak_price,
+        "below_peak_close_count": state.below_peak_close_count,
+    }
+
+
+def _pump_state_from_payload(payload: Any) -> PumpDetectorState:
+    if not isinstance(payload, dict):
+        raise ValueError("RADAR_PUMP_CACHE_STATE_INVALID")
+
+    def optional_datetime(key: str) -> datetime | None:
+        value = payload.get(key)
+        return _cache_datetime(value) if value is not None else None
+
+    def optional_price(key: str) -> float | None:
+        value = payload.get(key)
+        if value is None:
+            return None
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise ValueError("RADAR_PUMP_CACHE_PRICE_INVALID")
+        return parsed
+
+    below_count = int(payload.get("below_peak_close_count", 0))
+    if not 0 <= below_count < PUMP_EPISODE_EXIT_CONFIRMATION_DAYS:
+        raise ValueError("RADAR_PUMP_CACHE_COUNT_INVALID")
+    state = PumpDetectorState(
+        search_start_at=_cache_datetime(payload["search_start_at"]),
+        active_start_at=optional_datetime("active_start_at"),
+        active_start_price=optional_price("active_start_price"),
+        active_trigger_at=optional_datetime("active_trigger_at"),
+        active_peak_at=optional_datetime("active_peak_at"),
+        active_peak_price=optional_price("active_peak_price"),
+        below_peak_close_count=below_count,
+    )
+    active_values = (
+        state.active_start_at,
+        state.active_start_price,
+        state.active_trigger_at,
+        state.active_peak_at,
+        state.active_peak_price,
+    )
+    if any(value is None for value in active_values) and any(
+        value is not None for value in active_values
+    ):
+        raise ValueError("RADAR_PUMP_CACHE_ACTIVE_STATE_PARTIAL")
+    return state
+
+
+def _pump_episode_payload(episode: PumpEpisode) -> dict[str, Any]:
+    return {
+        "start_at": iso_utc(episode.start_at),
+        "trigger_at": iso_utc(episode.trigger_at),
+        "peak_at": iso_utc(episode.peak_at),
+        "peak_price": episode.peak_price,
+        "completed_at": iso_utc(episode.completed_at),
+        "advance_percent": episode.advance_percent,
+        "confirmed_drawdown_percent": episode.confirmed_drawdown_percent,
+    }
+
+
+def _pump_episode_from_payload(payload: Any) -> PumpEpisode:
+    if not isinstance(payload, dict):
+        raise ValueError("RADAR_PUMP_CACHE_EPISODE_INVALID")
+    episode = PumpEpisode(
+        start_at=_cache_datetime(payload["start_at"]),
+        trigger_at=_cache_datetime(payload["trigger_at"]),
+        peak_at=_cache_datetime(payload["peak_at"]),
+        peak_price=float(payload["peak_price"]),
+        completed_at=_cache_datetime(payload["completed_at"]),
+        advance_percent=float(payload["advance_percent"]),
+        confirmed_drawdown_percent=float(payload["confirmed_drawdown_percent"]),
+    )
+    numbers = (
+        episode.peak_price,
+        episode.advance_percent,
+        episode.confirmed_drawdown_percent,
+    )
+    if (
+        not all(math.isfinite(value) for value in numbers)
+        or episode.peak_price <= 0
+        or episode.start_at > episode.trigger_at
+        or episode.trigger_at > episode.completed_at
+        or episode.peak_at > episode.completed_at
+    ):
+        raise ValueError("RADAR_PUMP_CACHE_EPISODE_INVALID")
+    return episode
+
+
+def _read_pump_history_cache(path: Path) -> PumpHistoryCacheRecord | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
         if (
-            advance is not None
-            and drawdown is not None
-            and advance >= 30.0
-            and drawdown <= -18.0
+            payload.get("schema_version") != PUMP_HISTORY_CACHE_SCHEMA_VERSION
+            or payload.get("rule_version") != PUMP_HISTORY_RULE_VERSION
         ):
-            matches.append((candles[index].close_time, peak))
-    return matches[-1] if matches else None
+            return None
+        source = tuple(
+            (int(item[0]), str(item[1])) for item in payload.get("source", ())
+        )
+        if (
+            not source
+            or len(source) > DAILY_HISTORY_DAYS
+            or any(
+                current[0] <= previous[0]
+                or len(current[1]) != 64
+                for previous, current in zip(source, source[1:])
+            )
+        ):
+            return None
+        episodes = tuple(
+            _pump_episode_from_payload(item)
+            for item in payload.get("episodes", ())
+        )
+        checkpoints = tuple(
+            PumpDetectorCheckpoint(
+                candle_open_at=datetime.fromtimestamp(
+                    int(item["open_time_ms"]) / 1000,
+                    tz=UTC,
+                ),
+                state=_pump_state_from_payload(item["state"]),
+                episode_count=int(item["episode_count"]),
+            )
+            for item in payload.get("checkpoints", ())
+        )
+        if (
+            len(checkpoints) != len(source)
+            or any(
+                int(checkpoint.candle_open_at.timestamp() * 1000) != source[index][0]
+                or not 0 <= checkpoint.episode_count <= len(episodes)
+                for index, checkpoint in enumerate(checkpoints)
+            )
+        ):
+            return None
+        return PumpHistoryCacheRecord(source, episodes, checkpoints)
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+
+def _write_pump_history_cache(
+    path: Path,
+    record: PumpHistoryCacheRecord,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = {
+        "schema_version": PUMP_HISTORY_CACHE_SCHEMA_VERSION,
+        "rule_version": PUMP_HISTORY_RULE_VERSION,
+        "source": [[open_time_ms, digest] for open_time_ms, digest in record.source],
+        "episodes": [_pump_episode_payload(item) for item in record.episodes],
+        "checkpoints": [
+            {
+                "open_time_ms": int(item.candle_open_at.timestamp() * 1000),
+                "episode_count": item.episode_count,
+                "state": _pump_state_payload(item.state),
+            }
+            for item in record.checkpoints
+        ],
+    }
+    try:
+        with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class PumpHistoryCache:
+    """Versioned daily pump analysis with restart-safe incremental checkpoints."""
+
+    def __init__(
+        self,
+        cache_root: Path,
+        *,
+        max_memory_entries: int = DAILY_MEMORY_CACHE_MAX_ENTRIES,
+    ) -> None:
+        if not 1 <= max_memory_entries <= DAILY_MEMORY_CACHE_MAX_ENTRIES:
+            raise ValueError("RADAR_PUMP_MEMORY_CACHE_LIMIT_INVALID")
+        self.cache_root = cache_root.resolve()
+        self._max_memory_entries = max_memory_entries
+        self._memory: OrderedDict[str, _PumpHistoryMemoryEntry] = OrderedDict()
+        self._memory_lock = threading.Lock()
+
+    def _memory_get(self, cache_key: str) -> _PumpHistoryMemoryEntry | None:
+        with self._memory_lock:
+            entry = self._memory.get(cache_key)
+            if entry is not None:
+                self._memory.move_to_end(cache_key)
+            return entry
+
+    def _memory_put(
+        self,
+        cache_key: str,
+        record: PumpHistoryCacheRecord,
+        candles: Sequence[DailyContractCandle],
+    ) -> None:
+        source_object = candles if isinstance(candles, tuple) else None
+        with self._memory_lock:
+            self._memory[cache_key] = _PumpHistoryMemoryEntry(record, source_object)
+            self._memory.move_to_end(cache_key)
+            while len(self._memory) > self._max_memory_entries:
+                self._memory.popitem(last=False)
+
+    def analyze(
+        self,
+        symbol: str,
+        candles: Sequence[DailyContractCandle],
+    ) -> PumpHistoryResult:
+        if (
+            not symbol
+            or len(symbol) > 64
+            or not symbol.isalnum()
+            or not symbol.upper().endswith("USDT")
+        ):
+            raise ValueError("RADAR_DAILY_SYMBOL_INVALID")
+        cache_key = _symbol_cache_key(symbol)
+        memory_entry = self._memory_get(cache_key)
+        if memory_entry is not None and memory_entry.source_object is candles:
+            return PumpHistoryResult(
+                memory_entry.record.episodes,
+                "CACHE_CURRENT",
+                0,
+            )
+        ordered = tuple(sorted(candles, key=lambda candle: candle.open_time))[
+            -DAILY_HISTORY_DAYS:
+        ]
+        if not ordered:
+            return PumpHistoryResult((), "EMPTY", 0)
+        if any(
+            current.open_time <= previous.open_time
+            or abs(
+                (current.open_time - previous.open_time).total_seconds()
+                - DAILY_INTERVAL_SECONDS
+            )
+            > 5
+            for previous, current in zip(ordered, ordered[1:])
+        ):
+            raise ValueError("RADAR_DAILY_KLINES_NON_CONTIGUOUS")
+        source = tuple(
+            (
+                int(candle.open_time.timestamp() * 1000),
+                _pump_candle_fingerprint(candle),
+            )
+            for candle in ordered
+        )
+        cache_path = self.cache_root / f"{cache_key}.pump-history.json.gz"
+        cached = memory_entry.record if memory_entry is not None else None
+        if cached is None:
+            cached = _read_pump_history_cache(cache_path)
+        if cached is not None and cached.source == source:
+            self._memory_put(cache_key, cached, candles)
+            return PumpHistoryResult(cached.episodes, "CACHE_CURRENT", 0)
+
+        start_index = 0
+        initial_state: PumpDetectorState | None = None
+        initial_episodes: tuple[PumpEpisode, ...] = ()
+        preserved_checkpoints: tuple[PumpDetectorCheckpoint, ...] = ()
+        if cached is not None and source[0][0] >= cached.source[0][0]:
+            cached_index_by_time = {
+                open_time_ms: index
+                for index, (open_time_ms, _) in enumerate(cached.source)
+            }
+            cached_start = cached_index_by_time.get(source[0][0])
+            if cached_start is not None:
+                while (
+                    start_index < len(source)
+                    and cached_start + start_index < len(cached.source)
+                    and source[start_index] == cached.source[cached_start + start_index]
+                ):
+                    start_index += 1
+                if start_index:
+                    common_cached_end = cached_start + start_index
+                    common_checkpoints = cached.checkpoints[
+                        cached_start:common_cached_end
+                    ]
+                    removed_episodes = sum(
+                        1
+                        for episode in cached.episodes
+                        if episode.completed_at < ordered[0].open_time
+                    )
+                    preserved_checkpoints = tuple(
+                        PumpDetectorCheckpoint(
+                            candle_open_at=item.candle_open_at,
+                            state=item.state,
+                            episode_count=max(
+                                0,
+                                item.episode_count - removed_episodes,
+                            ),
+                        )
+                        for item in common_checkpoints
+                    )
+                    resume = preserved_checkpoints[-1]
+                    retained = tuple(
+                        episode
+                        for episode in cached.episodes
+                        if episode.completed_at >= ordered[0].open_time
+                    )
+                    initial_episodes = retained[: resume.episode_count]
+                    initial_state = resume.state
+
+        episodes, new_checkpoints = _run_pump_detector(
+            ordered,
+            start_index=start_index,
+            initial_state=initial_state,
+            initial_episodes=initial_episodes,
+        )
+        record = PumpHistoryCacheRecord(
+            source=source,
+            episodes=episodes,
+            checkpoints=(*preserved_checkpoints, *new_checkpoints),
+        )
+        _write_pump_history_cache(cache_path, record)
+        self._memory_put(cache_key, record, candles)
+        return PumpHistoryResult(
+            episodes,
+            "UPDATED" if cached is not None and start_index else "COMPUTED",
+            len(ordered) - start_index,
+        )
 
 
 def _current_pump_leg(
@@ -1496,6 +2255,7 @@ def analyze_price_position(
     *,
     current_price: float,
     return_24h_percent: float,
+    pump_episodes: Sequence[PumpEpisode] | None = None,
 ) -> PricePositionFeatures:
     """Classify an explainable current price location from closed UTC days."""
 
@@ -1578,9 +2338,22 @@ def analyze_price_position(
     atr60 = sum(true_range_percent[-60:]) / 60.0
     compression = atr20 / atr60 if atr60 > 0 else None
 
-    previous_peak = _previous_pump_peak(range_window)
-    previous_peak_at = previous_peak[0] if previous_peak else None
-    previous_peak_price = previous_peak[1] if previous_peak else None
+    completed_pumps = (
+        tuple(pump_episodes)
+        if pump_episodes is not None
+        else detect_pump_episodes(recent)
+    )
+    previous_pump = next(
+        (
+            episode
+            for episode in reversed(completed_pumps)
+            if episode.peak_at >= recent[0].open_time
+            and episode.completed_at <= recent[-1].close_time
+        ),
+        None,
+    )
+    previous_peak_at = previous_pump.peak_at if previous_pump else None
+    previous_peak_price = previous_pump.peak_price if previous_pump else None
     previous_peak_distance = (
         _percent_change(current_price, previous_peak_price)
         if previous_peak_price is not None
@@ -2151,12 +2924,11 @@ class BinanceAltcoinRadarMonitor:
     price_position_snapshot_key = PRICE_POSITION_SNAPSHOT_KEY
     price_position_table_title = "日线价格位置"
     price_position_method_note = (
-        "状态使用当前合约价与最多180根已闭合UTC日线计算；"
+        "短中期状态使用当前合约价与最多180根已闭合UTC日线计算；"
         "90日位置、距区间高低点、均线结构和独立收益窗口均保留为可排序事实。"
         "暴涨或拉升中会以起点前7根闭合日线收盘均价计算当前拉升倍数，"
         "起点日不进入均价。"
-        "“上一轮拉升峰值”只认定先在14日内上涨至少30%、随后14日回撤至少18%的"
-        "已完成价格段，不把当前上涨直接当作上一轮。"
+        "前轮高点单独从最近730根闭合日线的完整拉升段中识别。"
     )
     price_position_filter_choices = (
         FilterChoice("*", "全部状态"),
@@ -2174,7 +2946,7 @@ class BinanceAltcoinRadarMonitor:
             description=(
                 "按顺序判定：24h≤-12%或3日≤-20%为暴跌；24h≥15%或3日≥25%"
                 "为暴涨；7日≥25%、距区间高点不超过12%且高于20日均线为拉升中；"
-                "距上一轮完整拉升峰值-12%至+8%为前高附近；90日位置≥80%、"
+                "距两年内上一轮完整拉升峰值-12%至+8%为前高附近；90日位置≥80%、"
                 "7日波动≤10%且距区间高点≤15%为高位整理；90日位置≤20%、"
                 "14日波动≤8%、30日振幅≤18%且20日波动不高于60日的90%为底部横盘；"
                 "随后依次检查低位反弹、持续下跌、高位、底部和区间中部。"
@@ -2268,16 +3040,17 @@ class BinanceAltcoinRadarMonitor:
             "距前轮高点",
             "percent",
             description=(
-                "当前价相对最近一个完整拉升回落段峰值的距离。该峰值必须是局部高点，"
-                "此前14日内从低点上涨至少30%，此后14日内回撤至少18%；"
-                "未识别到完整价格段时保持为空。"
+                "当前价相对最近两年中上一轮完整拉升段最高价的距离。该轮须先从"
+                "60日内收盘低点上涨至少30%，并命中1/3/7/14/30日异常涨幅门槛；"
+                "拉升途中可持续多日或高位横盘，只有连续3根闭合日线收盘均较峰值"
+                "回撤至少18%才确认结束。尚未结束的当前拉升不算上一轮。"
             ),
         ),
         ViewColumn(
             "previous_pump_peak_date",
             "前轮高点日期",
             priority="secondary",
-            description="最近一个满足完整拉升回落规则的UTC日线峰值日期。",
+            description="最近两年中上一轮已确认结束的完整拉升段最高价所在UTC日期。",
         ),
         ViewColumn(
             "trend_structure",
@@ -2319,7 +3092,7 @@ class BinanceAltcoinRadarMonitor:
             priority="secondary",
             maximum_fraction_digits=0,
             description=(
-                "本轮连续闭合UTC日线的实际覆盖根数，最多220根；"
+                "本轮连续闭合UTC日线的实际覆盖根数，最多730根；"
                 "价格区间指标最多使用其中最近180根。"
             ),
         ),
@@ -2340,6 +3113,7 @@ class BinanceAltcoinRadarMonitor:
         *,
         client: AltcoinRadarProvider | None = None,
         daily_provider: DailySeriesProvider | None = None,
+        pump_history_cache: PumpHistoryCache | None = None,
         evaluation_store: SQLiteMonitorStore | None = None,
     ) -> None:
         self.settings = settings
@@ -2350,7 +3124,19 @@ class BinanceAltcoinRadarMonitor:
             proxy_url=settings.proxy_url,
         )
         self.daily_provider = daily_provider or (
-            BinanceUsdmDailyCache(settings.cache_root, self.client)
+            BinanceUsdmDailyCache(
+                settings.cache_root,
+                self.client,
+                max_memory_entries=settings.max_screened_contracts,
+            )
+            if settings.cache_root is not None
+            else None
+        )
+        self.pump_history_cache = pump_history_cache or (
+            PumpHistoryCache(
+                settings.cache_root / "pump-history",
+                max_memory_entries=settings.max_screened_contracts,
+            )
             if settings.cache_root is not None
             else None
         )
@@ -2959,10 +3745,26 @@ class BinanceAltcoinRadarMonitor:
         history_insufficient = 0
         for item, result in results:
             try:
+                pump_episodes: Sequence[PumpEpisode] | None = None
+                if self.pump_history_cache is not None:
+                    try:
+                        pump_episodes = self.pump_history_cache.analyze(
+                            item.seed.symbol,
+                            result.candles,
+                        ).episodes
+                    except (OSError, RuntimeError, TypeError, ValueError):
+                        issues.append(
+                            CollectionIssue(
+                                item.seed.symbol,
+                                "RADAR_PUMP_HISTORY_CACHE_FAILED",
+                            )
+                        )
+                        pump_episodes = detect_pump_episodes(result.candles)
                 current_features = analyze_price_position(
                     result.candles,
                     current_price=item.seed.ticker_24h.last_price,
                     return_24h_percent=item.seed.ticker_24h.price_change_percent,
+                    pump_episodes=pump_episodes,
                 )
                 if item.features is None:
                     raise RadarSourceError("RADAR_FEATURES_REQUIRED")
@@ -2976,6 +3778,7 @@ class BinanceAltcoinRadarMonitor:
                     result.candles,
                     current_price=item.features.close_price,
                     return_24h_percent=signal_return_24h,
+                    pump_episodes=pump_episodes,
                 )
             except RadarSourceError as exc:
                 if exc.reason_code == "RADAR_DAILY_HISTORY_INSUFFICIENT":
@@ -3007,8 +3810,8 @@ class BinanceAltcoinRadarMonitor:
         features: PricePositionFeatures,
     ) -> dict[str, Any]:
         peak_missing = (
-            "最近最多180根闭合日线中未识别到先涨至少30%、"
-            "随后回撤至少18%的完整拉升回落段。"
+            "最近最多730根闭合日线中未识别到先触发异常上涨、"
+            "随后连续3日收盘较峰值回撤至少18%的完整拉升段。"
         )
         missing_reasons: dict[str, str] = {}
         if features.previous_pump_peak_at is None:
@@ -3139,7 +3942,7 @@ class BinanceAltcoinRadarMonitor:
             observed_at=observed_at,
             cutoff_at=price_cutoff_at,
             payload={
-                "schema_version": 1,
+                "schema_version": 2,
                 "market_scope": MARKET_SCOPE,
                 "source": "BINANCE_USDM_PUBLIC_CURRENT_AND_CLOSED_1D_KLINES",
                 "price_cutoff_at": iso_utc(price_cutoff_at),

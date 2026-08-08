@@ -207,6 +207,48 @@ const ui = {
   marketEventDirectionFormula: document.querySelector("#market-event-direction-formula"),
   marketEventDirectionInputs: document.querySelector("#market-event-direction-inputs"),
   marketEventSourceLinks: document.querySelector("#market-event-source-links"),
+  stockEvents: document.querySelector("#stock-events"),
+  stockEventsScope: document.querySelector("#stock-events-scope"),
+  stockEventsSelectButton: document.querySelector("#stock-events-select-button"),
+  stockEventsCalendarTab: document.querySelector("#stock-events-calendar-tab"),
+  stockEventsTimelineTab: document.querySelector("#stock-events-timeline-tab"),
+  stockEventsWindow: document.querySelector("#stock-events-window"),
+  stockEventsNotice: document.querySelector("#stock-events-notice"),
+  stockEventsCalendarPanel: document.querySelector("#stock-events-calendar-panel"),
+  stockEventsTimelinePanel: document.querySelector("#stock-events-timeline-panel"),
+  stockCalendarPrevious: document.querySelector("#stock-calendar-previous"),
+  stockCalendarNext: document.querySelector("#stock-calendar-next"),
+  stockCalendarToday: document.querySelector("#stock-calendar-today"),
+  stockCalendarTitle: document.querySelector("#stock-calendar-title"),
+  stockCalendarGrid: document.querySelector("#stock-calendar-grid"),
+  stockDayAgendaDate: document.querySelector("#stock-day-agenda-date"),
+  stockDayAgendaCount: document.querySelector("#stock-day-agenda-count"),
+  stockDayAgendaList: document.querySelector("#stock-day-agenda-list"),
+  stockDayAgendaEmpty: document.querySelector("#stock-day-agenda-empty"),
+  stockEventDetail: document.querySelector("#stock-event-detail"),
+  stockEventDetailBadges: document.querySelector("#stock-event-detail-badges"),
+  stockEventDetailTitle: document.querySelector("#stock-event-detail-title"),
+  stockEventDetailStock: document.querySelector("#stock-event-detail-stock"),
+  stockEventDetailSummary: document.querySelector("#stock-event-detail-summary"),
+  stockEventDetailSource: document.querySelector("#stock-event-detail-source"),
+  stockEventsTimeline: document.querySelector("#stock-events-timeline"),
+  stockEventsTimelineEmpty: document.querySelector("#stock-events-timeline-empty"),
+  stockEventsSourceSummary: document.querySelector("#stock-events-source-summary"),
+  stockEventsSourceList: document.querySelector("#stock-events-source-list"),
+  stockSelectorDialog: document.querySelector("#stock-selector-dialog"),
+  stockSelectorClose: document.querySelector("#stock-selector-close"),
+  stockSelectorCancel: document.querySelector("#stock-selector-cancel"),
+  stockSelectorApply: document.querySelector("#stock-selector-apply"),
+  stockSelectorSearch: document.querySelector("#stock-selector-search"),
+  stockSelectorCount: document.querySelector("#stock-selector-count"),
+  stockSelectorManualTab: document.querySelector("#stock-selector-manual-tab"),
+  stockSelectorAutoTab: document.querySelector("#stock-selector-auto-tab"),
+  stockSelectorAddForm: document.querySelector("#stock-selector-add-form"),
+  stockSelectorAddQuery: document.querySelector("#stock-selector-add-query"),
+  stockSelectorSuggestions: document.querySelector("#stock-selector-suggestions"),
+  stockSelectorHelp: document.querySelector("#stock-selector-help"),
+  stockSelectorList: document.querySelector("#stock-selector-list"),
+  stockSelectorStatus: document.querySelector("#stock-selector-status"),
 };
 
 const state = {
@@ -215,6 +257,8 @@ const state = {
   hours: 6,
   filters: {},
   refreshTimer: null,
+  observationTimer: null,
+  observationMonitorId: null,
   request: null,
   configurationDirty: false,
   configurationSubmitting: false,
@@ -243,6 +287,23 @@ const state = {
   viewPayload: null,
   eventHistoryPage: 1,
   marketEventPayload: null,
+  stockEventPayload: null,
+  stockEventView: "CALENDAR",
+  stockCalendarMonth: null,
+  stockSelectedDate: null,
+  stockSelectedEventId: null,
+  stockSelectedCodes: null,
+  stockSelectorTab: "MANUAL",
+  stockSelectorDraftCodes: new Set(),
+  stockSelectorDraftManual: new Set(),
+  stockSelectorOriginalManual: new Set(),
+  stockSelectorSubmitting: false,
+  stockDirectorySuggestions: [],
+  stockDirectorySuggestionIndex: -1,
+  stockDirectorySelected: null,
+  stockDirectoryKnown: new Map(),
+  stockDirectorySearchSerial: 0,
+  stockDirectorySearchTimer: null,
   buybackDetailEntityKey: null,
   buybackDetailRevisionNo: null,
   buybackReviewSubmitting: false,
@@ -265,6 +326,7 @@ const MONITOR_COMPACT_LABELS = {
   "binance-btc-relationship": "BTC",
   "a-hk-buyback": "回购",
   "market-event-calendar": "事件",
+  "stock-event-calendar": "个股",
 };
 
 const STATUS_LABELS = {
@@ -369,6 +431,16 @@ const ISSUE_REASON_LABELS = {
   MARKET_EVENTS_NYFED_EVENT_TIME_MISSING: "纽约联储事件缺少发布时间",
   MARKET_EVENTS_FOMC_SCHEMA_CHANGED: "美联储议息日历格式变化",
   MARKET_EVENTS_FOMC_DATE_INVALID: "美联储议息日期异常",
+  MARKET_EVENTS_NBS_SCHEMA_CHANGED: "国家统计局发布日程格式变化",
+  MARKET_EVENTS_NBS_SCHEDULE_NOT_FOUND: "国家统计局年度发布日程尚未找到",
+  MARKET_EVENTS_NBS_DATE_INVALID: "国家统计局发布日期异常",
+  MARKET_EVENTS_NBS_TIME_INVALID: "国家统计局发布时间异常",
+  MARKET_EVENTS_HK_CSD_SCHEMA_CHANGED: "香港政府统计处发布日程格式变化",
+  MARKET_EVENTS_HK_CSD_XLSX_INVALID: "香港政府统计处发布日程文件异常",
+  MARKET_EVENTS_HK_CSD_DATE_INVALID: "香港政府统计处发布日期异常",
+  MARKET_EVENTS_SFC_SCHEMA_CHANGED: "香港证监会监管日历格式变化",
+  MARKET_EVENTS_SFC_JSON_INVALID: "香港证监会监管日历数据异常",
+  MARKET_EVENTS_SFC_DATE_INVALID: "香港证监会监管日历日期异常",
   MARKET_EVENTS_BLS_JSON_INVALID: "BLS宏观数据格式异常",
   MARKET_EVENTS_BLS_RESPONSE_FAILED: "BLS宏观数据请求失败",
   MARKET_EVENTS_BLS_SCHEMA_CHANGED: "BLS宏观数据字段变化",
@@ -380,6 +452,16 @@ const ISSUE_REASON_LABELS = {
   MARKET_EVENTS_CONSENSUS_DATE_INVALID: "市场一致预期发布时间异常",
   MARKET_EVENTS_CONSENSUS_VALUE_INVALID: "市场一致预期数值异常",
   MARKET_EVENTS_CONSENSUS_AMBIGUOUS: "市场一致预期存在冲突",
+  STOCK_EVENTS_POOL_SCHEMA_CHANGED: "每日动态股池字段变化",
+  STOCK_EVENTS_DIRECTORY_SCHEMA_CHANGED: "股票名称与代码目录字段变化",
+  STOCK_EVENTS_DIRECTORY_BOUNDS_CHANGED: "股票目录规模超出安全边界",
+  STOCK_EVENTS_DIRECTORY_PAGING_CHANGED: "股票目录分页发生变化",
+  STOCK_EVENTS_DIRECTORY_INCOMPLETE: "股票目录读取不完整",
+  STOCK_EVENTS_CALENDAR_SCHEMA_CHANGED: "公司事件日历字段变化",
+  STOCK_EVENTS_CALENDAR_TRUNCATED: "公司事件日历超过读取上限",
+  STOCK_EVENTS_ANNOUNCEMENT_SCHEMA_CHANGED: "公司公告索引字段变化",
+  STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED: "公司公告索引超过读取上限",
+  STOCK_EVENTS_PROJECTION_TRUNCATED: "个股事件展示超过保留上限",
 };
 
 const ISSUE_SCOPE_LABELS = {
@@ -396,8 +478,14 @@ const ISSUE_SCOPE_LABELS = {
   "buyback-financial-reference": "A股与港股公开业绩参考",
   "bea-schedule": "美国经济分析局发布日程",
   "fomc-calendar": "美联储议息日历",
+  "sfc-regulatory-calendar": "香港证监会监管日历",
   "bls-macro-data": "美国通胀与就业数据",
   "market-consensus": "本周市场一致预期",
+  "daily-universe": "每日动态股池",
+  "stock-directory": "股票名称与代码目录",
+  "stock-calendar": "公司事件日历",
+  "stock-announcements": "公司公告索引",
+  "stock-events-projection": "个股事件结果集",
   "BTCUSDT:1d": "BTC Spot 日线",
   "BTCUSDT:4h": "BTC Spot 4小时",
   "BTCUSDT:spot-price": "BTC Spot 参考价",
@@ -495,6 +583,16 @@ const ISSUE_REASON_DETAILS = {
   MARKET_EVENTS_NYFED_EVENT_TIME_MISSING: "目标事件没有可校验的发布时间，本轮不展示该月份事件。",
   MARKET_EVENTS_FOMC_SCHEMA_CHANGED: "美联储会议日历结构与既定契约不一致，本轮不展示议息事件。",
   MARKET_EVENTS_FOMC_DATE_INVALID: "美联储会议日期无法解析，本轮不展示议息事件。",
+  MARKET_EVENTS_NBS_SCHEMA_CHANGED: "国家统计局年度日程与既定表格契约不一致，本轮隔离该来源。",
+  MARKET_EVENTS_NBS_SCHEDULE_NOT_FOUND: "尚未在有界的官方通知公告页中发现对应年度日程；系统会按计划重试。",
+  MARKET_EVENTS_NBS_DATE_INVALID: "国家统计局日程包含无效日期，本轮隔离对应年度。",
+  MARKET_EVENTS_NBS_TIME_INVALID: "国家统计局日程包含无效时间，本轮隔离对应年度。",
+  MARKET_EVENTS_HK_CSD_SCHEMA_CHANGED: "香港政府统计处日程字段与既定契约不一致，本轮隔离对应年度。",
+  MARKET_EVENTS_HK_CSD_XLSX_INVALID: "香港政府统计处日程文件无法安全解析，本轮隔离对应年度。",
+  MARKET_EVENTS_HK_CSD_DATE_INVALID: "香港政府统计处日程包含无效日期，本轮隔离对应年度。",
+  MARKET_EVENTS_SFC_SCHEMA_CHANGED: "香港证监会监管日历字段与既定契约不一致，本轮隔离该来源。",
+  MARKET_EVENTS_SFC_JSON_INVALID: "香港证监会监管日历内嵌数据无法解析，本轮隔离该来源。",
+  MARKET_EVENTS_SFC_DATE_INVALID: "香港证监会监管日历包含无效日期，本轮隔离该来源。",
   MARKET_EVENTS_BLS_JSON_INVALID: "BLS公共API响应无法解析，最近通胀与就业结果暂不展示。",
   MARKET_EVENTS_BLS_RESPONSE_FAILED: "BLS公共API没有返回成功状态，事件日历不受影响。",
   MARKET_EVENTS_BLS_SCHEMA_CHANGED: "BLS公共API字段与既定契约不一致，最近宏观结果暂不展示。",
@@ -506,6 +604,16 @@ const ISSUE_REASON_DETAILS = {
   MARKET_EVENTS_CONSENSUS_DATE_INVALID: "一致预期的事件时间无效；没有与官方日历强行匹配。",
   MARKET_EVENTS_CONSENSUS_VALUE_INVALID: "一致预期数值无法可靠解析；相关指标不计算预期差。",
   MARKET_EVENTS_CONSENSUS_AMBIGUOUS: "同一事件同一指标出现冲突预期；相关指标不计算方向。",
+  STOCK_EVENTS_POOL_SCHEMA_CHANGED: "公开热点股池字段与既定契约不一致；对应子来源已隔离。",
+  STOCK_EVENTS_DIRECTORY_SCHEMA_CHANGED: "股票名称与代码目录字段与既定契约不一致；本轮保留安全的本地缓存。",
+  STOCK_EVENTS_DIRECTORY_BOUNDS_CHANGED: "股票目录页数或记录数超出既定安全边界；没有继续无界读取。",
+  STOCK_EVENTS_DIRECTORY_PAGING_CHANGED: "股票目录分页总数在同一轮读取中变化；本轮目录没有覆盖旧缓存。",
+  STOCK_EVENTS_DIRECTORY_INCOMPLETE: "股票目录没有完整读取到全部分页；本轮目录没有覆盖旧缓存。",
+  STOCK_EVENTS_CALENDAR_SCHEMA_CHANGED: "公司事件日历字段与既定契约不一致；受影响股票批次未生成日历事项。",
+  STOCK_EVENTS_CALENDAR_TRUNCATED: "公司事件日历超过有界分页上限；日志列出受影响股票批次与读取边界。",
+  STOCK_EVENTS_ANNOUNCEMENT_SCHEMA_CHANGED: "公司公告索引字段与既定契约不一致；受影响股票批次的公告没有继续解析。",
+  STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED: "公司公告总量超过该股票批次的有界分页上限；已读取记录仍保留，超出部分未展示。",
+  STOCK_EVENTS_PROJECTION_TRUNCATED: "个股事件总量超过本地结果上限；手动关注股票事件优先保留。",
 };
 
 function issueReasonLabel(reasonCode) {
@@ -514,8 +622,12 @@ function issueReasonLabel(reasonCode) {
   if (String(reasonCode).startsWith("MARKET_EVENTS_BEA_")) return "BEA发布日程暂时无法读取";
   if (String(reasonCode).startsWith("MARKET_EVENTS_NYFED_")) return "纽约联储事件日历暂时无法读取";
   if (String(reasonCode).startsWith("MARKET_EVENTS_FOMC_")) return "美联储议息日历暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_NBS_")) return "国家统计局发布日程暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_HK_CSD_")) return "香港政府统计处发布日程暂时无法读取";
+  if (String(reasonCode).startsWith("MARKET_EVENTS_SFC_")) return "香港证监会监管日历暂时无法读取";
   if (String(reasonCode).startsWith("MARKET_EVENTS_BLS_")) return "BLS宏观数据暂时无法读取";
   if (String(reasonCode).startsWith("MARKET_EVENTS_CONSENSUS_")) return "市场一致预期暂时无法读取";
+  if (String(reasonCode).startsWith("STOCK_EVENTS_")) return "个股事件公开来源暂时无法读取";
   return "采集过程出现未识别问题";
 }
 
@@ -527,7 +639,80 @@ function issueReasonDetail(reasonCode) {
   if (String(reasonCode).startsWith("MARKET_EVENTS_")) {
     return "读取对应官方来源时失败；系统会按计划重试，其他来源的事件仍照常展示。";
   }
+  if (String(reasonCode).startsWith("STOCK_EVENTS_")) {
+    return "读取对应个股事件公开来源时失败；受影响批次已隔离，其他来源仍照常更新。";
+  }
   return "该问题尚无更具体的页面说明；系统会保留记录并继续按计划采集。";
+}
+
+const ISSUE_STATE_LABELS = {
+  ACTIVE: "当前影响",
+  RECOVERED: "已恢复",
+  HISTORICAL: "历史记录",
+};
+
+const ISSUE_CONTEXT_LABELS = {
+  selection_origin: "股票来源",
+  stock_codes: "股票批次",
+  stock_count: "股票数量",
+  window_start: "查询起始",
+  window_end: "查询截止",
+  page_size: "每页上限",
+  page_limit: "分页上限",
+  pages_read: "已读页数",
+  failed_page: "失败页码",
+  records_read: "已读记录",
+  upstream_total_hits: "上游总量",
+  events_before_limit: "截断前事件",
+  event_limit: "事件上限",
+  manual_event_count: "手动关注事件",
+  automatic_event_count: "每日入选事件",
+  exception_type: "异常类型",
+  origin_module: "代码模块",
+  origin_function: "代码函数",
+  origin_line: "代码行号",
+  boundary_module: "项目边界模块",
+  boundary_function: "项目边界函数",
+  boundary_line: "项目边界行号",
+};
+
+const ISSUE_CONTEXT_ORDER = Object.keys(ISSUE_CONTEXT_LABELS);
+
+function issueContextValue(key, value) {
+  if (value === null || value === undefined || value === "") return "未知";
+  if (key === "selection_origin") {
+    if (value === "MANUAL") return "手动关注";
+    if (value === "AUTO") return "每日入选";
+  }
+  if (key === "stock_codes") return String(value).replaceAll(",", "、");
+  return String(value);
+}
+
+function issueContextEntries(context) {
+  if (!context || typeof context !== "object" || Array.isArray(context)) return [];
+  const keys = Object.keys(context).sort((left, right) => {
+    const leftIndex = ISSUE_CONTEXT_ORDER.indexOf(left);
+    const rightIndex = ISSUE_CONTEXT_ORDER.indexOf(right);
+    return (leftIndex < 0 ? ISSUE_CONTEXT_ORDER.length : leftIndex)
+      - (rightIndex < 0 ? ISSUE_CONTEXT_ORDER.length : rightIndex)
+      || left.localeCompare(right);
+  });
+  return keys.map((key) => ({
+    key,
+    label: ISSUE_CONTEXT_LABELS[key] || key,
+    value: issueContextValue(key, context[key]),
+  }));
+}
+
+function issueReasonDetailForRecord(issue) {
+  const detail = issueReasonDetail(issue.reason_code);
+  if (
+    issue.reason_code === "STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED"
+    && issueContextEntries(issue.context).length === 0
+  ) {
+    return `${detail} 这条历史记录产生于批次定位字段上线前，原分页统计未被保存。`;
+  }
+  return detail;
 }
 
 const CHART = {
@@ -627,6 +812,12 @@ function syncMonitorLocation(monitorId) {
 function queryUrl() {
   const params = new URLSearchParams();
   if (state.monitorId) params.set("monitor_id", state.monitorId);
+  if (state.monitorId === RADAR_MONITOR_ID) {
+    params.set(
+      "view",
+      RADAR_TAB_LOCATION_VALUES[state.radarTab] || RADAR_TAB_LOCATION_VALUES.TABLE,
+    );
+  }
   params.set("hours", String(state.hours));
   if (state.seriesKey) params.set("series_key", state.seriesKey);
   if (state.buybackStockQuery.trim()) {
@@ -634,6 +825,9 @@ function queryUrl() {
   }
   if (state.eventQuery.trim()) {
     params.set("event_query", state.eventQuery.trim());
+  }
+  if (state.projectionKind === "stock_events" && Array.isArray(state.stockSelectedCodes)) {
+    state.stockSelectedCodes.forEach((code) => params.append("stock_code", code));
   }
   Object.entries(state.filters).forEach(([key, value]) => {
     if (Array.isArray(value)) {
@@ -657,10 +851,50 @@ async function maintainForegroundObservation(monitor) {
       `/api/monitors/${encodeURIComponent(monitor.monitor_id)}/observe`,
       { method: "POST", headers: { Accept: "application/json" } },
     );
-    return response.ok;
+    if (!response.ok) return false;
+    const payload = await response.json();
+    return Boolean(payload.refresh_requested);
   } catch (_error) {
     return false;
   }
+}
+
+function stopForegroundObservation() {
+  clearInterval(state.observationTimer);
+  state.observationTimer = null;
+  state.observationMonitorId = null;
+}
+
+function requestNearTermViewRefresh() {
+  if (document.visibilityState !== "visible") return;
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = setTimeout(() => loadView(), 3000);
+}
+
+function syncForegroundObservation(monitor) {
+  if (
+    document.visibilityState !== "visible"
+    || !monitor?.enabled
+    || !monitor?.collection_cadence?.adaptive
+  ) {
+    stopForegroundObservation();
+    return;
+  }
+  const monitorId = monitor.monitor_id;
+  if (
+    state.observationTimer !== null
+    && state.observationMonitorId === monitorId
+  ) return;
+  stopForegroundObservation();
+  state.observationMonitorId = monitorId;
+  state.observationTimer = setInterval(async () => {
+    const current = state.viewPayload?.monitor;
+    if (state.monitorId !== monitorId || current?.monitor_id !== monitorId) {
+      stopForegroundObservation();
+      return;
+    }
+    if (await maintainForegroundObservation(current)) requestNearTermViewRefresh();
+  }, 15000);
 }
 
 async function loadView({ preserveSeries = true } = {}) {
@@ -692,6 +926,18 @@ async function loadView({ preserveSeries = true } = {}) {
         cache: "no-store",
       });
     }
+    if (
+      response.status === 422
+      && state.projectionKind === "stock_events"
+      && Array.isArray(state.stockSelectedCodes)
+    ) {
+      state.stockSelectedCodes = null;
+      response = await fetch(queryUrl(), {
+        signal: state.request.signal,
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      });
+    }
     if (!response.ok) throw new Error(`HTTP_${response.status}`);
     const payload = await response.json();
     const requestedRefreshSeconds = Number(payload.refresh_after_seconds);
@@ -707,20 +953,39 @@ async function loadView({ preserveSeries = true } = {}) {
     } else {
       state.buybackStockQuery = "";
     }
-    if (state.projectionKind === "market_events") {
+    if (["market_events", "stock_events"].includes(state.projectionKind)) {
       if (document.activeElement !== ui.eventSearch) {
-        state.eventQuery = String(payload.market_events?.event_query || "");
+        state.eventQuery = String(
+          (state.projectionKind === "stock_events" ? payload.stock_events : payload.market_events)?.event_query || "",
+        );
       }
     } else {
       state.eventQuery = "";
     }
-    state.seriesKey = payload.selected_series_key;
+    if (state.projectionKind === "stock_events") {
+      const available = new Set((payload.stock_events?.securities || []).map((item) => String(item.code)));
+      if (Array.isArray(state.stockSelectedCodes)) {
+        state.stockSelectedCodes = state.stockSelectedCodes.filter((code) => available.has(code));
+      }
+    } else {
+      state.stockSelectedCodes = null;
+    }
+    if (
+      payload.monitor.projection_kind !== "altcoin_radar"
+      || ["TABLE", "HISTORY"].includes(state.radarTab)
+    ) {
+      state.seriesKey = payload.selected_series_key;
+    }
     state.filters = payload.monitor.selected_filters;
     state.latestRunId = payload.monitor.latest_run?.run_id ?? null;
     state.viewPayload = payload;
     syncMonitorLocation(state.monitorId);
     render(payload);
-    await maintainForegroundObservation(payload.monitor);
+    const observationRequested = state.observationMonitorId === payload.monitor.monitor_id
+      ? false
+      : await maintainForegroundObservation(payload.monitor);
+    syncForegroundObservation(payload.monitor);
+    if (observationRequested) nextRefreshMilliseconds = 3000;
     if (state.pendingManualRefresh?.monitorId === state.monitorId) {
       const manualRunStarted = Number(payload.monitor.latest_run?.run_id ?? 0)
         > state.pendingManualRefresh.runAfter;
@@ -746,22 +1011,26 @@ async function loadView({ preserveSeries = true } = {}) {
 function render(payload) {
   const isBuyback = payload.monitor.projection_kind === "buyback";
   const isMarketEvents = payload.monitor.projection_kind === "market_events";
+  const isStockEvents = payload.monitor.projection_kind === "stock_events";
   const isAltcoinRadar = payload.monitor.projection_kind === "altcoin_radar";
   const isBtcIntelligence = payload.monitor.projection_kind === "btc_intelligence";
   ui.workspace.dataset.projectionKind = isBuyback
     ? "buyback"
     : isMarketEvents
       ? "market-events"
-      : isAltcoinRadar
-        ? "altcoin-radar"
-        : isBtcIntelligence
-          ? "btc-intelligence"
-          : "time-series";
+      : isStockEvents
+        ? "stock-events"
+        : isAltcoinRadar
+          ? "altcoin-radar"
+          : isBtcIntelligence
+            ? "btc-intelligence"
+            : "time-series";
   renderGlobal(payload);
   renderMonitorList(payload.monitors);
   renderContext(payload.monitor);
   renderControl(payload.monitor);
   renderConfiguration(payload.monitor.configuration, payload.monitor.latest_run);
+  if (isStockEvents) ui.configurationRegion.hidden = true;
   renderFilters(
     payload.monitor.filters,
     payload.time_windows,
@@ -770,10 +1039,11 @@ function render(payload) {
   renderBuybackOverview(payload.buyback);
   renderBuybackSources(payload.buyback);
   renderMarketEvents(payload.market_events);
+  renderStockEvents(payload.stock_events);
   renderBtcIntelligence(payload.btc_intelligence);
-  ui.historyRegion.hidden = isBuyback || isMarketEvents || isAltcoinRadar || isBtcIntelligence;
-  ui.historyWindowField.hidden = isBuyback || isMarketEvents || isAltcoinRadar || isBtcIntelligence;
-  ui.dataCutoff.hidden = isBuyback || isMarketEvents || isBtcIntelligence;
+  ui.historyRegion.hidden = isBuyback || isMarketEvents || isStockEvents || isAltcoinRadar || isBtcIntelligence;
+  ui.historyWindowField.hidden = isBuyback || isMarketEvents || isStockEvents || isAltcoinRadar || isBtcIntelligence;
+  ui.dataCutoff.hidden = isBuyback || isMarketEvents || isStockEvents || isBtcIntelligence;
   ui.quoteScroll.classList.toggle("buyback-table-scroll", isBuyback);
   ui.quoteScroll.classList.toggle("market-event-table-scroll", isMarketEvents);
   ui.quoteScroll.classList.toggle("radar-table-scroll", isAltcoinRadar);
@@ -788,7 +1058,10 @@ function render(payload) {
           : "最新监控数据，可横向滚动",
   );
   renderRadarPriceFilter(payload.altcoin_price_position);
-  if (isAltcoinRadar) {
+  if (isStockEvents) {
+    ui.tableRegion.hidden = true;
+    renderRunSummary([]);
+  } else if (isAltcoinRadar) {
     renderRadarTableView(payload);
   } else {
     ui.quoteTableTitle.textContent = payload.buyback?.list_title
@@ -813,7 +1086,7 @@ function render(payload) {
   );
   renderEvaluation(payload.evaluation);
   applyRadarTabState();
-  renderIssues(payload.issues, payload.monitor);
+  renderIssues(payload.issues, payload.current_issues, payload.monitor);
   updateBackToTopVisibility();
   requestAnimationFrame(updateQuoteHorizontalScrollbar);
 }
@@ -1454,6 +1727,703 @@ function renderMarketEvents(eventPayload) {
   applyEventTabState();
 }
 
+function shanghaiDateKey(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(parsed);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function stockMonthShift(monthKey, offset) {
+  const [year, month] = String(monthKey || "").split("-").map(Number);
+  if (!year || !month) return null;
+  const shifted = new Date(Date.UTC(year, month - 1 + offset, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+function stockDateLabel(dateKey, options = {}) {
+  const parsed = new Date(`${dateKey}T12:00:00+08:00`);
+  if (Number.isNaN(parsed.getTime())) return "日期未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: options.month || "long",
+    day: options.day || "numeric",
+    weekday: options.weekday || "short",
+    year: options.year,
+  }).format(parsed);
+}
+
+function stockEventBadge(text, kind, value = "") {
+  const badge = createElement("span", `stock-event-badge stock-event-badge-${kind}`, text);
+  if (value) badge.dataset.value = value;
+  return badge;
+}
+
+function stockEventTitle(event) {
+  const name = event.stock_name || "名称待更新";
+  return `${name} ${event.stock_code || ""}`.trim();
+}
+
+function stockEventDisplayTitle(event) {
+  if (
+    event.source_kind === "EVENT_CALENDAR"
+    && event.summary
+    && event.summary !== event.title
+  ) {
+    return `${event.title || "公司事件"} · ${event.summary}`;
+  }
+  return event.title || "公司事件";
+}
+
+function eventsOnStockDate(payload, dateKey) {
+  return (payload?.events || []).filter((event) => event.event_date === dateKey);
+}
+
+function renderStockEventDetail(event) {
+  ui.stockEventDetail.hidden = !event;
+  if (!event) return;
+  ui.stockEventDetailBadges.replaceChildren(
+    stockEventBadge(event.category_label || "公司事件", "category", event.category || "DISCLOSURE"),
+    stockEventBadge(event.importance === "HIGH" ? "重点" : "一般", "importance", event.importance || "MEDIUM"),
+    stockEventBadge(event.state_label || "状态未知", "state", event.state || "UNKNOWN"),
+  );
+  ui.stockEventDetailTitle.textContent = event.title || "公司事件";
+  ui.stockEventDetailStock.textContent = `${stockEventTitle(event)} · ${stockDateLabel(event.event_date)}`;
+  ui.stockEventDetailSummary.textContent = event.summary || "来源未提供补充摘要。";
+  const sourceUrl = safeExternalUrl(event.source_url);
+  ui.stockEventDetailSource.hidden = !sourceUrl;
+  if (sourceUrl) {
+    ui.stockEventDetailSource.href = sourceUrl;
+    ui.stockEventDetailSource.textContent = `查看${event.source_label || "公开来源"} ↗`;
+    ui.stockEventDetailSource.setAttribute(
+      "aria-label",
+      `查看${event.source_label || "公开来源"}，新标签页`,
+    );
+  } else {
+    ui.stockEventDetailSource.removeAttribute("href");
+  }
+}
+
+function renderStockDayAgenda(payload) {
+  const dateKey = state.stockSelectedDate;
+  const events = eventsOnStockDate(payload, dateKey);
+  ui.stockDayAgendaDate.textContent = dateKey ? stockDateLabel(dateKey, { year: "numeric" }) : "日期未知";
+  ui.stockDayAgendaCount.textContent = `${events.length} 项`;
+  ui.stockDayAgendaList.replaceChildren();
+  if (!events.some((event) => event.event_id === state.stockSelectedEventId)) {
+    state.stockSelectedEventId = events[0]?.event_id || null;
+  }
+  events.forEach((event) => {
+    const button = createElement("button", "stock-day-event");
+    button.type = "button";
+    button.dataset.selected = String(event.event_id === state.stockSelectedEventId);
+    const heading = createElement("span", "stock-day-event-heading");
+    heading.append(
+      createElement("strong", "", stockEventTitle(event)),
+      stockEventBadge(event.category_label || "公司事件", "category", event.category || "DISCLOSURE"),
+    );
+    button.append(
+      heading,
+      createElement("span", "stock-day-event-title", stockEventDisplayTitle(event)),
+      createElement("span", "stock-day-event-meta", `${event.state_label || ""} · ${event.source_label || "公开来源"}`),
+    );
+    button.addEventListener("click", () => {
+      state.stockSelectedEventId = event.event_id;
+      renderStockDayAgenda(payload);
+    });
+    ui.stockDayAgendaList.append(button);
+  });
+  ui.stockDayAgendaEmpty.hidden = events.length > 0;
+  ui.stockEventDetail.hidden = events.length === 0;
+  renderStockEventDetail(
+    events.find((event) => event.event_id === state.stockSelectedEventId) || null,
+  );
+}
+
+function renderStockCalendar(payload) {
+  const monthKey = state.stockCalendarMonth;
+  const [year, month] = String(monthKey || "").split("-").map(Number);
+  if (!year || !month) return;
+  const todayKey = shanghaiDateKey(state.viewPayload?.server_time || new Date().toISOString());
+  ui.stockCalendarTitle.textContent = `${year}年${month}月`;
+  ui.stockCalendarGrid.replaceChildren();
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const leading = (first.getUTCDay() + 6) % 7;
+  const totalCells = Math.ceil((leading + daysInMonth) / 7) * 7;
+  const eventsByDate = new Map();
+  (payload?.events || []).forEach((event) => {
+    if (!String(event.event_date || "").startsWith(`${monthKey}-`)) return;
+    const items = eventsByDate.get(event.event_date) || [];
+    items.push(event);
+    eventsByDate.set(event.event_date, items);
+  });
+  for (let index = 0; index < totalCells; index += 1) {
+    const day = index - leading + 1;
+    if (day < 1 || day > daysInMonth) {
+      const blank = createElement("span", "stock-calendar-day stock-calendar-day-blank");
+      blank.setAttribute("aria-hidden", "true");
+      ui.stockCalendarGrid.append(blank);
+      continue;
+    }
+    const dateKey = `${monthKey}-${String(day).padStart(2, "0")}`;
+    const dayEvents = eventsByDate.get(dateKey) || [];
+    const cell = createElement("div", "stock-calendar-day");
+    cell.setAttribute("role", "gridcell");
+    cell.dataset.today = String(dateKey === todayKey);
+    cell.dataset.selected = String(dateKey === state.stockSelectedDate);
+    const dateButton = createElement("button", "stock-calendar-date", String(day));
+    dateButton.type = "button";
+    dateButton.setAttribute("aria-label", `${stockDateLabel(dateKey)}，${dayEvents.length} 项事件`);
+    dateButton.addEventListener("click", () => {
+      state.stockSelectedDate = dateKey;
+      state.stockSelectedEventId = dayEvents[0]?.event_id || null;
+      renderStockCalendar(payload);
+    });
+    cell.append(dateButton);
+    const items = createElement("div", "stock-calendar-events");
+    dayEvents.slice(0, 3).forEach((event) => {
+      const item = createElement("button", "stock-calendar-event", event.stock_name || event.stock_code || "股票");
+      item.type = "button";
+      item.dataset.category = event.category || "DISCLOSURE";
+      item.title = `${stockEventTitle(event)} · ${stockEventDisplayTitle(event)}`;
+      item.addEventListener("click", () => {
+        state.stockSelectedDate = dateKey;
+        state.stockSelectedEventId = event.event_id;
+        renderStockCalendar(payload);
+      });
+      items.append(item);
+    });
+    if (dayEvents.length > 3) {
+      items.append(createElement("span", "stock-calendar-more", `+${dayEvents.length - 3}`));
+    }
+    cell.append(items);
+    ui.stockCalendarGrid.append(cell);
+  }
+  const minimumMonth = String(payload?.window_start || monthKey).slice(0, 7);
+  const maximumMonth = String(payload?.window_end || monthKey).slice(0, 7);
+  ui.stockCalendarPrevious.disabled = monthKey <= minimumMonth;
+  ui.stockCalendarNext.disabled = monthKey >= maximumMonth;
+  renderStockDayAgenda(payload);
+}
+
+function renderStockTimeline(payload) {
+  ui.stockEventsTimeline.replaceChildren();
+  const todayKey = shanghaiDateKey(state.viewPayload?.server_time || new Date().toISOString());
+  const allEvents = payload?.events || [];
+  const upcoming = allEvents
+    .filter((event) => event.event_date >= todayKey)
+    .sort((left, right) => (
+      String(left.event_date || "").localeCompare(String(right.event_date || ""))
+      || String(left.sort_at || "").localeCompare(String(right.sort_at || ""))
+    ));
+  const history = allEvents
+    .filter((event) => event.event_date < todayKey)
+    .sort((left, right) => (
+      String(right.event_date || "").localeCompare(String(left.event_date || ""))
+      || String(right.sort_at || "").localeCompare(String(left.sort_at || ""))
+    ));
+  const events = [...upcoming, ...history].slice(0, 240);
+  let previousDate = null;
+  let group = null;
+  events.forEach((event) => {
+    if (event.event_date !== previousDate) {
+      group = createElement("section", "stock-timeline-group");
+      const heading = createElement("header", "stock-timeline-date");
+      heading.append(
+        createElement("strong", "", stockDateLabel(event.event_date)),
+        createElement("span", "", event.event_date),
+      );
+      group.append(heading);
+      ui.stockEventsTimeline.append(group);
+      previousDate = event.event_date;
+    }
+    const button = createElement("button", "stock-timeline-event");
+    button.type = "button";
+    const body = createElement("span", "stock-timeline-event-body");
+    body.append(
+      createElement("strong", "", stockEventDisplayTitle(event)),
+      createElement("span", "", `${stockEventTitle(event)} · ${event.source_label || "公开来源"}`),
+    );
+    button.append(
+      stockEventBadge(event.category_label || "公司事件", "category", event.category || "DISCLOSURE"),
+      body,
+      createElement("span", "stock-timeline-state", event.state_label || ""),
+    );
+    button.addEventListener("click", () => {
+      state.stockCalendarMonth = String(event.event_date).slice(0, 7);
+      state.stockSelectedDate = event.event_date;
+      state.stockSelectedEventId = event.event_id;
+      state.stockEventView = "CALENDAR";
+      renderStockEvents(payload);
+    });
+    group?.append(button);
+  });
+  if ((payload?.events || []).length > events.length) {
+    ui.stockEventsTimeline.append(
+      createElement("p", "stock-timeline-limit", `时间线仅渲染前 ${events.length} 项；可缩小股票或事件筛选范围。`),
+    );
+  }
+  ui.stockEventsTimelineEmpty.hidden = events.length > 0;
+}
+
+function renderStockEventSources(payload) {
+  const sources = payload?.source_states || [];
+  ui.stockEventsSourceSummary.textContent = sources.length
+    ? `最近检查 ${payload.source_checked_at ? formatTime(payload.source_checked_at) : "未知"} · ${sources.length} 组来源`
+    : "等待首次来源检查";
+  ui.stockEventsSourceList.replaceChildren();
+  const labels = {
+    SUCCESS: "已更新",
+    EMPTY: "本轮为空",
+    PARTIAL: "部分可用",
+    ERROR: "暂不可用",
+  };
+  sources.forEach((source) => {
+    const row = createElement("article", "stock-source-row");
+    const heading = createElement("div", "stock-source-heading");
+    heading.append(
+      createElement("strong", "", source.label || "公开来源"),
+      stockEventBadge(labels[source.status] || source.status || "未知", "source", source.status || "UNKNOWN"),
+    );
+    const linkUrl = safeExternalUrl(source.source_url);
+    const detail = createElement("p", "", source.detail || "未提供来源说明");
+    row.append(heading, detail);
+    const meta = createElement("p", "stock-source-meta");
+    meta.textContent = [
+      source.record_count === null || source.record_count === undefined ? null : `${source.record_count} 条`,
+      source.checked_at ? formatTime(source.checked_at) : null,
+    ].filter(Boolean).join(" · ") || "尚无成功检查时间";
+    row.append(meta);
+    if (linkUrl) {
+      const link = createElement("a", "", "打开来源 ↗");
+      link.href = linkUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      row.append(link);
+    }
+    ui.stockEventsSourceList.append(row);
+  });
+}
+
+function renderStockEvents(payload) {
+  const active = state.projectionKind === "stock_events";
+  ui.stockEvents.hidden = !active;
+  if (!active) {
+    state.stockEventPayload = null;
+    return;
+  }
+  state.stockEventPayload = payload;
+  const todayKey = shanghaiDateKey(state.viewPayload?.server_time || new Date().toISOString());
+  const minimumMonth = String(payload?.window_start || todayKey || "").slice(0, 7);
+  const maximumMonth = String(payload?.window_end || todayKey || "").slice(0, 7);
+  if (!state.stockCalendarMonth || state.stockCalendarMonth < minimumMonth || state.stockCalendarMonth > maximumMonth) {
+    state.stockCalendarMonth = String(todayKey || payload?.window_start || "").slice(0, 7);
+  }
+  const monthEvents = (payload?.events || []).filter(
+    (event) => String(event.event_date || "").startsWith(`${state.stockCalendarMonth}-`),
+  );
+  if (!state.stockSelectedDate || !state.stockSelectedDate.startsWith(`${state.stockCalendarMonth}-`)) {
+    state.stockSelectedDate = todayKey?.startsWith(`${state.stockCalendarMonth}-`)
+      ? todayKey
+      : monthEvents[0]?.event_date || `${state.stockCalendarMonth}-01`;
+    state.stockSelectedEventId = null;
+  }
+  ui.stockEventsScope.textContent = [
+    `关注股 ${Number(payload?.manual_security_count || 0)}`,
+    `每日入选 ${Number(payload?.auto_security_count || 0)}`,
+    `当前显示 ${Number(payload?.selected_security_count || 0)}`,
+    payload?.selection_trade_date ? `名单截至 ${payload.selection_trade_date}` : null,
+  ].filter(Boolean).join(" · ");
+  ui.stockEventsWindow.textContent = payload?.window_start && payload?.window_end
+    ? `事件范围 ${payload.window_start} 至 ${payload.window_end} · ${Number(payload.event_count || 0)} 项`
+    : "等待首次成功采集";
+  const messages = payload?.coverage_messages || [];
+  ui.stockEventsNotice.hidden = messages.length === 0;
+  ui.stockEventsNotice.textContent = messages.length
+    ? `本轮覆盖提示：${messages.join("；")}。`
+    : "";
+  const calendar = state.stockEventView === "CALENDAR";
+  ui.stockEventsCalendarTab.setAttribute("aria-selected", String(calendar));
+  ui.stockEventsTimelineTab.setAttribute("aria-selected", String(!calendar));
+  ui.stockEventsCalendarPanel.hidden = !calendar;
+  ui.stockEventsTimelinePanel.hidden = calendar;
+  if (calendar) renderStockCalendar(payload);
+  else renderStockTimeline(payload);
+  renderStockEventSources(payload);
+}
+
+function stockSelectorSecurities() {
+  const securities = (state.stockEventPayload?.securities || []).map((item) => ({ ...item }));
+  const known = new Set(securities.map((item) => String(item.code)));
+  state.stockSelectorDraftManual.forEach((code) => {
+    if (!known.has(code)) {
+      const directoryEntry = state.stockDirectoryKnown.get(code) || {};
+      securities.push({
+        code,
+        name: directoryEntry.name || null,
+        market_label: directoryEntry.market_label || null,
+        industry: directoryEntry.industry || null,
+        is_manual: true,
+        is_auto: false,
+        auto_reasons: [],
+        verification_state: "PENDING",
+      });
+    }
+  });
+  return securities;
+}
+
+function closeStockDirectorySuggestions() {
+  state.stockDirectorySuggestions = [];
+  state.stockDirectorySuggestionIndex = -1;
+  ui.stockSelectorSuggestions.replaceChildren();
+  ui.stockSelectorSuggestions.hidden = true;
+  ui.stockSelectorAddQuery.setAttribute("aria-expanded", "false");
+  ui.stockSelectorAddQuery.removeAttribute("aria-activedescendant");
+  ui.stockSelectorAddQuery.removeAttribute("aria-busy");
+}
+
+function resetStockDirectorySearch() {
+  state.stockDirectorySearchSerial += 1;
+  if (state.stockDirectorySearchTimer !== null) {
+    clearTimeout(state.stockDirectorySearchTimer);
+    state.stockDirectorySearchTimer = null;
+  }
+  state.stockDirectorySelected = null;
+  closeStockDirectorySuggestions();
+}
+
+function chooseStockDirectorySuggestion(suggestion) {
+  state.stockDirectoryKnown.set(String(suggestion.code), suggestion);
+  state.stockDirectorySelected = suggestion;
+  ui.stockSelectorAddQuery.value = `${suggestion.name} ${suggestion.code}`;
+  ui.stockSelectorStatus.textContent = `已选择 ${suggestion.name} ${suggestion.code}，点击添加。`;
+  closeStockDirectorySuggestions();
+}
+
+function renderStockDirectorySuggestions(status = "SUCCESS") {
+  const suggestions = state.stockDirectorySuggestions;
+  ui.stockSelectorSuggestions.replaceChildren();
+  if (!suggestions.length) {
+    const message = status === "UNAVAILABLE"
+      ? "股票目录正在等待更新，可直接输入6位代码。"
+      : "本地股票目录没有匹配结果。";
+    const empty = createElement("div", "stock-selector-suggestion-empty", message);
+    empty.setAttribute("role", "option");
+    empty.setAttribute("aria-disabled", "true");
+    ui.stockSelectorSuggestions.append(empty);
+  } else {
+    suggestions.forEach((suggestion, index) => {
+      const option = createElement("button", "stock-selector-suggestion");
+      option.type = "button";
+      option.id = `stock-selector-suggestion-${index}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(index === state.stockDirectorySuggestionIndex));
+      const identity = createElement("span", "stock-selector-suggestion-identity");
+      identity.append(
+        createElement("strong", "", suggestion.name),
+        createElement("span", "", suggestion.code),
+      );
+      const context = [suggestion.market_label, suggestion.industry].filter(Boolean).join(" · ");
+      option.append(identity, createElement("span", "stock-selector-suggestion-context", context));
+      option.addEventListener("click", () => chooseStockDirectorySuggestion(suggestion));
+      ui.stockSelectorSuggestions.append(option);
+    });
+  }
+  ui.stockSelectorSuggestions.hidden = false;
+  ui.stockSelectorAddQuery.setAttribute("aria-expanded", "true");
+  const active = state.stockDirectorySuggestionIndex;
+  if (active >= 0) {
+    ui.stockSelectorAddQuery.setAttribute("aria-activedescendant", `stock-selector-suggestion-${active}`);
+  } else {
+    ui.stockSelectorAddQuery.removeAttribute("aria-activedescendant");
+  }
+}
+
+async function searchStockDirectory(query, serial) {
+  try {
+    const params = new URLSearchParams({ q: query, limit: "8" });
+    const response = await fetch(
+      `/api/monitors/${encodeURIComponent(state.monitorId)}/stocks/search?${params.toString()}`,
+      { headers: { Accept: "application/json" } },
+    );
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `HTTP_${response.status}`);
+    if (serial !== state.stockDirectorySearchSerial) return;
+    state.stockDirectorySuggestions = Array.isArray(payload.matches) ? payload.matches : [];
+    state.stockDirectorySuggestions.forEach((item) => {
+      state.stockDirectoryKnown.set(String(item.code), item);
+    });
+    state.stockDirectorySuggestionIndex = state.stockDirectorySuggestions.length ? 0 : -1;
+    renderStockDirectorySuggestions(payload.status);
+    if (payload.status === "STALE") {
+      ui.stockSelectorStatus.textContent = "搜索推荐来自上次成功更新的本地股票目录。";
+    } else if (payload.status === "UNAVAILABLE") {
+      ui.stockSelectorStatus.textContent = "股票目录暂不可用，也可直接输入6位代码。";
+    } else {
+      ui.stockSelectorStatus.textContent = "";
+    }
+  } catch (error) {
+    if (serial !== state.stockDirectorySearchSerial) return;
+    closeStockDirectorySuggestions();
+    ui.stockSelectorStatus.textContent = `股票搜索暂不可用，可直接输入6位代码 · ${error.message}`;
+  } finally {
+    if (serial === state.stockDirectorySearchSerial) {
+      ui.stockSelectorAddQuery.removeAttribute("aria-busy");
+    }
+  }
+}
+
+function scheduleStockDirectorySearch() {
+  state.stockDirectorySelected = null;
+  state.stockDirectorySearchSerial += 1;
+  const serial = state.stockDirectorySearchSerial;
+  if (state.stockDirectorySearchTimer !== null) {
+    clearTimeout(state.stockDirectorySearchTimer);
+    state.stockDirectorySearchTimer = null;
+  }
+  closeStockDirectorySuggestions();
+  const query = ui.stockSelectorAddQuery.value.trim();
+  if (!query) {
+    ui.stockSelectorStatus.textContent = "";
+    return;
+  }
+  ui.stockSelectorAddQuery.setAttribute("aria-busy", "true");
+  state.stockDirectorySearchTimer = setTimeout(() => {
+    state.stockDirectorySearchTimer = null;
+    void searchStockDirectory(query, serial);
+  }, 180);
+}
+
+function renderStockSelector() {
+  const query = String(ui.stockSelectorSearch.value || "").trim().toLocaleLowerCase("zh-CN");
+  const manual = state.stockSelectorTab === "MANUAL";
+  const securities = stockSelectorSecurities().filter((item) => {
+    const code = String(item.code || "");
+    const isInTab = manual
+      ? state.stockSelectorDraftManual.has(code)
+      : Boolean(item.is_auto);
+    if (!isInTab) return false;
+    return !query || `${code}${item.name || ""}`.toLocaleLowerCase("zh-CN").includes(query);
+  });
+  ui.stockSelectorManualTab.setAttribute("aria-selected", String(manual));
+  ui.stockSelectorAutoTab.setAttribute("aria-selected", String(!manual));
+  ui.stockSelectorAddForm.hidden = !manual;
+  ui.stockSelectorHelp.textContent = manual
+    ? "输入中文名称或代码搜索；添加后保存到本机并持续监控。勾选只控制当前页面显示。"
+    : "每日入选按最近交易日强势、涨停/连板与近期新高股池冻结；不表示推荐。";
+  ui.stockSelectorList.replaceChildren();
+  securities.forEach((security) => {
+    const code = String(security.code);
+    const row = createElement("div", "stock-selector-row");
+    const choice = createElement("label", "stock-selector-choice");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.stockSelectorDraftCodes.has(code);
+    checkbox.setAttribute("aria-label", `显示 ${security.name || code}`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.stockSelectorDraftCodes.add(code);
+      else state.stockSelectorDraftCodes.delete(code);
+      renderStockSelector();
+    });
+    const identity = createElement("span", "stock-selector-identity");
+    identity.append(
+      createElement("strong", "", security.name || "名称待来源确认"),
+      createElement("span", "", code),
+    );
+    choice.append(checkbox, identity);
+    const tags = createElement("span", "stock-selector-tags");
+    if (state.stockSelectorDraftManual.has(code)) {
+      tags.append(stockEventBadge("长期关注", "manual"));
+    }
+    if (security.is_auto) {
+      tags.append(stockEventBadge((security.auto_reasons || []).join(" / ") || "每日入选", "auto"));
+    }
+    row.append(choice, tags);
+    if (manual) {
+      const remove = createElement("button", "stock-selector-remove", "移除");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `移除关注 ${security.name || code}`);
+      remove.addEventListener("click", () => {
+        state.stockSelectorDraftManual.delete(code);
+        if (!security.is_auto) state.stockSelectorDraftCodes.delete(code);
+        renderStockSelector();
+      });
+      row.append(remove);
+    }
+    ui.stockSelectorList.append(row);
+  });
+  if (!securities.length) {
+    ui.stockSelectorList.append(
+      createElement("p", "stock-selector-empty", query ? "没有匹配股票。" : manual ? "尚未添加手动关注股票。" : "等待每日动态股池。"),
+    );
+  }
+  ui.stockSelectorCount.textContent = `已选 ${state.stockSelectorDraftCodes.size} 支`;
+}
+
+function openStockSelector() {
+  const configurationCodes = state.viewPayload?.monitor?.configuration?.values?.manual_stock_codes || [];
+  const selectedCodes = state.stockEventPayload?.selected_stock_codes || [];
+  state.stockSelectorOriginalManual = new Set(configurationCodes.map(String));
+  state.stockSelectorDraftManual = new Set(configurationCodes.map(String));
+  state.stockSelectorDraftCodes = new Set(selectedCodes.map(String));
+  state.stockDirectoryKnown = new Map(
+    (state.stockEventPayload?.securities || []).map((item) => [String(item.code), item]),
+  );
+  state.stockSelectorTab = "MANUAL";
+  ui.stockSelectorSearch.value = "";
+  ui.stockSelectorAddQuery.value = "";
+  ui.stockSelectorStatus.textContent = "";
+  resetStockDirectorySearch();
+  renderStockSelector();
+  ui.stockSelectorDialog.showModal();
+  ui.stockSelectorAddQuery.focus();
+}
+
+async function applyStockSelector() {
+  if (state.stockSelectorSubmitting) return;
+  const manual = [...state.stockSelectorDraftManual].sort();
+  const original = [...state.stockSelectorOriginalManual].sort();
+  const manualChanged = manual.join(",") !== original.join(",");
+  if (!state.stockSelectorDraftCodes.size && !manualChanged) {
+    ui.stockSelectorStatus.textContent = "请至少选择一支股票用于显示。";
+    return;
+  }
+  state.stockSelectorSubmitting = true;
+  ui.stockSelectorApply.disabled = true;
+  ui.stockSelectorStatus.textContent = manualChanged ? "正在保存关注股票…" : "正在应用显示范围…";
+  try {
+    if (manualChanged) {
+      const response = await fetch(
+        `/api/monitors/${encodeURIComponent(state.monitorId)}/configuration`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ values: { manual_stock_codes: manual } }),
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || `HTTP_${response.status}`);
+      state.pendingConfigurationRunAfter = result.refresh_requested ? (state.latestRunId ?? 0) : null;
+      state.stockSelectedCodes = null;
+    } else {
+      state.stockSelectedCodes = [...state.stockSelectorDraftCodes];
+    }
+    ui.stockSelectorDialog.close();
+    await loadView({ preserveSeries: false });
+  } catch (error) {
+    ui.stockSelectorStatus.textContent = `应用失败 · ${error.message}`;
+  } finally {
+    state.stockSelectorSubmitting = false;
+    ui.stockSelectorApply.disabled = false;
+  }
+}
+
+ui.stockEventsCalendarTab.addEventListener("click", () => {
+  state.stockEventView = "CALENDAR";
+  renderStockEvents(state.stockEventPayload);
+});
+
+ui.stockEventsTimelineTab.addEventListener("click", () => {
+  state.stockEventView = "TIMELINE";
+  renderStockEvents(state.stockEventPayload);
+});
+
+ui.stockCalendarPrevious.addEventListener("click", () => {
+  state.stockCalendarMonth = stockMonthShift(state.stockCalendarMonth, -1);
+  state.stockSelectedDate = null;
+  renderStockEvents(state.stockEventPayload);
+});
+
+ui.stockCalendarNext.addEventListener("click", () => {
+  state.stockCalendarMonth = stockMonthShift(state.stockCalendarMonth, 1);
+  state.stockSelectedDate = null;
+  renderStockEvents(state.stockEventPayload);
+});
+
+ui.stockCalendarToday.addEventListener("click", () => {
+  const todayKey = shanghaiDateKey(state.viewPayload?.server_time || new Date().toISOString());
+  state.stockCalendarMonth = String(todayKey || "").slice(0, 7);
+  state.stockSelectedDate = todayKey;
+  state.stockSelectedEventId = null;
+  renderStockEvents(state.stockEventPayload);
+});
+
+ui.stockEventsSelectButton.addEventListener("click", openStockSelector);
+ui.stockSelectorClose.addEventListener("click", () => ui.stockSelectorDialog.close());
+ui.stockSelectorCancel.addEventListener("click", () => ui.stockSelectorDialog.close());
+ui.stockSelectorApply.addEventListener("click", () => { void applyStockSelector(); });
+ui.stockSelectorSearch.addEventListener("input", renderStockSelector);
+ui.stockSelectorManualTab.addEventListener("click", () => {
+  state.stockSelectorTab = "MANUAL";
+  renderStockSelector();
+});
+ui.stockSelectorAutoTab.addEventListener("click", () => {
+  state.stockSelectorTab = "AUTO";
+  ui.stockSelectorAddQuery.value = "";
+  resetStockDirectorySearch();
+  renderStockSelector();
+});
+ui.stockSelectorAddQuery.addEventListener("input", scheduleStockDirectorySearch);
+ui.stockSelectorAddQuery.addEventListener("keydown", (event) => {
+  const suggestions = state.stockDirectorySuggestions;
+  if (!suggestions.length) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    state.stockDirectorySuggestionIndex = (
+      state.stockDirectorySuggestionIndex + direction + suggestions.length
+    ) % suggestions.length;
+    renderStockDirectorySuggestions();
+    document.querySelector(`#stock-selector-suggestion-${state.stockDirectorySuggestionIndex}`)
+      ?.scrollIntoView({ block: "nearest" });
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeStockDirectorySuggestions();
+    return;
+  }
+  if (event.key === "Enter" && state.stockDirectorySuggestionIndex >= 0) {
+    event.preventDefault();
+    chooseStockDirectorySuggestion(suggestions[state.stockDirectorySuggestionIndex]);
+    ui.stockSelectorAddForm.requestSubmit();
+  }
+});
+ui.stockSelectorAddForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const query = ui.stockSelectorAddQuery.value.trim();
+  const selected = state.stockDirectorySelected;
+  const code = selected?.code || (/^\d{6}$/.test(query) ? query : "");
+  const limit = Number(state.stockEventPayload?.manual_limit || 50);
+  if (!/^\d{6}$/.test(String(code))) {
+    ui.stockSelectorStatus.textContent = "请从搜索推荐中选择股票，或直接输入6位代码。";
+    return;
+  }
+  if (!state.stockSelectorDraftManual.has(code) && state.stockSelectorDraftManual.size >= limit) {
+    ui.stockSelectorStatus.textContent = `手动关注最多 ${limit} 支。`;
+    return;
+  }
+  state.stockSelectorDraftManual.add(code);
+  state.stockSelectorDraftCodes.add(code);
+  ui.stockSelectorAddQuery.value = "";
+  const stockLabel = selected ? `${selected.name} ${code}` : code;
+  resetStockDirectorySearch();
+  ui.stockSelectorStatus.textContent = `${stockLabel} 已加入待保存关注。`;
+  renderStockSelector();
+});
+ui.stockSelectorDialog.addEventListener("click", (event) => {
+  if (event.target === ui.stockSelectorDialog) ui.stockSelectorDialog.close();
+});
+ui.stockSelectorDialog.addEventListener("close", resetStockDirectorySearch);
+
 function renderRadarPriceFilter(pricePayload) {
   const choices = Array.isArray(pricePayload?.filter_choices)
     ? pricePayload.filter_choices
@@ -1496,6 +2466,7 @@ function renderRadarPriceFilter(pricePayload) {
 
 function renderRadarTableView(payload) {
   if (!payload || payload.monitor?.projection_kind !== "altcoin_radar") return;
+  if (!["TABLE", "POSITION"].includes(state.radarTab)) return;
   const showingPosition = state.radarTab === "POSITION";
   if (!showingPosition) {
     ui.quoteTableTitle.textContent = payload.monitor.table_title;
@@ -1618,7 +2589,7 @@ function activateRadarTab(tab) {
   state.tablePage = 1;
   syncMonitorLocation(state.monitorId);
   applyRadarTabState();
-  renderRadarTableView(state.viewPayload);
+  loadView();
 }
 
 ui.eventUpcomingTab.addEventListener("click", () => {
@@ -1769,6 +2740,7 @@ function renderMonitorList(monitors) {
         seriesKey: state.seriesKey,
         buybackStockQuery: state.buybackStockQuery,
         eventQuery: state.eventQuery,
+        stockSelectedCodes: state.stockSelectedCodes,
         radarTab: state.radarTab,
         radarPriceState: state.radarPriceState,
         tableSort: state.tableSort,
@@ -1784,6 +2756,7 @@ function renderMonitorList(monitors) {
       state.seriesKey = null;
       state.buybackStockQuery = "";
       state.eventQuery = "";
+      state.stockSelectedCodes = null;
       state.radarTab = "TABLE";
       state.radarPriceState = "*";
       state.tableSort = null;
@@ -1795,6 +2768,7 @@ function renderMonitorList(monitors) {
         state.seriesKey = previous.seriesKey;
         state.buybackStockQuery = previous.buybackStockQuery;
         state.eventQuery = previous.eventQuery;
+        state.stockSelectedCodes = previous.stockSelectedCodes;
         state.radarTab = previous.radarTab;
         state.radarPriceState = previous.radarPriceState;
         state.tableSort = previous.tableSort;
@@ -2132,6 +3106,7 @@ function renderFilters(filters, timeWindows, projectionKind) {
   filters.forEach((filter) => {
     if (filter.multiple) {
       const field = createElement("div", "filter-field dynamic-filter-field");
+      field.dataset.filterKey = filter.key;
       const heading = createFilterLabel(filter);
       heading.id = `filter-${filter.key}-label`;
       field.append(heading);
@@ -2217,13 +3192,14 @@ function renderFilters(filters, timeWindows, projectionKind) {
   });
   const isBuyback = projectionKind === "buyback";
   const isMarketEvents = projectionKind === "market_events";
+  const isStockEvents = projectionKind === "stock_events";
   ui.buybackStockSearchField.hidden = !isBuyback;
   if (document.activeElement !== ui.buybackStockSearch) {
     ui.buybackStockSearch.value = isBuyback ? state.buybackStockQuery : "";
   }
-  ui.eventSearchField.hidden = !isMarketEvents;
+  ui.eventSearchField.hidden = !isMarketEvents && !isStockEvents;
   if (document.activeElement !== ui.eventSearch) {
-    ui.eventSearch.value = isMarketEvents ? state.eventQuery : "";
+    ui.eventSearch.value = isMarketEvents || isStockEvents ? state.eventQuery : "";
   }
   ui.timeWindow.replaceChildren();
   timeWindows.forEach((window) => {
@@ -2417,6 +3393,12 @@ function issueScopeLabel(scope) {
   if (ISSUE_SCOPE_LABELS[scopeValue]) return ISSUE_SCOPE_LABELS[scopeValue];
   if (scopeValue.startsWith("nyfed-calendar:")) {
     return `纽约联储事件日历 ${scopeValue.split(":", 2)[1]}`;
+  }
+  if (scopeValue.startsWith("nbs-schedule:")) {
+    return `国家统计局发布日程 ${scopeValue.split(":", 2)[1]}`;
+  }
+  if (scopeValue.startsWith("hk-csd-calendar:")) {
+    return `香港政府统计处发布日程 ${scopeValue.split(":", 2)[1]}`;
   }
   if (scopeValue === "monitor") return "全部范围";
   const [direction, asset] = scopeValue.split(":", 2);
@@ -2794,7 +3776,7 @@ function renderTable(
           timing.append(createElement("span", "market-event-change", "时间有调整"));
         }
         timing.title = row.time_precision === "DATE"
-          ? "官方目前只公布了美国东部日期，具体发布时间待公布。"
+          ? `官方目前只公布了${row.source_timezone_label || "来源所在地日期"}，具体发布时间待公布。`
           : "已换算为北京时间。";
         td.append(timing);
       } else if (state.projectionKind === "market_events" && column.key === "event_title") {
@@ -4043,33 +5025,89 @@ ui.backToTop.addEventListener("click", () => {
 
 updateBackToTopVisibility();
 
-function renderIssues(issues, monitor) {
+function renderIssues(issues, currentIssues, monitor) {
   const diagnosticIssues = issues.filter(
     (issue) => issue.classification !== "EXPECTED_ABSENCE"
   );
+  const currentIssueIds = new Set(
+    (currentIssues || [])
+      .filter((issue) => issue.classification !== "EXPECTED_ABSENCE")
+      .map((issue) => issue.issue_id),
+  );
+  const isActive = (issue) => issue.state === "ACTIVE" || currentIssueIds.has(issue.issue_id);
+  const activeCount = diagnosticIssues.filter(isActive).length;
+  const historyCount = diagnosticIssues.length - activeCount;
   ui.issueBody.replaceChildren();
   diagnosticIssues.forEach((issue) => {
     const row = document.createElement("tr");
-    row.append(createElement("td", "", issueScopeLabel(issue.scope)));
-    row.append(createElement("td", "", formatTime(issue.occurred_at)));
-    const reason = createElement("td", "", issueReasonLabel(issue.reason_code));
-    reason.title = issueReasonDetail(issue.reason_code);
+    const stateValue = isActive(issue) ? "ACTIVE" : issue.state || "HISTORICAL";
+    row.className = "issue-row";
+    row.dataset.state = stateValue;
+
+    const stateCell = document.createElement("td");
+    const stateBadge = createElement(
+      "span",
+      "issue-state-badge",
+      ISSUE_STATE_LABELS[stateValue] || "历史记录",
+    );
+    stateBadge.dataset.state = stateValue;
+    stateCell.append(stateBadge);
+    if (stateValue === "RECOVERED" && issue.recovered_at) {
+      stateCell.append(createElement("span", "issue-meta", `恢复于 ${formatTime(issue.recovered_at)}`));
+    }
+    row.append(stateCell);
+
+    const scope = document.createElement("td");
+    scope.className = "issue-scope";
+    scope.append(createElement("strong", "issue-cell-title", issueScopeLabel(issue.scope)));
+    if (issueScopeLabel(issue.scope) !== issue.scope) {
+      scope.append(createElement("code", "issue-code", issue.scope));
+    }
+    row.append(scope);
+
+    const time = document.createElement("td");
+    time.append(createElement("span", "issue-cell-title", formatTime(issue.occurred_at)));
+    time.append(createElement("span", "issue-meta", `运行 #${issue.run_id} · 记录 #${issue.issue_id}`));
+    row.append(time);
+
+    const reason = document.createElement("td");
+    reason.className = "issue-reason";
+    reason.append(createElement("strong", "issue-reason-label", issueReasonLabel(issue.reason_code)));
+    reason.append(createElement("code", "issue-code", issue.reason_code));
+    reason.append(createElement("span", "issue-reason-detail", issueReasonDetailForRecord(issue)));
+    const contextEntries = issueContextEntries(issue.context);
+    if (contextEntries.length > 0) {
+      const context = document.createElement("dl");
+      context.className = "issue-context";
+      contextEntries.forEach((entry) => {
+        context.append(createElement("dt", "", entry.label));
+        context.append(createElement("dd", "", entry.value));
+      });
+      reason.append(context);
+    }
     row.append(reason);
     ui.issueBody.append(row);
   });
-  ui.issueCount.textContent = `${diagnosticIssues.length} 条`;
-  ui.diagnosticsOpenCount.textContent = String(diagnosticIssues.length);
-  ui.diagnosticsOpenCount.hidden = diagnosticIssues.length === 0;
-  ui.diagnosticsOpen.dataset.hasIssues = String(diagnosticIssues.length > 0);
+  const countParts = [];
+  if (activeCount > 0) countParts.push(`${activeCount} 条当前`);
+  if (historyCount > 0) countParts.push(`${historyCount} 条历史`);
+  ui.issueCount.textContent = countParts.join(" · ") || "0 条";
+  ui.diagnosticsOpenCount.textContent = String(activeCount);
+  ui.diagnosticsOpenCount.hidden = activeCount === 0;
+  ui.diagnosticsOpen.dataset.hasIssues = String(activeCount > 0);
   ui.diagnosticsOpen.setAttribute(
     "aria-label",
-    diagnosticIssues.length > 0
-      ? `查看${monitor.display_name}的诊断日志，${diagnosticIssues.length} 条记录`
-      : `查看${monitor.display_name}的诊断日志，当前没有采集失败`,
+    activeCount > 0
+      ? `查看${monitor.display_name}的诊断日志，${activeCount} 条当前问题`
+      : historyCount > 0
+        ? `查看${monitor.display_name}的诊断日志，当前采集正常，保留${historyCount}条历史记录`
+        : `查看${monitor.display_name}的诊断日志，当前没有采集失败`,
   );
-  ui.diagnosticsDialogSubtitle.textContent = diagnosticIssues.length > 0
-    ? `${monitor.display_name} · ${diagnosticIssues.length} 条近期记录`
-    : `${monitor.display_name} · 当前没有采集失败`;
+  ui.diagnosticsDialogSubtitle.textContent = activeCount > 0
+    ? `${monitor.display_name} · ${activeCount} 条当前问题${historyCount > 0 ? `，另有 ${historyCount} 条历史记录` : ""}`
+    : historyCount > 0
+      ? `${monitor.display_name} · 当前采集正常，保留 ${historyCount} 条近期历史记录`
+      : `${monitor.display_name} · 当前没有采集失败`;
   ui.issueScroll.hidden = diagnosticIssues.length === 0;
   ui.issueEmpty.hidden = diagnosticIssues.length > 0;
 }
@@ -4090,6 +5128,7 @@ document.addEventListener("visibilitychange", () => {
   clearTimeout(state.refreshTimer);
   state.refreshTimer = null;
   if (document.visibilityState === "visible") loadView();
+  else stopForegroundObservation();
 });
 
 applyMonitorRailState({ persist: false });

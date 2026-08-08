@@ -43,6 +43,17 @@ def store_at(tmp_path: Path) -> SQLiteMonitorStore:
     return store
 
 
+def test_issue_lookup_has_run_index(tmp_path: Path) -> None:
+    store = store_at(tmp_path)
+    with closing(sqlite3.connect(store.path)) as connection:
+        indexes = {
+            str(row[1])
+            for row in connection.execute("PRAGMA index_list('monitor_issue')")
+        }
+
+    assert "monitor_issue_run_idx" in indexes
+
+
 def market_event_revision(
     event_key: str,
     *,
@@ -166,6 +177,9 @@ def test_version_two_database_adds_raw_artifact_storage_in_place(
                 "PRAGMA table_info(monitor_projection_snapshot)"
             )
         }
+        issue_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(monitor_issue)")
+        }
     assert version == SCHEMA_VERSION
     assert {
         "request_started_at",
@@ -182,6 +196,64 @@ def test_version_two_database_adds_raw_artifact_storage_in_place(
         "cutoff_at",
         "payload_json",
     } == snapshot_columns
+    assert "context_json" in issue_columns
+
+
+def test_version_ten_issue_rows_gain_empty_context_in_place(tmp_path: Path) -> None:
+    path = tmp_path / "monitor.sqlite3"
+    with closing(sqlite3.connect(path)) as connection:
+        with connection:
+            connection.executescript(
+                """
+                CREATE TABLE monitor_run (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    monitor_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT
+                );
+                CREATE TABLE monitor_issue (
+                    issue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    monitor_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    reason_code TEXT NOT NULL
+                );
+                INSERT INTO monitor_run (
+                    monitor_id, started_at, completed_at, status,
+                    sample_count, error_code
+                ) VALUES (
+                    'stock-event-calendar', '2026-08-08T01:00:00.000Z',
+                    '2026-08-08T01:00:01.000Z', 'PARTIAL', 0,
+                    'STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED'
+                );
+                INSERT INTO monitor_issue (
+                    run_id, monitor_id, occurred_at, scope, reason_code
+                ) VALUES (
+                    1, 'stock-event-calendar', '2026-08-08T01:00:01.000Z',
+                    'stock-announcements',
+                    'STOCK_EVENTS_ANNOUNCEMENTS_TRUNCATED'
+                );
+                PRAGMA user_version = 10;
+                """
+            )
+
+    store = SQLiteMonitorStore(path)
+    store.initialize()
+
+    with closing(sqlite3.connect(path)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(monitor_issue)")
+        }
+        raw_context = connection.execute(
+            "SELECT context_json FROM monitor_issue WHERE issue_id = 1"
+        ).fetchone()[0]
+    assert "context_json" in columns
+    assert raw_context == "{}"
+    assert store.recent_issues("stock-event-calendar")[0].context == {}
 
 
 def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
@@ -474,7 +546,13 @@ def test_partial_run_commits_samples_and_scoped_issue_together(tmp_path: Path) -
         "test-monitor",
         CollectionBatch(
             samples=(sample("6.75"),),
-            issues=(CollectionIssue("BUY:USDT", "NO_ELIGIBLE_C2C_AD"),),
+            issues=(
+                CollectionIssue(
+                    "BUY:USDT",
+                    "NO_ELIGIBLE_C2C_AD",
+                    context={"page_limit": 2, "stock_codes": "600519,300059"},
+                ),
+            ),
         ),
         completed_at=NOW,
     )
@@ -486,6 +564,10 @@ def test_partial_run_commits_samples_and_scoped_issue_together(tmp_path: Path) -
     assert latest is not None and latest.status == "PARTIAL"
     assert store.samples_for_run(run_id)[0].value_text == "6.75"
     assert issues[0].scope == "BUY:USDT"
+    assert issues[0].context == {
+        "page_limit": 2,
+        "stock_codes": "600519,300059",
+    }
     assert run_issues == issues
 
 
@@ -587,6 +669,7 @@ def test_issue_without_any_sample_is_a_failed_run(tmp_path: Path) -> None:
     assert status == "FAILED"
     assert latest is not None and latest.status == "FAILED"
     assert latest.error_code == "SMART_MONEY_SCHEMA_CHANGED"
+    assert store.latest_finished_run("test-monitor") == latest
 
 
 def test_interrupted_run_is_failed_on_restart(tmp_path: Path) -> None:

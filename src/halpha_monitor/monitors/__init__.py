@@ -33,6 +33,10 @@ from halpha_monitor.monitors.market_events import (
     MarketEventMonitor,
     MarketEventSettings,
 )
+from halpha_monitor.monitors.stock_events import (
+    StockEventMonitor,
+    StockEventSettings,
+)
 from halpha_monitor.service import MonitorRegistry
 from halpha_monitor.store import SQLiteMonitorStore
 
@@ -97,6 +101,12 @@ def add_builtin_monitor_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--market-events-interval-seconds", type=float, default=21600)
     parser.add_argument("--market-events-jitter-seconds", type=float, default=900)
     parser.add_argument("--market-events-lookahead-days", type=int, default=60)
+    parser.add_argument("--stock-events-interval-seconds", type=float, default=3600)
+    parser.add_argument("--stock-events-jitter-seconds", type=float, default=300)
+    parser.add_argument("--stock-events-history-days", type=int, default=30)
+    parser.add_argument("--stock-events-lookahead-days", type=int, default=60)
+    parser.add_argument("--stock-events-auto-limit", type=int, default=80)
+    parser.add_argument("--stock-events-watchlist", default="")
     parser.add_argument("--fiat", default="CNY")
     parser.add_argument("--assets", default="USDT,USDC,BTC,ETH,BNB,SOL")
     parser.add_argument(
@@ -166,7 +176,8 @@ def register_builtin_monitors(
                 jitter_seconds=args.btc_relationship_jitter_seconds,
                 timeout_seconds=args.timeout_seconds,
                 workers=args.btc_relationship_workers,
-            )
+            ),
+            store=store,
         )
     )
     registry.register(
@@ -202,6 +213,21 @@ def register_builtin_monitors(
             store=store,
         )
     )
+    registry.register(
+        StockEventMonitor(
+            StockEventSettings(
+                interval_seconds=args.stock_events_interval_seconds,
+                jitter_seconds=args.stock_events_jitter_seconds,
+                history_days=args.stock_events_history_days,
+                lookahead_days=args.stock_events_lookahead_days,
+                auto_limit=args.stock_events_auto_limit,
+                manual_stock_codes=_csv_tokens(args.stock_events_watchlist),
+                timeout_seconds=args.timeout_seconds,
+                proxy_url=args.proxy_url,
+            ),
+            store=store,
+        )
+    )
 
 
 __all__ = [
@@ -217,6 +243,8 @@ __all__ = [
     "BinanceBtcIntelligenceSettings",
     "MarketEventMonitor",
     "MarketEventSettings",
+    "StockEventMonitor",
+    "StockEventSettings",
     "add_builtin_monitor_arguments",
     "register_builtin_monitors",
 ]

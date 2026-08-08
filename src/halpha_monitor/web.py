@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
 import math
 from pathlib import Path
+import re
 import threading
 from typing import Any, Literal
 import unicodedata
@@ -25,11 +26,18 @@ from halpha_monitor.contracts import (
     RegisteredMonitor,
     ViewColumn,
 )
-from halpha_monitor.buyback_metrics import project_buyback_metrics
+from halpha_monitor.buyback_metrics import (
+    buyback_projection_valid_until,
+    project_buyback_metrics,
+)
 from halpha_monitor.monitors.a_hk_buyback import (
     classify_buyback_attention,
     classify_buyback_title,
     is_target_a_share_security,
+)
+from halpha_monitor.monitors.stock_events import (
+    STOCK_DIRECTORY_REFRESH_INTERVAL,
+    STOCK_DIRECTORY_SNAPSHOT_KEY,
 )
 from halpha_monitor.service import (
     DEFAULT_OBSERVATION_LEASE_SECONDS,
@@ -67,6 +75,8 @@ EXPECTED_ABSENCE_REASON_CODES = frozenset({"NO_ELIGIBLE_C2C_AD"})
 REQUEST_WINDOW_SECONDS = 60.0
 BUYBACK_MONITOR_ID = "a-hk-buyback"
 MARKET_EVENT_MONITOR_ID = "market-event-calendar"
+STOCK_EVENT_MONITOR_ID = "stock-event-calendar"
+RADAR_VIEW_NAMES = frozenset({"candidates", "position", "history", "evaluation"})
 
 
 class ConfigurationRequest(BaseModel):
@@ -156,14 +166,34 @@ def _run_payload(run: StoredRun | None) -> dict[str, Any] | None:
     }
 
 
-def _issue_payload(issue: StoredIssue) -> dict[str, Any]:
+def _issue_payload(
+    issue: StoredIssue,
+    *,
+    current_issue_run: StoredRun | None,
+    latest_successful_run: StoredRun | None,
+) -> dict[str, Any]:
     expected_absence = issue.reason_code in EXPECTED_ABSENCE_REASON_CODES
+    if current_issue_run is not None and issue.run_id == current_issue_run.run_id:
+        lifecycle_state = "ACTIVE"
+        recovered_at = None
+    elif (
+        latest_successful_run is not None
+        and latest_successful_run.run_id > issue.run_id
+    ):
+        lifecycle_state = "RECOVERED"
+        recovered_at = latest_successful_run.completed_at
+    else:
+        lifecycle_state = "HISTORICAL"
+        recovered_at = None
     return {
         "issue_id": issue.issue_id,
         "run_id": issue.run_id,
         "occurred_at": iso_utc(issue.occurred_at),
         "scope": issue.scope,
         "reason_code": issue.reason_code,
+        "context": issue.context,
+        "state": lifecycle_state,
+        "recovered_at": iso_utc(recovered_at) if recovered_at is not None else None,
         "classification": "EXPECTED_ABSENCE" if expected_absence else "DATA_ISSUE",
         "tone": "NOTICE" if expected_absence else "WARNING",
     }
@@ -317,7 +347,12 @@ def _monitor_summary(
     latest = store.latest_run(monitor.monitor_id)
     projection_kind = getattr(monitor, "projection_kind", None)
     is_buyback = projection_kind == "buyback"
-    is_snapshot = projection_kind in {"buyback", "market_events", "btc_intelligence"}
+    is_snapshot = projection_kind in {
+        "buyback",
+        "market_events",
+        "stock_events",
+        "btc_intelligence",
+    }
     data_run = (
         store.latest_completed_run(monitor.monitor_id)
         if is_snapshot
@@ -366,6 +401,17 @@ def _monitor_summary(
             "detail": "宏观发布与央行日历最近一轮检查已结束。",
             "cutoff_label": "最近事件检查",
         }
+    if projection_kind == "stock_events" and data_status["kind"] in {
+        "CURRENT",
+        "CURRENT_WITH_NOTICES",
+        "CURRENT_WITH_GAPS",
+    }:
+        data_status = {
+            **data_status,
+            "label": "最近个股事件检查已完成",
+            "detail": "动态股池、公司事件与公告索引最近一轮检查已结束。",
+            "cutoff_label": "最近事件检查",
+        }
     if projection_kind == "btc_intelligence" and data_status["kind"] in {
         "CURRENT",
         "CURRENT_WITH_NOTICES",
@@ -387,9 +433,9 @@ def _monitor_summary(
             operational_status = {
                 "kind": "SCHEDULED_IDLE",
                 "tone": "IDLE",
-                "label": "已收市 · 静态",
+                "label": automatic_state.label,
             }
-            if data_run is not None:
+            if data_run is not None and is_buyback:
                 data_status = {
                     "kind": "STATIC_CLOSED",
                     "tone": "HEALTHY",
@@ -399,6 +445,14 @@ def _monitor_summary(
                         "可使用手动刷新显式检查一次。"
                     ),
                     "cutoff_label": "最近来源检查",
+                }
+            elif data_run is not None:
+                data_status = {
+                    "kind": "STATIC_SCHEDULED",
+                    "tone": "HEALTHY",
+                    "label": "最新闭合周期已计算",
+                    "detail": automatic_state.detail,
+                    "cutoff_label": "最近计算完成",
                 }
         elif automatic_state.status == "UNAVAILABLE":
             operational_status = {
@@ -890,7 +944,8 @@ def _row_matches_filters(
 MARKET_EVENT_MARKET_LABELS = {
     "CRYPTO": "加密资产",
     "US_STOCKS": "美股",
-    "A_HK_STOCKS": "A股 / 港股",
+    "A_STOCKS": "A股",
+    "HK_STOCKS": "港股",
 }
 
 
@@ -918,6 +973,25 @@ def _market_event_date(payload: dict[str, Any]) -> date | None:
         return None
 
 
+def _market_event_timezone(payload: dict[str, Any]) -> ZoneInfo:
+    timezone_name = str(payload.get("source_timezone") or "America/New_York")
+    try:
+        return ZoneInfo(timezone_name)
+    except (KeyError, ValueError):
+        return NEW_YORK_TZ
+
+
+def _market_event_scopes(payload: dict[str, Any]) -> list[str]:
+    scopes: list[str] = []
+    for raw_value in payload.get("market_scopes", []):
+        value = str(raw_value)
+        expanded = ("A_STOCKS", "HK_STOCKS") if value == "A_HK_STOCKS" else (value,)
+        for scope in expanded:
+            if scope in MARKET_EVENT_MARKET_LABELS and scope not in scopes:
+                scopes.append(scope)
+    return scopes
+
+
 def _market_event_sort_time(payload: dict[str, Any]) -> datetime | None:
     exact = _market_event_exact_time(payload)
     if exact is not None:
@@ -928,7 +1002,7 @@ def _market_event_sort_time(payload: dict[str, Any]) -> datetime | None:
     return datetime.combine(
         scheduled_date,
         datetime_time(hour=12),
-        tzinfo=NEW_YORK_TZ,
+        tzinfo=_market_event_timezone(payload),
     ).astimezone(UTC)
 
 
@@ -939,7 +1013,7 @@ def _market_event_is_upcoming(payload: dict[str, Any], *, now: datetime) -> bool
     scheduled_date = _market_event_date(payload)
     return (
         scheduled_date is not None
-        and scheduled_date >= now.astimezone(NEW_YORK_TZ).date()
+        and scheduled_date >= now.astimezone(_market_event_timezone(payload)).date()
     )
 
 
@@ -955,7 +1029,7 @@ def _market_event_within_days(
     scheduled_date = _market_event_date(payload)
     if scheduled_date is None:
         return False
-    today = now.astimezone(NEW_YORK_TZ).date()
+    today = now.astimezone(_market_event_timezone(payload)).date()
     return today <= scheduled_date <= today + timedelta(days=days)
 
 
@@ -972,7 +1046,7 @@ def _market_event_time_matches(
         if exact is not None:
             return exact <= now + timedelta(hours=24)
         scheduled_date = _market_event_date(payload)
-        today = now.astimezone(NEW_YORK_TZ).date()
+        today = now.astimezone(_market_event_timezone(payload)).date()
         return scheduled_date is not None and scheduled_date <= today + timedelta(
             days=1
         )
@@ -989,6 +1063,7 @@ def _market_event_matches(
     query: str,
     *,
     now: datetime,
+    include_time: bool = True,
 ) -> bool:
     normalized_query = _normalize_event_query(query)
     if normalized_query and not any(
@@ -1001,15 +1076,34 @@ def _market_event_matches(
     ):
         return False
     for key, selected_value in selected_filters.items():
-        selected = str(selected_value)
         if key == "time_range":
-            if not _market_event_time_matches(payload, selected, now=now):
+            if include_time and not _market_event_time_matches(
+                payload,
+                str(selected_value),
+                now=now,
+            ):
                 return False
         elif key == "affected_market":
-            if selected != "*" and selected not in payload.get("market_scopes", []):
+            selected_markets = (
+                [str(value) for value in selected_value]
+                if isinstance(selected_value, list)
+                else [str(selected_value)]
+            )
+            if "*" not in selected_markets and not (
+                set(selected_markets) & set(_market_event_scopes(payload))
+            ):
                 return False
-        elif selected != "*" and str(payload.get(key) or "") != selected:
-            return False
+        else:
+            selected_values = (
+                [str(value) for value in selected_value]
+                if isinstance(selected_value, list)
+                else [str(selected_value)]
+            )
+            if (
+                "*" not in selected_values
+                and str(payload.get(key) or "") not in selected_values
+            ):
+                return False
     return True
 
 
@@ -1019,7 +1113,9 @@ def _market_event_countdown(payload: dict[str, Any], *, now: datetime) -> str:
         scheduled_date = _market_event_date(payload)
         if scheduled_date is None:
             return "时间待公布"
-        days = (scheduled_date - now.astimezone(NEW_YORK_TZ).date()).days
+        days = (
+            scheduled_date - now.astimezone(_market_event_timezone(payload)).date()
+        ).days
         if days <= 0:
             return "今天 · 时间待公布"
         if days == 1:
@@ -1063,7 +1159,9 @@ def _market_event_priority(
     else:
         scheduled_date = _market_event_date(payload)
         if scheduled_date is not None:
-            days = (scheduled_date - now.astimezone(NEW_YORK_TZ).date()).days
+            days = (
+                scheduled_date - now.astimezone(_market_event_timezone(payload)).date()
+            ).days
             if changed and days <= 7:
                 return 2, "时间有调整", "官方日期最近发生调整，具体时间仍待公布。"
             if high and days <= 2:
@@ -1084,11 +1182,7 @@ def _market_event_enriched(
     local_date = (
         exact.astimezone(SHANGHAI_TZ).date() if exact is not None else scheduled_date
     )
-    scopes = [
-        str(value)
-        for value in payload.get("market_scopes", [])
-        if str(value) in MARKET_EVENT_MARKET_LABELS
-    ]
+    scopes = _market_event_scopes(payload)
     return {
         **payload,
         "priority_rank": rank,
@@ -1101,7 +1195,9 @@ def _market_event_enriched(
         ),
         "calendar_date": local_date.isoformat() if local_date is not None else None,
         "calendar_timezone_label": (
-            "北京时间" if exact is not None else "美国东部日期"
+            "北京时间"
+            if exact is not None
+            else str(payload.get("source_timezone_label") or "来源所在地日期")
         ),
         "schedule_changed_recently": _market_event_recent_change(payload, now=now),
     }
@@ -1118,6 +1214,12 @@ def _market_event_coverage_messages(
         messages.append("部分美国经济指标月份暂时无法更新")
     if "fomc-calendar" in scopes:
         messages.append("美联储议息日期暂时无法更新")
+    if any(scope.startswith("nbs-schedule:") for scope in scopes):
+        messages.append("部分国家统计局宏观数据发布日程暂时无法更新")
+    if any(scope.startswith("hk-csd-calendar:") for scope in scopes):
+        messages.append("部分香港政府统计处宏观数据发布日程暂时无法更新")
+    if "sfc-regulatory-calendar" in scopes:
+        messages.append("香港证监会政策与重要活动日历暂时无法更新")
     if "bls-macro-data" in scopes:
         messages.append("最近CPI与就业数据暂时无法更新，事件时间仍可使用")
     if "market-consensus" in scopes:
@@ -1199,7 +1301,17 @@ def _market_event_projection(
     history_rows = [
         _market_event_enriched(dict(row), now=now)
         for row in history_payloads
-        if ((sort_at := _market_event_sort_time(row)) is not None and sort_at < now)
+        if (
+            (sort_at := _market_event_sort_time(row)) is not None
+            and sort_at < now
+            and _market_event_matches(
+                row,
+                selected_filters,
+                query,
+                now=now,
+                include_time=False,
+            )
+        )
     ]
     history_rows.sort(
         key=lambda row: (
@@ -1241,6 +1353,193 @@ def _market_event_projection(
         "history_events": history_rows,
     }
     return rows, payload
+
+
+def _stock_event_coverage_messages(
+    issues: tuple[StoredIssue, ...],
+) -> list[str]:
+    scopes = {issue.scope for issue in issues}
+    messages: list[str] = []
+    if any(scope.startswith("auto-") for scope in scopes):
+        messages.append("部分每日动态股池暂时无法更新；已取得的范围仍可使用")
+    if "stock-directory" in scopes:
+        messages.append("股票名称目录暂时无法更新；搜索推荐可能使用旧缓存或暂不可用")
+    if "stock-calendar" in scopes:
+        messages.append("部分公司事件日历暂时无法更新")
+    if "stock-announcements" in scopes:
+        messages.append("部分最新公告索引暂时无法更新")
+    if "stock-events-projection" in scopes:
+        messages.append("事件数量达到本地上限；手动关注股票优先保留")
+    return messages
+
+
+def _stock_event_projection(
+    snapshot: dict[str, Any] | None,
+    selected_filters: dict[str, str | list[str]],
+    query: str,
+    selected_stock_codes: tuple[str, ...],
+    *,
+    current_issues: tuple[StoredIssue, ...],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    snapshot = snapshot or {}
+    securities = [
+        dict(item)
+        for item in snapshot.get("securities", [])
+        if isinstance(item, dict) and item.get("code")
+    ]
+    available_codes = {str(item["code"]) for item in securities}
+    active_codes = set(selected_stock_codes) if selected_stock_codes else available_codes
+    normalized_query = _normalize_event_query(query)
+
+    def matches(event: dict[str, Any]) -> bool:
+        code = str(event.get("stock_code") or "")
+        if code not in active_codes:
+            return False
+        for key, selected in selected_filters.items():
+            if selected == "*":
+                continue
+            if key == "stock_origin":
+                if selected == "MANUAL" and not event.get("is_manual_stock"):
+                    return False
+                if selected == "AUTO" and not event.get("is_auto_stock"):
+                    return False
+                continue
+            if str(event.get(key) or "") != str(selected):
+                return False
+        if not normalized_query:
+            return True
+        searchable = " ".join(
+            str(event.get(key) or "")
+            for key in ("stock_code", "stock_name", "title", "summary", "category_label")
+        )
+        return normalized_query in _normalize_event_query(searchable)
+
+    events = [
+        dict(item)
+        for item in snapshot.get("events", [])
+        if isinstance(item, dict) and matches(item)
+    ]
+    events.sort(key=lambda item: (str(item.get("sort_at") or ""), str(item.get("event_id") or "")))
+    source_states = [
+        dict(item)
+        for item in snapshot.get("source_states", [])
+        if isinstance(item, dict)
+    ]
+    selected_set = set(active_codes)
+    for security in securities:
+        security["selected"] = str(security["code"]) in selected_set
+    payload = {
+        "projection_kind": "stock_events",
+        "observed_at": snapshot.get("observed_at"),
+        "cutoff_at": snapshot.get("cutoff_at"),
+        "window_start": snapshot.get("window_start"),
+        "window_end": snapshot.get("window_end"),
+        "history_days": snapshot.get("history_days"),
+        "lookahead_days": snapshot.get("lookahead_days"),
+        "selection_trade_date": snapshot.get("selection_trade_date"),
+        "selection_checked_at": snapshot.get("selection_checked_at"),
+        "source_checked_at": snapshot.get("source_checked_at"),
+        "auto_limit": snapshot.get("auto_limit"),
+        "manual_limit": snapshot.get("manual_limit"),
+        "event_query": query.strip(),
+        "securities": securities,
+        "security_count": len(securities),
+        "manual_security_count": sum(bool(item.get("is_manual")) for item in securities),
+        "auto_security_count": sum(bool(item.get("is_auto")) for item in securities),
+        "selected_stock_codes": [
+            str(item["code"])
+            for item in securities
+            if str(item["code"]) in selected_set
+        ],
+        "selected_security_count": len(selected_set & available_codes),
+        "all_event_count": int(snapshot.get("event_count") or 0),
+        "event_count": len(events),
+        "upcoming_event_count": sum(item.get("state") == "UPCOMING" for item in events),
+        "recent_announcement_count": sum(
+            item.get("state_label") == "刚发生的公告" for item in events
+        ),
+        "event_truncated": bool(snapshot.get("event_truncated")),
+        "events": events,
+        "source_states": source_states,
+        "source_problem_count": sum(
+            str(item.get("status") or "") not in {"SUCCESS", "EMPTY"}
+            for item in source_states
+        ),
+        "coverage_messages": _stock_event_coverage_messages(current_issues),
+        "method_note": snapshot.get("method_note"),
+    }
+    return events, payload
+
+
+def _stock_directory_search(
+    snapshot: dict[str, Any] | None,
+    query: str,
+    limit: int,
+) -> dict[str, Any]:
+    snapshot = snapshot or {}
+    raw_entries = snapshot.get("securities")
+    entries = raw_entries if isinstance(raw_entries, list) else []
+    needle = _normalize_event_query(query)
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for item in entries if needle else []:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not re.fullmatch(r"\d{6}", code) or not name:
+            continue
+        normalized_name = _normalize_event_query(name)
+        if code == needle:
+            rank = 0
+        elif normalized_name == needle:
+            rank = 1
+        elif code.startswith(needle):
+            rank = 2
+        elif normalized_name.startswith(needle):
+            rank = 3
+        elif needle in code:
+            rank = 4
+        elif needle in normalized_name:
+            rank = 5
+        else:
+            continue
+        scored.append(
+            (
+                rank,
+                code,
+                {
+                    "code": code,
+                    "name": name,
+                    "market_label": item.get("market_label"),
+                    "industry": item.get("industry"),
+                },
+            )
+        )
+    scored.sort(key=lambda item: (item[0], item[1]))
+    last_attempt_at = snapshot.get("last_attempt_at")
+    next_update_at = None
+    try:
+        last_attempt = datetime.fromisoformat(
+            str(last_attempt_at).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        last_attempt = None
+    if last_attempt is not None and last_attempt.utcoffset() is not None:
+        next_update_at = iso_utc(
+            last_attempt.astimezone(UTC) + STOCK_DIRECTORY_REFRESH_INTERVAL
+        )
+    status = str(snapshot.get("status") or "UNAVAILABLE")
+    if not entries:
+        status = "UNAVAILABLE"
+    return {
+        "status": status,
+        "query": query.strip(),
+        "record_count": len(entries),
+        "updated_at": snapshot.get("source_checked_at"),
+        "last_attempt_at": last_attempt_at,
+        "next_update_at": next_update_at,
+        "matches": [item[2] for item in scored[:limit]],
+    }
 
 
 def _buyback_effective_at(value: Any) -> datetime | None:
@@ -2143,6 +2442,9 @@ def _configuration_payload(
                 "unit": field.unit,
                 "minimum": field.minimum,
                 "step": field.step,
+                "description": field.description,
+                "placeholder": field.placeholder,
+                "maximum_items": field.maximum_items,
                 "choices": [
                     {"value": choice.value, "label": choice.label}
                     for choice in field.choices
@@ -2171,10 +2473,14 @@ def create_app(
         cache_key = (
             monitor_id,
             store.buyback_projection_version(monitor_id),
-            int(now.timestamp() // 60),
         )
         with buyback_cache_lock:
-            if buyback_cache.get("key") == cache_key:
+            if (
+                buyback_cache.get("key") == cache_key
+                and isinstance(buyback_cache.get("computed_at"), datetime)
+                and isinstance(buyback_cache.get("valid_until"), datetime)
+                and buyback_cache["computed_at"] <= now < buyback_cache["valid_until"]
+            ):
                 return dict(buyback_cache)
             entity_window = store.latest_buyback_entities(
                 monitor_id,
@@ -2185,11 +2491,12 @@ def create_app(
                 _buyback_entity_payload(entity) for entity in entities
             )
             source_states = store.buyback_source_states(monitor_id)
+            source_payloads = {
+                source.source_key: dict(source.payload) for source in source_states
+            }
             projected = project_buyback_metrics(
                 entity_payloads,
-                source_payloads={
-                    source.source_key: dict(source.payload) for source in source_states
-                },
+                source_payloads=source_payloads,
                 source_statuses={
                     source.source_key: source.status for source in source_states
                 },
@@ -2200,6 +2507,11 @@ def create_app(
             buyback_cache.update(
                 {
                     "key": cache_key,
+                    "computed_at": now,
+                    "valid_until": buyback_projection_valid_until(
+                        source_payloads,
+                        now=now,
+                    ),
                     "rows": rows,
                     "rows_by_key": {
                         str(row.get("entity_key") or ""): row
@@ -2318,6 +2630,7 @@ def create_app(
         series_key: str | None = None,
         stock_query: str = Query(default="", max_length=64),
         event_query: str = Query(default="", max_length=64),
+        radar_view: str | None = Query(default=None, alias="view"),
     ) -> dict[str, Any]:
         if hours not in ALLOWED_WINDOWS:
             raise HTTPException(status_code=422, detail="TIME_WINDOW_UNSUPPORTED")
@@ -2348,7 +2661,11 @@ def create_app(
             if definition.multiple:
                 requested_values = request.query_params.getlist(definition.key)
                 if not requested_values:
-                    requested_values = [definition.default]
+                    requested_values = (
+                        list(definition.default)
+                        if isinstance(definition.default, tuple)
+                        else [definition.default]
+                    )
                 requested = list(dict.fromkeys(requested_values))
                 if not requested or any(value not in allowed for value in requested):
                     raise HTTPException(
@@ -2356,9 +2673,14 @@ def create_app(
                         detail=f"FILTER_VALUE_UNSUPPORTED_{definition.key.upper()}",
                     )
             else:
+                default_value = (
+                    definition.default
+                    if isinstance(definition.default, str)
+                    else definition.default[0]
+                )
                 requested = request.query_params.get(
                     definition.key,
-                    definition.default,
+                    default_value,
                 )
                 if requested not in allowed:
                     raise HTTPException(
@@ -2385,15 +2707,25 @@ def create_app(
 
         issues = store.recent_issues(selected.monitor_id, limit=20)
         latest_run = store.latest_run(selected.monitor_id)
+        current_issue_run = store.latest_finished_run(selected.monitor_id)
+        latest_successful_run = store.latest_successful_run(selected.monitor_id)
         current_issues = (
-            store.issues_for_run(latest_run.run_id) if latest_run is not None else ()
+            store.issues_for_run(current_issue_run.run_id)
+            if current_issue_run is not None
+            else ()
         )
         projection_kind = getattr(selected, "projection_kind", "time_series")
         is_buyback = projection_kind == "buyback"
         is_market_events = projection_kind == "market_events"
+        is_stock_events = projection_kind == "stock_events"
         is_btc_intelligence = projection_kind == "btc_intelligence"
+        is_altcoin_radar = projection_kind == "altcoin_radar"
+        if is_altcoin_radar and radar_view not in {None, *RADAR_VIEW_NAMES}:
+            raise HTTPException(status_code=422, detail="RADAR_VIEW_UNSUPPORTED")
+        selective_radar_view = is_altcoin_radar and radar_view is not None
         buyback_payload: dict[str, Any] | None = None
         market_events_payload: dict[str, Any] | None = None
+        stock_events_payload: dict[str, Any] | None = None
         btc_intelligence_payload: dict[str, Any] | None = None
         altcoin_price_position_payload: dict[str, Any] | None = None
         if is_buyback:
@@ -2500,6 +2832,40 @@ def create_app(
             collection_gaps = []
             promoted_columns = {}
             run_summary_payload = []
+        elif is_stock_events:
+            data_run = store.latest_completed_run(selected.monitor_id)
+            samples = ()
+            snapshot = store.projection_snapshot(selected.monitor_id, "current")
+            snapshot_payload = snapshot.payload if snapshot is not None else None
+            available_stock_codes = {
+                str(item.get("code") or "")
+                for item in (snapshot_payload or {}).get("securities", [])
+                if isinstance(item, dict)
+            }
+            requested_stock_codes = tuple(
+                dict.fromkeys(request.query_params.getlist("stock_code"))
+            )
+            if len(requested_stock_codes) > 150 or any(
+                not re.fullmatch(r"\d{6}", code)
+                or code not in available_stock_codes
+                for code in requested_stock_codes
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="STOCK_EVENT_SELECTION_INVALID",
+                )
+            row_payloads, stock_events_payload = _stock_event_projection(
+                snapshot_payload,
+                selected_filters,
+                event_query,
+                requested_stock_codes,
+                current_issues=current_issues,
+            )
+            selected_series = None
+            history_points = []
+            collection_gaps = []
+            promoted_columns = {}
+            run_summary_payload = []
         elif is_btc_intelligence:
             data_run = store.latest_completed_run(selected.monitor_id)
             samples = store.samples_for_run(data_run.run_id) if data_run else ()
@@ -2516,17 +2882,28 @@ def create_app(
             run_summary_payload = []
         else:
             data_run = store.latest_sample_run(selected.monitor_id)
-            samples = store.samples_for_run(data_run.run_id) if data_run else ()
-            if projection_kind == "altcoin_radar":
-                samples = tuple(
-                    sample
-                    for sample in samples
-                    if sample.payload.get("market_scope") == "USDM_PERPETUAL"
-                )
+            needs_radar_samples = not selective_radar_view or radar_view in {
+                "candidates",
+                "history",
+            }
+            samples = (
+                store.samples_for_run(data_run.run_id)
+                if data_run and needs_radar_samples
+                else ()
+            )
+            if is_altcoin_radar and (
+                not selective_radar_view or radar_view == "position"
+            ):
                 altcoin_price_position_payload = _altcoin_price_position_projection(
                     selected,
                     store,
                     data_run=data_run,
+                )
+            if is_altcoin_radar and samples:
+                samples = tuple(
+                    sample
+                    for sample in samples
+                    if sample.payload.get("market_scope") == "USDM_PERPETUAL"
                 )
             rows = [
                 sample
@@ -2542,13 +2919,14 @@ def create_app(
                 if rows
                 else None
             )
+            needs_history = not selective_radar_view or radar_view == "history"
             history = (
                 store.history(
                     selected.monitor_id,
                     selected_series,
                     since=now - timedelta(hours=hours),
                 )
-                if selected_series is not None
+                if selected_series is not None and needs_history
                 else ()
             )
             history_points, collection_gaps = _history_payload(
@@ -2556,20 +2934,44 @@ def create_app(
                 interval_seconds=selected.interval_seconds,
                 now=now,
             )
-            promoted_columns = _promoted_uniform_columns(selected, samples)
-            run_summary_payload = _run_summary_payload(
-                selected,
-                samples,
-                promoted_columns,
+            needs_candidate_summary = (
+                not selective_radar_view or radar_view == "candidates"
             )
-        refresh_after_seconds = 15
+            promoted_columns = (
+                _promoted_uniform_columns(selected, samples)
+                if needs_candidate_summary
+                else {}
+            )
+            run_summary_payload = (
+                _run_summary_payload(
+                    selected,
+                    samples,
+                    promoted_columns,
+                )
+                if needs_candidate_summary
+                else []
+            )
+        selected_cadence = selected_summary.get("collection_cadence") or {}
+        adaptive = bool(selected_cadence.get("adaptive"))
+        cadence_basis = float(
+            selected_cadence.get("foreground_interval_seconds")
+            if adaptive
+            else selected_cadence.get(
+                "effective_interval_seconds",
+                selected.interval_seconds,
+            )
+        )
+        refresh_after_seconds = max(
+            30,
+            min(60, round(cadence_basis / (5 if adaptive else 10))),
+        )
         automatic_collection = selected_summary.get("automatic_collection")
-        if is_buyback and automatic_collection is not None:
+        latest_selected_run = selected_summary.get("latest_run")
+        if latest_selected_run and latest_selected_run.get("status") == "RUNNING":
+            refresh_after_seconds = 15
+        elif automatic_collection is not None:
             automatic_status = str(automatic_collection.get("status") or "")
-            latest_selected_run = selected_summary.get("latest_run")
-            if latest_selected_run and latest_selected_run.get("status") == "RUNNING":
-                refresh_after_seconds = 15
-            elif automatic_status == "CLOSED":
+            if automatic_status == "CLOSED":
                 next_open = _payload_time(automatic_collection.get("next_open_at"))
                 refresh_after_seconds = (
                     max(
@@ -2609,14 +3011,33 @@ def create_app(
             "run_summary": run_summary_payload,
             "buyback": buyback_payload,
             "market_events": market_events_payload,
+            "stock_events": stock_events_payload,
             "btc_intelligence": btc_intelligence_payload,
             "altcoin_price_position": altcoin_price_position_payload,
-            "evaluation": _forward_evaluation_payload(selected, store, now=now),
+            "evaluation": (
+                _forward_evaluation_payload(selected, store, now=now)
+                if not selective_radar_view or radar_view == "evaluation"
+                else None
+            ),
             "selected_series_key": selected_series,
             "history": history_points,
             "collection_gaps": collection_gaps,
-            "current_issues": [_issue_payload(issue) for issue in current_issues],
-            "issues": [_issue_payload(issue) for issue in issues],
+            "current_issues": [
+                _issue_payload(
+                    issue,
+                    current_issue_run=current_issue_run,
+                    latest_successful_run=latest_successful_run,
+                )
+                for issue in current_issues
+            ],
+            "issues": [
+                _issue_payload(
+                    issue,
+                    current_issue_run=current_issue_run,
+                    latest_successful_run=latest_successful_run,
+                )
+                for issue in issues
+            ],
             "time_windows": [
                 {
                     "hours": value,
@@ -2625,6 +3046,30 @@ def create_app(
                 for value in ALLOWED_WINDOWS
             ],
         }
+
+    @app.get("/api/monitors/{monitor_id}/stocks/search")
+    def search_monitor_stocks(
+        monitor_id: str,
+        q: str = Query(min_length=1, max_length=32),
+        limit: int = Query(default=8, ge=1, le=20),
+    ) -> dict[str, Any]:
+        try:
+            monitor = registry.get(monitor_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="MONITOR_NOT_FOUND") from None
+        if getattr(monitor, "projection_kind", None) != "stock_events":
+            raise HTTPException(
+                status_code=409,
+                detail="STOCK_DIRECTORY_SEARCH_UNSUPPORTED",
+            )
+        snapshot = store.projection_snapshot(
+            monitor_id, STOCK_DIRECTORY_SNAPSHOT_KEY
+        )
+        return _stock_directory_search(
+            snapshot.payload if snapshot is not None else None,
+            q,
+            limit,
+        )
 
     @app.put("/api/monitors/{monitor_id}/control")
     def update_control(

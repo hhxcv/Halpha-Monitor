@@ -155,6 +155,77 @@
 
         <p id="monitor-method-note" class="monitor-method-note" hidden></p>
 
+        <section class="stock-events" id="stock-events" aria-label="个股事件日历" hidden>
+          <header class="stock-events-hero">
+            <div>
+              <p class="stock-events-eyebrow">沪深京 A 股 · 公开公司事件</p>
+              <p id="stock-events-scope" class="stock-events-scope">等待股票范围</p>
+            </div>
+            <button
+              id="stock-events-select-button"
+              class="stock-events-select-button"
+              type="button"
+              aria-haspopup="dialog"
+              aria-controls="stock-selector-dialog"
+            >选择股票</button>
+          </header>
+
+          <div class="stock-events-viewbar">
+            <nav class="stock-events-tabs" role="tablist" aria-label="个股事件视图">
+              <button id="stock-events-calendar-tab" type="button" role="tab" aria-selected="true">月历</button>
+              <button id="stock-events-timeline-tab" type="button" role="tab" aria-selected="false">时间线</button>
+            </nav>
+            <p id="stock-events-window" class="stock-events-window"></p>
+          </div>
+
+          <aside id="stock-events-notice" class="stock-events-notice" role="status" hidden></aside>
+
+          <div id="stock-events-calendar-panel" class="stock-events-calendar-panel" role="tabpanel" aria-labelledby="stock-events-calendar-tab">
+            <div class="stock-calendar-toolbar">
+              <button id="stock-calendar-previous" type="button" aria-label="上个月">‹</button>
+              <h2 id="stock-calendar-title">—</h2>
+              <button id="stock-calendar-today" type="button">回到本月</button>
+              <button id="stock-calendar-next" type="button" aria-label="下个月">›</button>
+            </div>
+            <div class="stock-calendar-layout">
+              <div class="stock-calendar-board">
+                <div class="stock-calendar-weekdays" aria-hidden="true">
+                  <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+                </div>
+                <div id="stock-calendar-grid" class="stock-calendar-grid" role="grid" aria-labelledby="stock-calendar-title"></div>
+              </div>
+              <aside class="stock-day-agenda" aria-labelledby="stock-day-agenda-title">
+                <header>
+                  <div>
+                    <p id="stock-day-agenda-date"></p>
+                    <h3 id="stock-day-agenda-title">当日事件</h3>
+                  </div>
+                  <span id="stock-day-agenda-count">0 项</span>
+                </header>
+                <div id="stock-day-agenda-list" class="stock-day-agenda-list"></div>
+                <article id="stock-event-detail" class="stock-event-detail" hidden>
+                  <div class="stock-event-detail-badges" id="stock-event-detail-badges"></div>
+                  <h4 id="stock-event-detail-title"></h4>
+                  <p id="stock-event-detail-stock"></p>
+                  <p id="stock-event-detail-summary"></p>
+                  <a id="stock-event-detail-source" target="_blank" rel="noopener noreferrer">查看来源 ↗</a>
+                </article>
+                <p id="stock-day-agenda-empty" class="stock-day-agenda-empty" hidden>这一天没有匹配事件。</p>
+              </aside>
+            </div>
+          </div>
+
+          <div id="stock-events-timeline-panel" class="stock-events-timeline-panel" role="tabpanel" aria-labelledby="stock-events-timeline-tab" hidden>
+            <div id="stock-events-timeline" class="stock-events-timeline"></div>
+            <p id="stock-events-timeline-empty" class="stock-day-agenda-empty" hidden>当前筛选没有匹配事件。</p>
+          </div>
+
+          <details class="stock-events-sources">
+            <summary><strong>数据来源与范围边界</strong><span id="stock-events-source-summary"></span></summary>
+            <div id="stock-events-source-list" class="stock-events-source-list"></div>
+          </details>
+        </section>
+
         <section class="btc-intelligence" id="btc-intelligence" aria-label="BTC 专业情报" hidden>
           <header class="btc-intelligence-hero">
             <div>
@@ -335,7 +406,7 @@
           <div class="section-head event-section-head">
             <div>
               <h2 id="event-calendar-title">未来两周日历</h2>
-              <p>精确时间按北京时间归入日期；仅有官方日期的事件按美国日期展示</p>
+              <p>精确时间按北京时间归入日期；仅有官方日期的事件按来源所在地日期展示</p>
             </div>
           </div>
           <div id="event-calendar-grid" class="event-calendar-grid"></div>
@@ -516,7 +587,7 @@
           <div id="issue-scroll" class="table-scroll issue-scroll" tabindex="0" aria-label="采集诊断记录">
             <table>
               <thead>
-                <tr><th>范围</th><th>失败时间</th><th>原因</th></tr>
+                <tr><th>状态</th><th>范围</th><th>发生时间 / 运行</th><th>原因与定位</th></tr>
               </thead>
               <tbody id="issue-body"></tbody>
             </table>
@@ -631,6 +702,61 @@
           </section>
           <div id="market-event-source-links" class="market-event-source-links"></div>
         </div>
+      </div>
+    </dialog>
+
+    <dialog class="stock-selector-dialog" id="stock-selector-dialog" aria-labelledby="stock-selector-title">
+      <div class="stock-selector-shell">
+        <header class="stock-selector-header">
+          <div>
+            <p>显示范围与长期关注</p>
+            <h2 id="stock-selector-title">选择显示与监控的股票</h2>
+          </div>
+          <button id="stock-selector-close" type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="stock-selector-tools">
+          <label>
+            <span class="visually-hidden">搜索股票</span>
+            <input id="stock-selector-search" type="search" maxlength="32" placeholder="搜索代码或名称" autocomplete="off">
+          </label>
+          <span id="stock-selector-count">已选 0 支</span>
+        </div>
+        <nav class="stock-selector-tabs" role="tablist" aria-label="股票来源">
+          <button id="stock-selector-manual-tab" type="button" role="tab" aria-selected="true">手动关注</button>
+          <button id="stock-selector-auto-tab" type="button" role="tab" aria-selected="false">每日入选</button>
+        </nav>
+        <form id="stock-selector-add-form" class="stock-selector-add-form">
+          <div class="stock-selector-add-field">
+            <label for="stock-selector-add-query">增加关注</label>
+            <input
+              id="stock-selector-add-query"
+              type="search"
+              maxlength="32"
+              placeholder="输入中文名称或股票代码"
+              autocomplete="off"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded="false"
+              aria-controls="stock-selector-suggestions"
+              required
+            >
+            <div
+              id="stock-selector-suggestions"
+              class="stock-selector-suggestions"
+              role="listbox"
+              aria-label="股票搜索推荐"
+              hidden
+            ></div>
+          </div>
+          <button type="submit">添加</button>
+        </form>
+        <p id="stock-selector-help" class="stock-selector-help">可按中文名称或代码搜索；手动关注会长期保留。</p>
+        <div id="stock-selector-list" class="stock-selector-list"></div>
+        <p id="stock-selector-status" class="stock-selector-status" role="status" aria-live="polite"></p>
+        <footer class="stock-selector-footer">
+          <button id="stock-selector-cancel" type="button">取消</button>
+          <button id="stock-selector-apply" type="button">应用选择</button>
+        </footer>
       </div>
     </dialog>
   </body>

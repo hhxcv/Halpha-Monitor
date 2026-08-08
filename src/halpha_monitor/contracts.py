@@ -10,7 +10,7 @@ from typing import Any, Literal, Protocol, Sequence, runtime_checkable
 
 ColumnKind = Literal["text", "number", "percent", "time"]
 ColumnPriority = Literal["primary", "secondary"]
-ConfigurationKind = Literal["decimal", "multi_choice"]
+ConfigurationKind = Literal["decimal", "multi_choice", "stock_list"]
 EvaluationDirection = Literal["UP", "DOWN"]
 EvaluationStatus = Literal["COMPLETE", "UNAVAILABLE"]
 EvaluationVerdict = Literal["ALIGNED", "INCONCLUSIVE", "OPPOSED", "UNAVAILABLE"]
@@ -49,7 +49,7 @@ class FilterChoice:
 class ViewFilter:
     key: str
     label: str
-    default: str
+    default: str | tuple[str, ...]
     choices: tuple[FilterChoice, ...]
     multiple: bool = False
 
@@ -107,6 +107,9 @@ class ConfigurationField:
     minimum: str | None = None
     step: str | None = None
     choices: tuple[FilterChoice, ...] = ()
+    description: str | None = None
+    placeholder: str | None = None
+    maximum_items: int | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,7 @@ class MetricSample:
 class CollectionIssue:
     scope: str
     reason_code: str
+    context: dict[str, str | int | float | bool | None] | None = None
 
 
 @dataclass(frozen=True)

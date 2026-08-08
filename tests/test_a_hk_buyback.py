@@ -11,6 +11,7 @@ from pypdf import PdfWriter
 
 from halpha_monitor.monitors import a_hk_buyback as buyback
 from halpha_monitor.buyback_metrics import (
+    buyback_projection_valid_until,
     match_a_share_program,
     parse_a_share_reference,
     parse_financial_reference,
@@ -41,6 +42,22 @@ from halpha_monitor.store import SQLiteMonitorStore
 
 NOW = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def test_buyback_projection_cache_expiry_matches_next_time_derived_change() -> None:
+    now = datetime(2026, 8, 7, 23, 30, tzinfo=UTC)
+    reference_at = now - timedelta(days=7) + timedelta(minutes=15)
+    source_payloads = {
+        "a-share-buyback-reference": {
+            "programmes": [{"updated_at": reference_at.isoformat()}]
+        }
+    }
+
+    valid_until = buyback_projection_valid_until(source_payloads, now=now)
+    midnight_only = buyback_projection_valid_until({}, now=now)
+
+    assert valid_until == reference_at + timedelta(days=7, microseconds=1)
+    assert midnight_only == datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
 
 
 def test_buyback_schedule_uses_a_h_union_and_stays_closed_off_session() -> None:

@@ -3,6 +3,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import numpy as np
@@ -16,6 +17,7 @@ from halpha_monitor.monitors.binance_btc_relationship import (
     MAX_KLINE_RESPONSE_BYTES,
     _price_series,
     analyze_pair,
+    latest_closed_cutoff,
     normalize_klines,
 )
 
@@ -274,3 +276,55 @@ def test_monitor_marks_failed_asset_missing_but_preserves_other_valid_rows(
     assert by_symbol["ETHUSDT"].payload["data_state"].startswith("可用")
     assert by_symbol["MISSUSDT"].payload["pearson"] is None
     assert batch.issues[0].scope == "MISSUSDT"
+
+
+def test_daily_relationship_computation_waits_until_next_closed_utc_day(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    cutoff = latest_closed_cutoff(now)
+
+    class StateStore:
+        def __init__(self, stored_cutoff: datetime, *, status: str = "SUCCESS") -> None:
+            self.stored_cutoff = stored_cutoff
+            self.status = status
+
+        def latest_finished_run(self, monitor_id):  # type: ignore[no-untyped-def]
+            del monitor_id
+            return SimpleNamespace(status=self.status)
+
+        def latest_samples_by_entity(self, monitor_id, entity_keys):  # type: ignore[no-untyped-def]
+            del monitor_id, entity_keys
+            return (
+                SimpleNamespace(
+                    payload={"data_cutoff_at": self.stored_cutoff.isoformat()}
+                ),
+            )
+
+    settings = BinanceBtcRelationshipSettings(
+        cache_root=tmp_path,
+        symbols=("BTCUSDT", "ETHUSDT"),
+    )
+    current = BinanceBtcRelationshipMonitor(
+        settings,
+        FakeProvider({}),
+        store=StateStore(cutoff),  # type: ignore[arg-type]
+    ).automatic_collection_state(now=now)
+    pending = BinanceBtcRelationshipMonitor(
+        settings,
+        FakeProvider({}),
+        store=StateStore(cutoff - timedelta(days=1)),  # type: ignore[arg-type]
+    ).automatic_collection_state(now=now)
+    partial = BinanceBtcRelationshipMonitor(
+        settings,
+        FakeProvider({}),
+        store=StateStore(cutoff, status="PARTIAL"),  # type: ignore[arg-type]
+    ).automatic_collection_state(now=now)
+
+    assert current.allowed is False
+    assert current.status == "CLOSED"
+    assert current.next_open_at == datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    assert pending.allowed is True
+    assert pending.status == "OPEN"
+    assert partial.allowed is True
+    assert partial.status == "OPEN"

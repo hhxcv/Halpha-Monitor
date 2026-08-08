@@ -1,10 +1,13 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import gzip
+import json
 from urllib.error import HTTPError
 
 import pytest
 
 from halpha_monitor.contracts import ForwardEvaluationCase
+from halpha_monitor.monitors import binance_altcoin_radar as radar_module
 from halpha_monitor.monitors.binance_altcoin_radar import (
     BinanceAltcoinRadarClient,
     BinanceAltcoinRadarMonitor,
@@ -18,11 +21,13 @@ from halpha_monitor.monitors.binance_altcoin_radar import (
     EVALUATION_SOURCE,
     FundingContext,
     OpenInterestPoint,
+    PumpHistoryCache,
     RadarSourceError,
     RollingTicker,
     TimedValue,
     analyze_price_position,
     classify_contextual_stage,
+    detect_pump_episodes,
     latest_closed_daily_cutoff,
     open_interest_change_15m,
     parse_contract_klines,
@@ -31,6 +36,7 @@ from halpha_monitor.monitors.binance_altcoin_radar import (
     parse_tickers,
     score_candidate,
     select_candidate_seeds,
+    _write_daily_cache,
 )
 from halpha_monitor.store import SQLiteMonitorStore
 
@@ -595,6 +601,169 @@ def test_price_position_finds_only_a_completed_previous_pump_peak() -> None:
     )
 
 
+def test_pump_episode_keeps_multiday_rise_and_high_consolidation_together() -> None:
+    closes = tuple(
+        [100.0] * 80
+        + [110.0, 125.0, 140.0, 155.0]
+        + [150.0, 152.0, 149.0, 151.0, 150.0, 153.0, 151.0, 152.0]
+        + [160.0, 175.0]
+        + [143.0, 140.0, 138.0]
+    )
+    candles = daily_candles_from_closes(closes)
+
+    assert detect_pump_episodes(candles[:-1]) == ()
+    episodes = detect_pump_episodes(candles)
+
+    assert len(episodes) == 1
+    episode = episodes[0]
+    assert episode.start_at == candles[79].open_time
+    assert episode.peak_at == candles[-4].close_time
+    assert episode.peak_price == pytest.approx(176.75)
+    assert episode.completed_at == candles[-1].close_time
+    assert episode.advance_percent == pytest.approx(76.75)
+    assert episode.confirmed_drawdown_percent <= -18.0
+
+
+def test_unfinished_rise_is_not_labeled_as_previous_pump() -> None:
+    closes = tuple(
+        [100.0] * 80
+        + [110.0, 125.0, 145.0, 165.0]
+        + [155.0] * 30
+    )
+    candles = daily_candles_from_closes(closes)
+
+    assert detect_pump_episodes(candles) == ()
+    result = analyze_price_position(
+        candles,
+        current_price=158.0,
+        return_24h_percent=1.0,
+    )
+    assert result.previous_pump_peak_at is None
+    assert result.previous_pump_peak_price is None
+
+
+def test_previous_pump_search_uses_two_year_history_beyond_180_days() -> None:
+    closes = tuple(
+        [100.0] * 60
+        + [110.0, 125.0, 145.0, 170.0]
+        + [140.0, 135.0, 130.0]
+        + [100.0] * 500
+    )
+    candles = daily_candles_from_closes(closes)
+
+    result = analyze_price_position(
+        candles,
+        current_price=105.0,
+        return_24h_percent=0.5,
+    )
+
+    assert result.previous_pump_peak_at == candles[63].close_time
+    assert result.previous_pump_peak_price == pytest.approx(171.7)
+    assert result.previous_pump_peak_at < candles[-180].open_time
+
+
+def test_pump_history_cache_survives_restart_and_resumes_one_new_day(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    closes = tuple(
+        [100.0] * 80
+        + [110.0, 125.0, 145.0, 170.0]
+        + [140.0, 135.0, 130.0]
+        + [100.0] * 40
+    )
+    cutoff = latest_closed_daily_cutoff(NOW)
+    first_candles = daily_candles_from_closes(
+        closes,
+        cutoff=cutoff - timedelta(days=1),
+    )
+    cache_root = tmp_path / "pump-history"
+
+    first = PumpHistoryCache(cache_root).analyze("AAAUSDT", first_candles)
+    reopened = PumpHistoryCache(cache_root)
+    cached = reopened.analyze("AAAUSDT", first_candles)
+    extended = daily_candles_from_closes(
+        (*closes, 101.0),
+        cutoff=cutoff,
+    )
+    updated = reopened.analyze("AAAUSDT", extended)
+
+    assert first.status == "COMPUTED"
+    assert first.processed_candles == len(first_candles)
+    assert cached.status == "CACHE_CURRENT"
+    assert cached.processed_candles == 0
+    assert updated.status == "UPDATED"
+    assert updated.processed_candles == 1
+    assert updated.episodes == first.episodes
+    assert PumpHistoryCache(cache_root).analyze(
+        "AAAUSDT",
+        extended,
+    ).status == "CACHE_CURRENT"
+
+
+def test_pump_history_cache_skips_fingerprinting_same_in_memory_daily_tuple(
+    tmp_path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    candles = daily_candles_from_closes(tuple([100.0] * 120))
+    original = radar_module._pump_candle_fingerprint
+    calls = 0
+
+    def counted(candle):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        return original(candle)
+
+    monkeypatch.setattr(radar_module, "_pump_candle_fingerprint", counted)
+    cache = PumpHistoryCache(tmp_path / "pump-history")
+    first = cache.analyze("AAAUSDT", candles)
+    first_calls = calls
+    second = cache.analyze("AAAUSDT", candles)
+
+    assert first.status == "COMPUTED"
+    assert first_calls == len(candles)
+    assert second.status == "CACHE_CURRENT"
+    assert second.processed_candles == 0
+    assert calls == first_calls
+
+
+def test_pump_history_cache_rebuilds_when_rule_version_changes(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    candles = daily_candles_from_closes(tuple([100.0] * 120))
+    cache_root = tmp_path / "pump-history"
+    PumpHistoryCache(cache_root).analyze("AAAUSDT", candles)
+    cache_path = cache_root / "AAAUSDT.pump-history.json.gz"
+    with gzip.open(cache_path, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload["rule_version"] = "retired-rule"
+    with gzip.open(cache_path, "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+    rebuilt = PumpHistoryCache(cache_root).analyze("AAAUSDT", candles)
+
+    assert rebuilt.status == "COMPUTED"
+    assert rebuilt.processed_candles == len(candles)
+
+
+def test_pump_history_cache_rewinds_only_corrected_daily_tail(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    cutoff = latest_closed_daily_cutoff(NOW)
+    closes = tuple([100.0] * 120)
+    original = daily_candles_from_closes(closes, cutoff=cutoff)
+    cache = PumpHistoryCache(tmp_path / "pump-history")
+    cache.analyze("AAAUSDT", original)
+    corrected = daily_candles_from_closes(
+        (*closes[:-2], 110.0, 100.0),
+        cutoff=cutoff,
+    )
+
+    updated = cache.analyze("AAAUSDT", corrected)
+
+    assert updated.status == "UPDATED"
+    assert updated.processed_candles == 2
+
+
 def test_daily_cache_fetches_once_per_closed_day_and_survives_reopen(
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -635,6 +804,183 @@ def test_daily_cache_fetches_once_per_closed_day_and_survives_reopen(
     assert unicode_symbol.status == "FETCHED"
     assert client.calls == 2
     assert any(path.name.startswith("unicode-") for path in cache_root.iterdir())
+
+
+def test_daily_cache_reuses_same_process_memory_without_reopening_gzip(
+    tmp_path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    cutoff = latest_closed_daily_cutoff(NOW)
+    source_candles = daily_candles_from_closes(tuple([100.0] * 120), cutoff=cutoff)
+
+    class DailyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def daily_klines(
+            self,
+            symbol: str,
+            *,
+            start_at: datetime,
+            end_at: datetime,
+            limit: int,
+        ) -> TimedValue:
+            del symbol, start_at, end_at, limit
+            self.calls += 1
+            return TimedValue(source_candles, NOW)
+
+    client = DailyClient()
+    cache = BinanceUsdmDailyCache(tmp_path / "cache", client)  # type: ignore[arg-type]
+    first = cache.fetch("AAAUSDT", cutoff)
+
+    def unexpected_disk_read(_path):  # type: ignore[no-untyped-def]
+        raise AssertionError("current in-process daily data must not be decompressed again")
+
+    monkeypatch.setattr(radar_module, "_read_daily_cache", unexpected_disk_read)
+    second = cache.fetch("AAAUSDT", cutoff)
+
+    assert second.status == "CACHE_CURRENT"
+    assert second.candles is first.candles
+    assert client.calls == 1
+
+
+def test_daily_cache_paginates_and_persists_two_year_coverage(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    cutoff = latest_closed_daily_cutoff(NOW)
+    source_candles = daily_candles_from_closes(
+        tuple(100.0 + index / 1000 for index in range(730)),
+        cutoff=cutoff,
+    )
+
+    class DailyClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[datetime, datetime, int]] = []
+
+        def daily_klines(
+            self,
+            symbol: str,
+            *,
+            start_at: datetime,
+            end_at: datetime,
+            limit: int,
+        ) -> TimedValue:
+            del symbol
+            self.calls.append((start_at, end_at, limit))
+            page = tuple(
+                candle
+                for candle in source_candles
+                if candle.open_time >= start_at and candle.close_time <= end_at
+            )[:limit]
+            return TimedValue(page, NOW)
+
+    client = DailyClient()
+    cache_root = tmp_path / "cache"
+    cache = BinanceUsdmDailyCache(cache_root, client)  # type: ignore[arg-type]
+
+    fetched = cache.fetch("AAAUSDT", cutoff)
+    cached = BinanceUsdmDailyCache(cache_root, client).fetch(  # type: ignore[arg-type]
+        "AAAUSDT",
+        cutoff,
+    )
+
+    assert fetched.status == "FETCHED"
+    assert len(fetched.candles) == 730
+    assert [call[2] for call in client.calls] == [500, 230]
+    assert cached.status == "CACHE_CURRENT"
+    assert len(client.calls) == 2
+
+
+def test_daily_cache_backfills_legacy_short_history_once(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    cutoff = latest_closed_daily_cutoff(NOW)
+    source_candles = daily_candles_from_closes(
+        tuple(100.0 + index / 1000 for index in range(730)),
+        cutoff=cutoff,
+    )
+    cache_root = tmp_path / "cache"
+    cache_path = cache_root / "AAAUSDT.csv.gz"
+    _write_daily_cache(source_candles[-220:], cache_path)
+
+    class DailyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def daily_klines(
+            self,
+            symbol: str,
+            *,
+            start_at: datetime,
+            end_at: datetime,
+            limit: int,
+        ) -> TimedValue:
+            del symbol
+            self.calls += 1
+            page = tuple(
+                candle
+                for candle in source_candles
+                if candle.open_time >= start_at and candle.close_time <= end_at
+            )[:limit]
+            return TimedValue(page, NOW)
+
+    client = DailyClient()
+    cache = BinanceUsdmDailyCache(cache_root, client)  # type: ignore[arg-type]
+
+    backfilled = cache.fetch("AAAUSDT", cutoff)
+    cached = BinanceUsdmDailyCache(cache_root, client).fetch(  # type: ignore[arg-type]
+        "AAAUSDT",
+        cutoff,
+    )
+
+    assert backfilled.status == "FETCHED"
+    assert len(backfilled.candles) == 730
+    assert client.calls == 2
+    assert cached.status == "CACHE_CURRENT"
+    assert client.calls == 2
+
+
+def test_daily_cache_records_empty_pre_listing_backfill_as_complete(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    cutoff = latest_closed_daily_cutoff(NOW)
+    source_candles = daily_candles_from_closes(
+        tuple([100.0] * 120),
+        cutoff=cutoff,
+    )
+    cache_root = tmp_path / "cache"
+    _write_daily_cache(source_candles, cache_root / "NEWUSDT.csv.gz")
+
+    class DailyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def daily_klines(
+            self,
+            symbol: str,
+            *,
+            start_at: datetime,
+            end_at: datetime,
+            limit: int,
+        ) -> TimedValue:
+            del symbol, start_at, end_at, limit
+            self.calls += 1
+            raise RadarSourceError("RADAR_DAILY_KLINES_EMPTY")
+
+    client = DailyClient()
+    first = BinanceUsdmDailyCache(cache_root, client).fetch(  # type: ignore[arg-type]
+        "NEWUSDT",
+        cutoff,
+    )
+    second = BinanceUsdmDailyCache(cache_root, client).fetch(  # type: ignore[arg-type]
+        "NEWUSDT",
+        cutoff,
+    )
+
+    assert first.status == "FETCHED"
+    assert len(first.candles) == 120
+    assert second.status == "CACHE_CURRENT"
+    assert client.calls == 1
 
 
 def test_candidate_selection_excludes_btc_stables_and_leveraged_tokens() -> None:

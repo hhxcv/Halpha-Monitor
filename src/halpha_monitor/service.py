@@ -34,6 +34,54 @@ def _safe_runtime_log(message: str) -> None:
         return
 
 
+def _runtime_exception_context(exc: Exception) -> dict[str, str | int]:
+    """Keep path-free code location without persisting exception messages."""
+
+    context: dict[str, str | int] = {
+        "exception_type": type(exc).__name__[:80],
+    }
+    project_location: tuple[str, str, int] | None = None
+    fallback_location: tuple[str, str, int] | None = None
+    traceback = exc.__traceback__
+    while traceback is not None:
+        module = str(traceback.tb_frame.f_globals.get("__name__") or "")[:160]
+        function = str(traceback.tb_frame.f_code.co_name or "")[:120]
+        if (
+            re.fullmatch(r"[A-Za-z0-9_.]+", module)
+            and re.fullmatch(r"[A-Za-z0-9_<>]+", function)
+        ):
+            location = (module, function, int(traceback.tb_lineno))
+            fallback_location = location
+            if module == "halpha_monitor" or module.startswith("halpha_monitor."):
+                project_location = location
+        traceback = traceback.tb_next
+    selected = fallback_location or project_location
+    if selected is not None:
+        context.update(
+            {
+                "origin_module": selected[0],
+                "origin_function": selected[1],
+                "origin_line": selected[2],
+            }
+        )
+    if project_location is not None and project_location != selected:
+        context.update(
+            {
+                "boundary_module": project_location[0],
+                "boundary_function": project_location[1],
+                "boundary_line": project_location[2],
+            }
+        )
+    return context
+
+
+def _runtime_location(context: dict[str, str | int]) -> str:
+    module = context.get("origin_module", "unknown")
+    function = context.get("origin_function", "unknown")
+    line = context.get("origin_line", 0)
+    return f"{module}:{function}:{line}"
+
+
 @dataclass(frozen=True)
 class WorkerState:
     monitor_id: str
@@ -430,9 +478,11 @@ class MonitorScheduler:
                             # Follow-up validation must not invalidate the current
                             # market snapshot. Pending cases remain durable and are
                             # retried by the next bounded collection cycle.
+                            context = _runtime_exception_context(exc)
                             _safe_runtime_log(
                                 "MONITOR_EVALUATION_FAILED "
-                                f"id={monitor.monitor_id} type={type(exc).__name__}"
+                                f"id={monitor.monitor_id} type={type(exc).__name__} "
+                                f"origin={_runtime_location(context)}"
                             )
                         else:
                             batch = replace(
@@ -451,7 +501,19 @@ class MonitorScheduler:
                 )
             except Exception as exc:
                 reason_code = f"COLLECTION_FAILED_{type(exc).__name__.upper()}"
-                self.store.fail_run(run_id, monitor.monitor_id, reason_code)
+                context = _runtime_exception_context(exc)
+                self.store.fail_run(
+                    run_id,
+                    monitor.monitor_id,
+                    reason_code,
+                    context=context,
+                )
+                _safe_runtime_log(
+                    "MONITOR_COLLECTION_FAILED "
+                    f"id={monitor.monitor_id} run_id={run_id} "
+                    f"type={type(exc).__name__} "
+                    f"origin={_runtime_location(context)}"
+                )
             self._run_maintenance_if_due()
         finally:
             self._set_collecting(monitor.monitor_id, False)
@@ -469,15 +531,19 @@ class MonitorScheduler:
             try:
                 removed_runs = self.store.prune(self.retention_days)
             except Exception as exc:
+                context = _runtime_exception_context(exc)
                 _safe_runtime_log(
-                    f"MONITOR_MAINTENANCE_FAILED type={type(exc).__name__}"
+                    f"MONITOR_MAINTENANCE_FAILED type={type(exc).__name__} "
+                    f"origin={_runtime_location(context)}"
                 )
                 return
             try:
                 storage = self.store.storage_metrics()
             except Exception as exc:
+                context = _runtime_exception_context(exc)
                 _safe_runtime_log(
-                    f"MONITOR_RUNTIME_METRICS_FAILED type={type(exc).__name__}"
+                    f"MONITOR_RUNTIME_METRICS_FAILED type={type(exc).__name__} "
+                    f"origin={_runtime_location(context)}"
                 )
                 return
             workers = self.worker_states()
@@ -505,11 +571,13 @@ class MonitorScheduler:
 
     def _record_loop_error(self, monitor_id: str, exc: Exception) -> None:
         error_type = type(exc).__name__
+        context = _runtime_exception_context(exc)
         with self._worker_state_lock:
             self._worker_last_error[monitor_id] = error_type
             self._worker_last_seen_at[monitor_id] = utc_now()
         _safe_runtime_log(
-            f"MONITOR_LOOP_FAILED id={monitor_id} type={error_type}"
+            f"MONITOR_LOOP_FAILED id={monitor_id} type={error_type} "
+            f"origin={_runtime_location(context)}"
         )
 
     def _regular_wait_seconds(self, monitor: RegisteredMonitor) -> float:

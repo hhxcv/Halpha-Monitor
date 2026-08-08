@@ -31,7 +31,11 @@ from halpha_monitor.monitors.a_hk_buyback import (
     classify_buyback_title,
     is_target_a_share_security,
 )
-from halpha_monitor.service import MonitorRegistry, MonitorScheduler
+from halpha_monitor.service import (
+    DEFAULT_OBSERVATION_LEASE_SECONDS,
+    MonitorRegistry,
+    MonitorScheduler,
+)
 from halpha_monitor.store import (
     SQLiteMonitorStore,
     StoredForwardEvaluation,
@@ -80,26 +84,32 @@ class BuybackReviewRequest(BaseModel):
         "REJECTED_EVENT",
         "NEEDS_FOLLOW_UP",
     ]
-    corrected_event_type: Literal[
-        "PLAN_OR_APPROVAL",
-        "FIRST_EXECUTION",
-        "PROGRESS",
-        "MODIFICATION",
-        "COMPLETION_OR_TERMINATION",
-        "POST_BUYBACK_CANCELLATION",
-        "POST_BUYBACK_DISPOSAL",
-        "AMBIGUOUS_BUYBACK",
-        "HKEX_EXECUTION",
-    ] | None = None
+    corrected_event_type: (
+        Literal[
+            "PLAN_OR_APPROVAL",
+            "FIRST_EXECUTION",
+            "PROGRESS",
+            "MODIFICATION",
+            "COMPLETION_OR_TERMINATION",
+            "POST_BUYBACK_CANCELLATION",
+            "POST_BUYBACK_DISPOSAL",
+            "AMBIGUOUS_BUYBACK",
+            "HKEX_EXECUTION",
+        ]
+        | None
+    ) = None
     program_key: str | None = Field(default=None, max_length=120)
-    program_status: Literal[
-        "PROPOSED",
-        "APPROVED",
-        "ACTIVE",
-        "COMPLETED",
-        "TERMINATED",
-        "UNKNOWN",
-    ] | None = None
+    program_status: (
+        Literal[
+            "PROPOSED",
+            "APPROVED",
+            "ACTIVE",
+            "COMPLETED",
+            "TERMINATED",
+            "UNKNOWN",
+        ]
+        | None
+    ) = None
     note: str = Field(default="", max_length=1000)
 
 
@@ -201,9 +211,7 @@ def _data_status(
                 "kind": "DISABLED_EMPTY",
                 "tone": "DISABLED",
                 "label": "尚无采集记录",
-                "detail": (
-                    "监控当前未开启；没有历史结果，也没有使用任何替代值。"
-                ),
+                "detail": ("监控当前未开启；没有历史结果，也没有使用任何替代值。"),
                 "cutoff_label": "采集完成",
             }
         return {
@@ -262,9 +270,7 @@ def _data_status(
                 ),
                 "tone": "HEALTHY" if expected_absence_only else "PARTIAL",
                 "label": "最新采集已完成",
-                "detail": (
-                    "本轮未取得结果的具体范围已在对应数据表内标记。"
-                ),
+                "detail": ("本轮未取得结果的具体范围已在对应数据表内标记。"),
                 "cutoff_label": "最近采集完成",
             }
         if latest.status == "SUCCESS":
@@ -282,8 +288,7 @@ def _data_status(
             "tone": "RUNNING",
             "label": "正在刷新 · 显示上一轮结果",
             "detail": (
-                "新一轮尚未完成；表格显示上一轮已通过校验的结果，"
-                "无需用户处理。"
+                "新一轮尚未完成；表格显示上一轮已通过校验的结果，无需用户处理。"
             ),
             "cutoff_label": "上一轮采集完成",
         }
@@ -307,10 +312,12 @@ def _monitor_summary(
     now: datetime,
     scheduler: MonitorScheduler | None = None,
 ) -> dict[str, Any]:
+    cadence = _collection_cadence_payload(monitor, scheduler=scheduler)
+    effective_interval_seconds = float(cadence["effective_interval_seconds"])
     latest = store.latest_run(monitor.monitor_id)
     projection_kind = getattr(monitor, "projection_kind", None)
     is_buyback = projection_kind == "buyback"
-    is_snapshot = projection_kind in {"buyback", "market_events"}
+    is_snapshot = projection_kind in {"buyback", "market_events", "btc_intelligence"}
     data_run = (
         store.latest_completed_run(monitor.monitor_id)
         if is_snapshot
@@ -331,7 +338,7 @@ def _monitor_summary(
     data_status = _data_status(
         latest,
         data_run,
-        interval_seconds=monitor.interval_seconds,
+        interval_seconds=effective_interval_seconds,
         now=now,
         user_can_configure=isinstance(monitor, ConfigurableMonitor),
         enabled=control.enabled,
@@ -358,6 +365,17 @@ def _monitor_summary(
             "label": "最近事件检查已完成",
             "detail": "宏观发布与央行日历最近一轮检查已结束。",
             "cutoff_label": "最近事件检查",
+        }
+    if projection_kind == "btc_intelligence" and data_status["kind"] in {
+        "CURRENT",
+        "CURRENT_WITH_NOTICES",
+        "CURRENT_WITH_GAPS",
+    }:
+        data_status = {
+            **data_status,
+            "label": "BTC 情报快照已更新",
+            "detail": "月频、日频、4h 与聪明钱来源已按各自截止时间投影。",
+            "cutoff_label": "情报快照",
         }
     operational_status = _operational_status(latest, enabled=control.enabled)
     if (
@@ -393,11 +411,12 @@ def _monitor_summary(
         "display_name": monitor.display_name,
         "description": monitor.description,
         "interval_seconds": monitor.interval_seconds,
+        "collection_cadence": cadence,
         "enabled": control.enabled,
         "control_updated_at": iso_utc(control.updated_at),
         "status": monitor_status(
             latest,
-            interval_seconds=monitor.interval_seconds,
+            interval_seconds=effective_interval_seconds,
             now=now,
             enabled=control.enabled,
         ),
@@ -406,6 +425,38 @@ def _monitor_summary(
         "operational_status": operational_status,
         "data_status": data_status,
         "automatic_collection": _automatic_collection_payload(automatic_state),
+    }
+
+
+def _collection_cadence_payload(
+    monitor: RegisteredMonitor,
+    *,
+    scheduler: MonitorScheduler | None,
+) -> dict[str, Any]:
+    if scheduler is not None:
+        cadence = scheduler.collection_cadence(monitor.monitor_id)
+        return {
+            "adaptive": cadence.foreground_interval_seconds is not None,
+            "background_interval_seconds": cadence.background_interval_seconds,
+            "foreground_interval_seconds": cadence.foreground_interval_seconds,
+            "effective_interval_seconds": cadence.effective_interval_seconds,
+            "foreground_active": cadence.foreground_active,
+        }
+    background_interval = float(monitor.interval_seconds)
+    raw_foreground_interval = getattr(
+        monitor,
+        "foreground_interval_seconds",
+        None,
+    )
+    foreground_interval = (
+        float(raw_foreground_interval) if raw_foreground_interval is not None else None
+    )
+    return {
+        "adaptive": foreground_interval is not None,
+        "background_interval_seconds": background_interval,
+        "foreground_interval_seconds": foreground_interval,
+        "effective_interval_seconds": background_interval,
+        "foreground_active": False,
     }
 
 
@@ -455,16 +506,17 @@ def _overall_data_status(summaries: list[dict[str, Any]]) -> tuple[str, str]:
     active = [item for item in summaries if bool(item["enabled"])]
     if not active:
         return "DISABLED", "监控均已关闭"
-    if any(
-        str(item["operational_status"]["kind"]) == "COLLECTING"
-        for item in active
-    ):
+    if any(str(item["operational_status"]["kind"]) == "COLLECTING" for item in active):
         return "RUNNING", "采集中"
-    if active and all(
-        item.get("automatic_collection", {}).get("status") == "CLOSED"
-        for item in active
-        if item.get("automatic_collection") is not None
-    ) and all(item.get("automatic_collection") is not None for item in active):
+    if (
+        active
+        and all(
+            item.get("automatic_collection", {}).get("status") == "CLOSED"
+            for item in active
+            if item.get("automatic_collection") is not None
+        )
+        and all(item.get("automatic_collection") is not None for item in active)
+    ):
         return "IDLE", "闭市静态"
     kinds = [str(item["data_status"]["kind"]) for item in active]
     if kinds and all(kind == "EMPTY" for kind in kinds):
@@ -526,6 +578,10 @@ def _collection_load(
     request_count = 0
     measured_monitors = 0
     for monitor, summary in active:
+        cadence = summary.get("collection_cadence") or {}
+        effective_interval_seconds = float(
+            cadence.get("effective_interval_seconds", monitor.interval_seconds)
+        )
         latest = summary.get("latest_run")
         data_run = summary.get("data_run")
         if latest and latest.get("status") == "RUNNING":
@@ -539,7 +595,7 @@ def _collection_load(
         if monitor.monitor_id in automatically_running_ids or (
             latest and latest.get("status") == "RUNNING"
         ):
-            utilization += work_seconds / max(float(monitor.interval_seconds), 1.0)
+            utilization += work_seconds / max(effective_interval_seconds, 1.0)
 
         for run in (latest, data_run):
             if not run:
@@ -584,14 +640,18 @@ def _collection_load(
         "collecting_count": collecting_count,
         "planned_runs_per_minute": round(
             sum(
-                60.0 / float(monitor.interval_seconds)
-                for monitor, _ in automatically_running
+                60.0
+                / float(
+                    (summary.get("collection_cadence") or {}).get(
+                        "effective_interval_seconds",
+                        monitor.interval_seconds,
+                    )
+                )
+                for monitor, summary in automatically_running
             ),
             2,
         ),
-        "network_requests": (
-            request_count if measured_monitors else None
-        ),
+        "network_requests": (request_count if measured_monitors else None),
         "request_window_seconds": int(REQUEST_WINDOW_SECONDS),
         "request_measurement": measurement,
         "measured_monitor_count": measured_monitors,
@@ -675,6 +735,99 @@ def _sample_payload(sample: StoredSample) -> dict[str, Any]:
     }
 
 
+def _btc_intelligence_projection(
+    samples: tuple[StoredSample, ...],
+    store: SQLiteMonitorStore,
+    monitor_id: str,
+) -> dict[str, Any] | None:
+    snapshot = next(
+        (
+            sample
+            for sample in samples
+            if sample.payload.get("row_type") == "BTC_INTELLIGENCE"
+        ),
+        None,
+    )
+    if snapshot is None:
+        return None
+    history = store.btc_structure_history(monitor_id)
+    structure_algorithm_version = (
+        history.algorithm_version if history is not None else None
+    )
+    revisions = store.latest_btc_structure_event_revisions(
+        monitor_id,
+        limit=20,
+        algorithm_version=structure_algorithm_version,
+    )
+    events = []
+    for revision in revisions:
+        signal = revision.payload.get("signal")
+        outcome = revision.payload.get("outcome")
+        events.append(
+            {
+                "event_key": revision.event_key,
+                "event_at": iso_utc(revision.event_at),
+                "observed_at": iso_utc(revision.observed_at),
+                "state": revision.state,
+                "revision_no": revision.revision_no,
+                "signal": signal if isinstance(signal, dict) else None,
+                "outcome": outcome if isinstance(outcome, dict) else None,
+            }
+        )
+    monthly_history = store.btc_monthly_research_history(monitor_id)
+    monthly_ledger: dict[str, Any] | None = None
+    if monthly_history is not None:
+        monthly_revisions = store.latest_btc_monthly_research_revisions(
+            monitor_id,
+            limit=12,
+            algorithm_version=monthly_history.algorithm_version,
+        )
+        monthly_ledger = {
+            **store.btc_monthly_research_summary(
+                monitor_id,
+                algorithm_version=monthly_history.algorithm_version,
+            ),
+            "started_at": iso_utc(monthly_history.started_at),
+            "processed_through_at": iso_utc(monthly_history.processed_through_at),
+            "algorithm_version": monthly_history.algorithm_version,
+            "history_policy": "FORWARD_ONLY",
+            "records": [
+                {
+                    "signal_key": revision.signal_key,
+                    "signal_at": iso_utc(revision.signal_at),
+                    "observed_at": iso_utc(revision.observed_at),
+                    "state": revision.state,
+                    "revision_no": revision.revision_no,
+                    "signal": revision.payload.get("signal"),
+                    "execution": revision.payload.get("execution"),
+                }
+                for revision in monthly_revisions
+            ],
+        }
+    return {
+        **snapshot.payload,
+        "sample_observed_at": iso_utc(snapshot.observed_at),
+        "monthly_ledger": monthly_ledger,
+        "ledger": {
+            **store.btc_structure_event_summary(
+                monitor_id,
+                algorithm_version=structure_algorithm_version,
+            ),
+            "started_at": iso_utc(history.started_at) if history is not None else None,
+            "processed_through_at": (
+                iso_utc(history.processed_through_at) if history is not None else None
+            ),
+            "algorithm_version": (
+                history.algorithm_version if history is not None else None
+            ),
+            "events": events,
+            "history_policy": "FORWARD_ONLY",
+            "retention_days": store.btc_structure_retention_days,
+            "maximum_events": store.btc_structure_max_events,
+        },
+    }
+
+
 BUYBACK_EVENT_LABELS = {
     "PLAN_OR_APPROVAL": "方案 / 审议",
     "FIRST_EXECUTION": "首次实施",
@@ -703,15 +856,11 @@ BUYBACK_SYSTEM_VERIFIED_A_EVENTS = frozenset(
         "POST_BUYBACK_DISPOSAL",
     }
 )
-BUYBACK_EXECUTION_EVENTS = frozenset(
-    {"FIRST_EXECUTION", "PROGRESS", "HKEX_EXECUTION"}
-)
+BUYBACK_EXECUTION_EVENTS = frozenset({"FIRST_EXECUTION", "PROGRESS", "HKEX_EXECUTION"})
 
 
 def _normalize_buyback_stock_query(value: str) -> str:
-    return "".join(
-        unicodedata.normalize("NFKC", value).casefold().split()
-    )
+    return "".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
 def _buyback_stock_matches(payload: dict[str, Any], query: str) -> bool:
@@ -824,7 +973,9 @@ def _market_event_time_matches(
             return exact <= now + timedelta(hours=24)
         scheduled_date = _market_event_date(payload)
         today = now.astimezone(NEW_YORK_TZ).date()
-        return scheduled_date is not None and scheduled_date <= today + timedelta(days=1)
+        return scheduled_date is not None and scheduled_date <= today + timedelta(
+            days=1
+        )
     if selected == "NEXT_7D":
         return _market_event_within_days(payload, now=now, days=7)
     if selected == "NEXT_30D":
@@ -887,9 +1038,7 @@ def _market_event_countdown(payload: dict[str, Any], *, now: datetime) -> str:
 
 
 def _market_event_recent_change(payload: dict[str, Any], *, now: datetime) -> bool:
-    changed_at = _payload_time(
-        str(payload.get("last_schedule_changed_at") or "")
-    )
+    changed_at = _payload_time(str(payload.get("last_schedule_changed_at") or ""))
     return changed_at is not None and changed_at >= now - timedelta(days=7)
 
 
@@ -914,9 +1063,7 @@ def _market_event_priority(
     else:
         scheduled_date = _market_event_date(payload)
         if scheduled_date is not None:
-            days = (
-                scheduled_date - now.astimezone(NEW_YORK_TZ).date()
-            ).days
+            days = (scheduled_date - now.astimezone(NEW_YORK_TZ).date()).days
             if changed and days <= 7:
                 return 2, "时间有调整", "官方日期最近发生调整，具体时间仍待公布。"
             if high and days <= 2:
@@ -935,9 +1082,7 @@ def _market_event_enriched(
     exact = _market_event_exact_time(payload)
     scheduled_date = _market_event_date(payload)
     local_date = (
-        exact.astimezone(SHANGHAI_TZ).date()
-        if exact is not None
-        else scheduled_date
+        exact.astimezone(SHANGHAI_TZ).date() if exact is not None else scheduled_date
     )
     scopes = [
         str(value)
@@ -950,9 +1095,7 @@ def _market_event_enriched(
         "priority_label": label,
         "priority_reason": reason,
         "countdown_label": _market_event_countdown(payload, now=now),
-        "importance_label": (
-            "高" if payload.get("importance") == "HIGH" else "中"
-        ),
+        "importance_label": ("高" if payload.get("importance") == "HIGH" else "中"),
         "markets_label": "、".join(
             MARKET_EVENT_MARKET_LABELS[scope] for scope in scopes
         ),
@@ -978,7 +1121,9 @@ def _market_event_coverage_messages(
     if "bls-macro-data" in scopes:
         messages.append("最近CPI与就业数据暂时无法更新，事件时间仍可使用")
     if "market-consensus" in scopes:
-        messages.append("本周市场一致预期暂时无法更新；没有匹配预期时不计算预期差与方向")
+        messages.append(
+            "本周市场一致预期暂时无法更新；没有匹配预期时不计算预期差与方向"
+        )
     return messages
 
 
@@ -1033,7 +1178,9 @@ def _market_event_projection(
     calendar_days: list[dict[str, Any]] = []
     for offset in range(14):
         day = today + timedelta(days=offset)
-        day_events = [row for row in rows if row.get("calendar_date") == day.isoformat()]
+        day_events = [
+            row for row in rows if row.get("calendar_date") == day.isoformat()
+        ]
         calendar_days.append(
             {
                 "date": day.isoformat(),
@@ -1052,10 +1199,7 @@ def _market_event_projection(
     history_rows = [
         _market_event_enriched(dict(row), now=now)
         for row in history_payloads
-        if (
-            (sort_at := _market_event_sort_time(row)) is not None
-            and sort_at < now
-        )
+        if ((sort_at := _market_event_sort_time(row)) is not None and sort_at < now)
     ]
     history_rows.sort(
         key=lambda row: (
@@ -1088,14 +1232,10 @@ def _market_event_projection(
         ),
         "coverage_messages": _market_event_coverage_messages(current_issues),
         "coverage_problem_count": len(current_issues),
-        "source_checked_at": (
-            iso_utc(max(checked_times)) if checked_times else None
-        ),
+        "source_checked_at": (iso_utc(max(checked_times)) if checked_times else None),
         "list_title": "事件日历",
         "history_started_at": (
-            iso_utc(history_started_at)
-            if history_started_at is not None
-            else None
+            iso_utc(history_started_at) if history_started_at is not None else None
         ),
         "history_event_count": len(history_rows),
         "history_events": history_rows,
@@ -1119,9 +1259,7 @@ def _buyback_review_payload(review: StoredBuybackReview) -> dict[str, Any]:
         "entity_key": review.entity_key,
         "base_revision_no": review.base_revision_no,
         "decision": review.decision,
-        "decision_label": BUYBACK_REVIEW_LABELS.get(
-            review.decision, review.decision
-        ),
+        "decision_label": BUYBACK_REVIEW_LABELS.get(review.decision, review.decision),
         "corrected_event_type": review.corrected_event_type,
         "program_key": review.program_key,
         "program_status": review.program_status,
@@ -1187,7 +1325,7 @@ def _buyback_intelligence_summary(payload: dict[str, Any], headline: str) -> str
     if issuer_name:
         for prefix in (f"{issuer_name}：", f"{issuer_name}:"):
             while title.startswith(prefix):
-                title = title[len(prefix):].lstrip()
+                title = title[len(prefix) :].lstrip()
     return title or headline
 
 
@@ -1203,9 +1341,7 @@ def _buyback_system_verification(
             "SYSTEM_VERIFIED",
             "港交所官方回购日报表头、执行场所与结构化字段已通过契约校验。",
         )
-    if (
-        entity_type == "DISCLOSURE_CANDIDATE"
-    ):
+    if entity_type == "DISCLOSURE_CANDIDATE":
         current_classification = str(
             payload.get("current_title_classification") or event_type
         )
@@ -1254,18 +1390,14 @@ def _buyback_entity_payload(entity: StoredBuybackEntity) -> dict[str, Any]:
     review = entity.review
     review_status = review.decision if review is not None else "UNREVIEWED"
     if entity.entity_type == "DISCLOSURE_CANDIDATE":
-        current_classification = classify_buyback_title(
-            str(payload.get("title") or "")
-        )
+        current_classification = classify_buyback_title(str(payload.get("title") or ""))
         payload["current_title_classification"] = current_classification
         if (
             not (review is not None and review.corrected_event_type)
             and current_classification in BUYBACK_EVENT_LABELS
         ):
             payload["event_type"] = current_classification
-            payload["event_type_label"] = BUYBACK_EVENT_LABELS[
-                current_classification
-            ]
+            payload["event_type_label"] = BUYBACK_EVENT_LABELS[current_classification]
     if review is not None and review.corrected_event_type:
         payload["event_type"] = review.corrected_event_type
         payload["event_type_label"] = BUYBACK_EVENT_LABELS.get(
@@ -1320,9 +1452,9 @@ def _buyback_entity_payload(entity: StoredBuybackEntity) -> dict[str, Any]:
             "revision_id": entity.revision_id,
             "observed_at": iso_utc(entity.observed_at),
             "effective_at": iso_utc(entity.effective_at),
-            "effective_date": entity.effective_at.astimezone(
-                SHANGHAI_TZ
-            ).date().isoformat(),
+            "effective_date": entity.effective_at.astimezone(SHANGHAI_TZ)
+            .date()
+            .isoformat(),
             "document_sha256": entity.document_sha256,
             "review_status": review_status,
             "review_status_label": BUYBACK_REVIEW_LABELS[review_status],
@@ -1486,9 +1618,7 @@ def _buyback_source_payload(source: StoredBuybackSourceState) -> dict[str, Any]:
         "record_count": source.record_count,
         "detail_code": source.detail_code,
         "summary": {
-            key: value
-            for key, value in source.payload.items()
-            if key in summary_keys
+            key: value for key, value in source.payload.items() if key in summary_keys
         },
     }
 
@@ -1504,6 +1634,114 @@ def _column_payload(column: ViewColumn) -> dict[str, Any]:
         "use_grouping": column.use_grouping,
         "show_sign": column.show_sign,
         "description": column.description,
+    }
+
+
+def _altcoin_price_position_projection(
+    monitor: RegisteredMonitor,
+    store: SQLiteMonitorStore,
+    *,
+    data_run: StoredRun | None,
+) -> dict[str, Any]:
+    snapshot_key = str(
+        getattr(monitor, "price_position_snapshot_key", "price-position-v1")
+    )
+    snapshot = store.projection_snapshot(monitor.monitor_id, snapshot_key)
+    columns = tuple(getattr(monitor, "price_position_columns", ()))
+    choices = tuple(getattr(monitor, "price_position_filter_choices", ()))
+    common = {
+        "table_title": str(
+            getattr(monitor, "price_position_table_title", "日线价格位置")
+        ),
+        "method_note": str(getattr(monitor, "price_position_method_note", "")),
+        "columns": [_column_payload(column) for column in columns],
+        "filter_choices": [
+            {
+                "value": choice.value,
+                "label": choice.label,
+                "description": choice.description,
+            }
+            for choice in choices
+        ],
+    }
+    if snapshot is None:
+        return {
+            **common,
+            "status": "EMPTY",
+            "snapshot_run_id": None,
+            "observed_at": None,
+            "price_cutoff_at": None,
+            "daily_cutoff_at": None,
+            "valid_until": None,
+            "rows": [],
+            "summary": [],
+            "counts": {},
+            "state_counts": {},
+            "empty_message": (
+                "尚无已完成的日线价格位置快照；开启监控并完成一轮采集后显示。"
+            ),
+        }
+    raw_rows = snapshot.payload.get("rows")
+    rows = (
+        [dict(row) for row in raw_rows if isinstance(row, dict)]
+        if isinstance(raw_rows, list)
+        else []
+    )
+    is_current = data_run is not None and snapshot.run_id == data_run.run_id
+    summary: list[dict[str, Any]] = [
+        {
+            "key": "price_position_coverage",
+            "label": "本轮覆盖",
+            "value": str(snapshot.payload.get("coverage_label") or ""),
+            "kind": "text",
+            "description": (
+                "只统计本轮完成短周期分析的合约；日线少于90根或不连续时不进入价格位置主表。"
+            ),
+        },
+        {
+            "key": "price_position_price_cutoff",
+            "label": "当前价截至",
+            "value": snapshot.payload.get("price_cutoff_at")
+            or iso_utc(snapshot.cutoff_at),
+            "kind": "time",
+        },
+        {
+            "key": "price_position_daily_cutoff",
+            "label": "日线基准截至",
+            "value": snapshot.payload.get("daily_cutoff_at"),
+            "kind": "time",
+        },
+        {
+            "key": "price_position_valid_until",
+            "label": "本轮位置有效至",
+            "value": snapshot.payload.get("valid_until"),
+            "kind": "time",
+        },
+    ]
+    if not is_current:
+        summary.insert(
+            0,
+            {
+                "key": "price_position_snapshot_state",
+                "label": "快照状态",
+                "value": "上一轮价格位置；最近候选采集未形成新的完整日线快照。",
+                "kind": "text",
+            },
+        )
+    return {
+        **common,
+        "status": "CURRENT" if is_current else "PREVIOUS",
+        "snapshot_run_id": snapshot.run_id,
+        "observed_at": iso_utc(snapshot.observed_at),
+        "price_cutoff_at": snapshot.payload.get("price_cutoff_at")
+        or iso_utc(snapshot.cutoff_at),
+        "daily_cutoff_at": snapshot.payload.get("daily_cutoff_at"),
+        "valid_until": snapshot.payload.get("valid_until"),
+        "rows": rows,
+        "summary": summary,
+        "counts": snapshot.payload.get("counts") or {},
+        "state_counts": snapshot.payload.get("state_counts") or {},
+        "empty_message": "当前筛选没有匹配的价格状态。",
     }
 
 
@@ -1657,22 +1895,105 @@ def _forward_evaluation_payload(
                 ),
             }
         )
+    comparison_payload: dict[str, Any] | None = None
+    baseline_evaluation_source = getattr(
+        monitor,
+        "baseline_evaluation_source",
+        None,
+    )
+    if evaluation_source and baseline_evaluation_source:
+        comparison = store.forward_evaluation_comparison(
+            monitor.monitor_id,
+            primary_source=str(evaluation_source),
+            baseline_source=str(baseline_evaluation_source),
+        )
+
+        def comparison_rates(values: dict[str, Any]) -> dict[str, Any]:
+            sample_count = int(values["sample_count"])
+            enough_samples = sample_count >= definition.minimum_group_samples
+            primary_aligned = int(values["primary_aligned_count"])
+            primary_opposed = int(values["primary_opposed_count"])
+            baseline_aligned = int(values["baseline_aligned_count"])
+            baseline_opposed = int(values["baseline_opposed_count"])
+            primary_rate = (
+                round(primary_aligned / sample_count * 100.0, 1)
+                if enough_samples
+                else None
+            )
+            baseline_rate = (
+                round(baseline_aligned / sample_count * 100.0, 1)
+                if enough_samples
+                else None
+            )
+            return {
+                "sample_count": sample_count,
+                "primary_aligned_count": primary_aligned,
+                "primary_opposed_count": primary_opposed,
+                "baseline_aligned_count": baseline_aligned,
+                "baseline_opposed_count": baseline_opposed,
+                "primary_agreement_rate_percent": primary_rate,
+                "primary_opposed_rate_percent": (
+                    round(primary_opposed / sample_count * 100.0, 1)
+                    if enough_samples
+                    else None
+                ),
+                "baseline_agreement_rate_percent": baseline_rate,
+                "baseline_opposed_rate_percent": (
+                    round(baseline_opposed / sample_count * 100.0, 1)
+                    if enough_samples
+                    else None
+                ),
+                "agreement_change_percentage_points": (
+                    round(primary_rate - baseline_rate, 1)
+                    if primary_rate is not None and baseline_rate is not None
+                    else None
+                ),
+            }
+
+        comparison_payload = {
+            **comparison_rates(comparison),
+            "primary_label": "价格位置融合规则",
+            "baseline_label": "原短线规则",
+            "first_cutoff_at": (
+                iso_utc(comparison["first_cutoff_at"])
+                if comparison["first_cutoff_at"] is not None
+                else None
+            ),
+            "last_outcome_at": (
+                iso_utc(comparison["last_outcome_at"])
+                if comparison["last_outcome_at"] is not None
+                else None
+            ),
+            "groups": [
+                {
+                    "stage": item["stage"],
+                    "stage_label": item["stage_label"],
+                    "horizon_minutes": item["horizon_minutes"],
+                    **comparison_rates(item),
+                }
+                for item in comparison["groups"]
+            ],
+        }
     return {
         "title": definition.title,
         "method_note": definition.method_note,
         "minimum_group_samples": definition.minimum_group_samples,
         "overview": {
-            **{key: summary[key] for key in (
-                "total_cases",
-                "due_cases",
-                "completed_cases",
-                "unavailable_cases",
-                "pending_due_cases",
-                "pending_future_cases",
-            )},
+            **{
+                key: summary[key]
+                for key in (
+                    "total_cases",
+                    "due_cases",
+                    "completed_cases",
+                    "unavailable_cases",
+                    "pending_due_cases",
+                    "pending_future_cases",
+                )
+            },
             "coverage_percent": coverage_percent,
         },
         "groups": groups,
+        "comparison": comparison_payload,
         "recent": [
             _forward_evaluation_row(item, now=now)
             for item in store.recent_forward_evaluations(
@@ -1738,7 +2059,9 @@ def create_app(
                 limit=display_limit + 1,
             )
             entities = entity_window[:display_limit]
-            entity_payloads = tuple(_buyback_entity_payload(entity) for entity in entities)
+            entity_payloads = tuple(
+                _buyback_entity_payload(entity) for entity in entities
+            )
             source_states = store.buyback_source_states(monitor_id)
             projected = project_buyback_metrics(
                 entity_payloads,
@@ -1839,9 +2162,7 @@ def create_app(
     @app.get("/healthz", include_in_schema=False)
     def health() -> Response:
         if scheduler is None or not start_scheduler:
-            return JSONResponse(
-                {"status": "ok", "scheduler": "not_managed_by_app"}
-            )
+            return JSONResponse({"status": "ok", "scheduler": "not_managed_by_app"})
         workers = scheduler.worker_states()
         healthy = scheduler.healthy
         return JSONResponse(
@@ -1948,8 +2269,11 @@ def create_app(
         projection_kind = getattr(selected, "projection_kind", "time_series")
         is_buyback = projection_kind == "buyback"
         is_market_events = projection_kind == "market_events"
+        is_btc_intelligence = projection_kind == "btc_intelligence"
         buyback_payload: dict[str, Any] | None = None
         market_events_payload: dict[str, Any] | None = None
+        btc_intelligence_payload: dict[str, Any] | None = None
+        altcoin_price_position_payload: dict[str, Any] | None = None
         if is_buyback:
             data_run = store.latest_completed_run(selected.monitor_id)
             samples: tuple[StoredSample, ...] = ()
@@ -1969,9 +2293,7 @@ def create_app(
             promoted_columns: dict[str, Any] = {}
             intelligence_count = len(row_payloads)
             fresh_intelligence_count = sum(
-                (
-                    parsed := _buyback_effective_at(row.get("effective_at"))
-                ) is not None
+                (parsed := _buyback_effective_at(row.get("effective_at"))) is not None
                 and parsed >= now - timedelta(hours=24)
                 for row in row_payloads
             )
@@ -1980,24 +2302,19 @@ def create_app(
                 for row in row_payloads
             )
             priority_count = sum(
-                row.get("attention_level") == "PRIORITY"
-                for row in row_payloads
+                row.get("attention_level") == "PRIORITY" for row in row_payloads
             )
             high_attractiveness_count = sum(
-                row.get("attractiveness_level") == "HIGH"
-                for row in row_payloads
+                row.get("attractiveness_level") == "HIGH" for row in row_payloads
             )
             pending_count = sum(
-                row["intelligence_scope"] == "PENDING"
-                for row in all_row_payloads
+                row["intelligence_scope"] == "PENDING" for row in all_row_payloads
             )
             excluded_count = sum(
-                row["intelligence_scope"] == "EXCLUDED"
-                for row in all_row_payloads
+                row["intelligence_scope"] == "EXCLUDED" for row in all_row_payloads
             )
             source_problem_count = sum(
-                source.status not in {"SUCCESS", "EMPTY"}
-                for source in source_states
+                source.status not in {"SUCCESS", "EMPTY"} for source in source_states
             )
             source_checked_at = max(
                 (source.checked_at for source in source_states),
@@ -2061,6 +2378,20 @@ def create_app(
             collection_gaps = []
             promoted_columns = {}
             run_summary_payload = []
+        elif is_btc_intelligence:
+            data_run = store.latest_completed_run(selected.monitor_id)
+            samples = store.samples_for_run(data_run.run_id) if data_run else ()
+            btc_intelligence_payload = _btc_intelligence_projection(
+                samples,
+                store,
+                selected.monitor_id,
+            )
+            row_payloads = []
+            selected_series = None
+            history_points = []
+            collection_gaps = []
+            promoted_columns = {}
+            run_summary_payload = []
         else:
             data_run = store.latest_sample_run(selected.monitor_id)
             samples = store.samples_for_run(data_run.run_id) if data_run else ()
@@ -2069,6 +2400,11 @@ def create_app(
                     sample
                     for sample in samples
                     if sample.payload.get("market_scope") == "USDM_PERPETUAL"
+                )
+                altcoin_price_position_payload = _altcoin_price_position_projection(
+                    selected,
+                    store,
+                    data_run=data_run,
                 )
             rows = [
                 sample
@@ -2114,7 +2450,9 @@ def create_app(
             elif automatic_status == "CLOSED":
                 next_open = _payload_time(automatic_collection.get("next_open_at"))
                 refresh_after_seconds = (
-                    max(15, min(round((next_open - now).total_seconds()) + 2, 7 * 86400))
+                    max(
+                        15, min(round((next_open - now).total_seconds()) + 2, 7 * 86400)
+                    )
                     if next_open is not None
                     else 300
                 )
@@ -2149,6 +2487,8 @@ def create_app(
             "run_summary": run_summary_payload,
             "buyback": buyback_payload,
             "market_events": market_events_payload,
+            "btc_intelligence": btc_intelligence_payload,
+            "altcoin_price_position": altcoin_price_position_payload,
             "evaluation": _forward_evaluation_payload(selected, store, now=now),
             "selected_series_key": selected_series,
             "history": history_points,
@@ -2158,9 +2498,7 @@ def create_app(
             "time_windows": [
                 {
                     "hours": value,
-                    "label": (
-                        f"{value // 24}天" if value >= 24 else f"{value}小时"
-                    ),
+                    "label": (f"{value // 24}天" if value >= 24 else f"{value}小时"),
                 }
                 for value in ALLOWED_WINDOWS
             ],
@@ -2206,9 +2544,7 @@ def create_app(
             "enabled": stored.enabled,
             "updated_at": iso_utc(stored.updated_at),
             "refresh_requested": refresh_requested,
-            "automatic_collection": _automatic_collection_payload(
-                automatic_state
-            ),
+            "automatic_collection": _automatic_collection_payload(automatic_state),
         }
 
     @app.post("/api/monitors/{monitor_id}/refresh")
@@ -2235,6 +2571,41 @@ def create_app(
             "automatic_collection": _automatic_collection_payload(
                 scheduler.automatic_collection_state(monitor_id, now=utc_now())
             ),
+        }
+
+    @app.post("/api/monitors/{monitor_id}/observe")
+    def observe_monitor(monitor_id: str, request: Request) -> dict[str, Any]:
+        origin = request.headers.get("origin")
+        expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+        if origin is not None and origin.rstrip("/") != expected_origin:
+            raise HTTPException(status_code=403, detail="ORIGIN_NOT_ALLOWED")
+        try:
+            monitor = registry.get(monitor_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="MONITOR_NOT_FOUND") from None
+        if getattr(monitor, "foreground_interval_seconds", None) is None:
+            raise HTTPException(
+                status_code=409,
+                detail="MONITOR_FOREGROUND_CADENCE_UNSUPPORTED",
+            )
+        if scheduler is None or not scheduler.started:
+            raise HTTPException(status_code=503, detail="SCHEDULER_NOT_RUNNING")
+        result = scheduler.observe_monitor(
+            monitor_id,
+            lease_seconds=DEFAULT_OBSERVATION_LEASE_SECONDS,
+        )
+        cadence = result.cadence
+        return {
+            "status": "ACTIVE",
+            "refresh_requested": result.refresh_requested,
+            "lease_seconds": DEFAULT_OBSERVATION_LEASE_SECONDS,
+            "collection_cadence": {
+                "adaptive": True,
+                "background_interval_seconds": (cadence.background_interval_seconds),
+                "foreground_interval_seconds": (cadence.foreground_interval_seconds),
+                "effective_interval_seconds": cadence.effective_interval_seconds,
+                "foreground_active": cadence.foreground_active,
+            },
         }
 
     @app.put("/api/monitors/{monitor_id}/configuration")

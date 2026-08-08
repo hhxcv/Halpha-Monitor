@@ -14,6 +14,8 @@ from halpha_monitor.monitors import (
 )
 from halpha_monitor.service import MonitorRegistry, MonitorScheduler
 from halpha_monitor.store import (
+    DEFAULT_BTC_STRUCTURE_MAX_EVENTS,
+    DEFAULT_BTC_STRUCTURE_RETENTION_DAYS,
     DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES,
     DEFAULT_BUYBACK_RETENTION_DAYS,
     DEFAULT_MARKET_EVENT_RETENTION_DAYS,
@@ -57,6 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MARKET_EVENT_RETENTION_DAYS,
     )
+    parser.add_argument(
+        "--btc-structure-retention-days",
+        type=int,
+        default=DEFAULT_BTC_STRUCTURE_RETENTION_DAYS,
+    )
+    parser.add_argument(
+        "--btc-structure-max-events",
+        type=int,
+        default=DEFAULT_BTC_STRUCTURE_MAX_EVENTS,
+    )
     add_builtin_monitor_arguments(parser)
     return parser
 
@@ -73,11 +85,17 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("buyback-evidence-max-mib must be positive")
     if args.market_event_retention_days < 1:
         raise SystemExit("market-event-retention-days must be positive")
+    if args.btc_structure_retention_days < 1:
+        raise SystemExit("btc-structure-retention-days must be positive")
+    if args.btc_structure_max_events < 1:
+        raise SystemExit("btc-structure-max-events must be positive")
     store = SQLiteMonitorStore(
         args.db_path,
         buyback_retention_days=args.buyback_retention_days,
         buyback_evidence_max_bytes=args.buyback_evidence_max_mib * 1024 * 1024,
         market_event_retention_days=args.market_event_retention_days,
+        btc_structure_retention_days=args.btc_structure_retention_days,
+        btc_structure_max_events=args.btc_structure_max_events,
     )
     registry = MonitorRegistry()
     register_builtin_monitors(

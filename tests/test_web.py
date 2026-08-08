@@ -9,16 +9,24 @@ from fastapi.testclient import TestClient
 
 from halpha_monitor.contracts import (
     AutomaticCollectionState,
+    BtcMonthlyResearchHistoryObservation,
+    BtcMonthlyResearchRevision,
+    BtcStructureEventRevision,
+    BtcStructureHistoryObservation,
     BuybackEntityRevision,
     BuybackEvidenceDocument,
     BuybackSourceObservation,
     CollectionBatch,
     CollectionIssue,
     ConfigurationField,
+    EvaluationView,
     FilterChoice,
+    ForwardEvaluationCase,
+    ForwardEvaluationResult,
     MetricSample,
     MarketEventRevision,
     MonitorView,
+    ProjectionSnapshot,
     ViewColumn,
     ViewFilter,
 )
@@ -36,6 +44,7 @@ class FakeMonitor:
     display_name: str = "Fixture Monitor"
     description: str = "Fixture description"
     interval_seconds: float = 60
+    foreground_interval_seconds: float | None = None
     view: MonitorView = MonitorView(
         filters=(
             ViewFilter(
@@ -171,8 +180,16 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
         'id="monitor-control-button"'
     )
     assert 'id="monitor-refresh-button"' in page.text
-    assert '/api/monitors/${encodeURIComponent(monitorId)}/refresh' in script.text
+    assert "/api/monitors/${encodeURIComponent(monitorId)}/refresh" in script.text
+    assert (
+        "/api/monitors/${encodeURIComponent(monitor.monitor_id)}/observe" in script.text
+    )
+    assert 'document.visibilityState === "visible"' in script.text
+    assert "maintainForegroundObservation" in script.text
     assert "payload.refresh_after_seconds" in script.text
+    assert "ui.btcRegime.textContent = regime?.label" in script.text
+    assert "String(sourceState).replaceAll" not in script.text
+    assert "当前版本确认" in page.text
     assert "nextRefreshMilliseconds = manualRunStarted ? 15000 : 3000" in script.text
     assert 'id="quote-scroll"' in page.text
     assert 'id="quote-horizontal-scrollbar"' in page.text
@@ -201,11 +218,14 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert ".filter-multi-choice" in style.text
     assert "table-column-help-tooltip" in script.text
     assert ".table-column-help-tooltip" in style.text
-    assert 'ui.diagnosticsDialog.showModal()' in script.text
+    assert "ui.diagnosticsDialog.showModal()" in script.text
     assert "ui.buybackSourceRegion.hidden = !hasVisibleProblem" in script.text
     assert '"a-share-documents": "A股公告原文"' in script.text
     assert 'return "公开来源连接中断"' in script.text
-    assert 'const isMarketEvents = payload.monitor.projection_kind === "market_events"' in script.text
+    assert (
+        'const isMarketEvents = payload.monitor.projection_kind === "market_events"'
+        in script.text
+    )
     assert '.workspace[data-projection-kind="buyback"] #quote-scroll' in style.text
     assert "overflow-y: hidden" in style.text
     assert '.app-shell[data-rail-collapsed="true"]' in style.text
@@ -226,6 +246,10 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert ".monitor-link .monitor-link-status::before" not in style.text
     assert 'app-shell[data-rail-collapsed="true"] .monitor-link-status' in style.text
     assert "place-items: center" in style.text
+    assert 'id="btc-intelligence"' in page.text
+    assert "function renderBtcIntelligence" in script.text
+    assert '.workspace[data-projection-kind="btc-intelligence"]' in style.text
+
     assert ".table-pagination" in style.text
     assert ".back-to-top" in style.text
     assert "BUYBACK_TABLE_PAGE_SIZE = 50" in script.text
@@ -238,7 +262,7 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert "window.scrollTo({ top: 0" in script.text
     assert "function buybackMarketDestination" in script.text
     assert "https://cn.tradingview.com/chart/?symbol=" in script.text
-    assert 'encodeURIComponent(`HKEX:${tradingViewCode}`)' in script.text
+    assert "encodeURIComponent(`HKEX:${tradingViewCode}`)" in script.text
     assert 'row.market === "SH" ? "SSE" : row.market === "SZ" ? "SZSE"' in script.text
     assert "tradingViewCode = code.replace" in script.text
     assert "https://quote.eastmoney.com/" not in script.text
@@ -250,8 +274,15 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert 'id="event-view-tabs"' in page.text
     assert 'id="radar-view-tabs"' in page.text
     assert 'id="radar-table-tab"' in page.text
+    assert 'id="radar-position-tab"' in page.text
     assert 'id="radar-history-tab"' in page.text
     assert 'id="radar-evaluation-tab"' in page.text
+    assert 'id="evaluation-comparison"' in page.text
+    assert 'id="evaluation-comparison-body"' in page.text
+    assert "综合状态 × 检验期限" in page.text
+    assert "原阶段" not in page.text
+    assert 'id="radar-price-state-field"' in page.text
+    assert page.text.index('id="radar-view-tabs"') < page.text.index('id="filters"')
     assert 'id="event-history-region"' in page.text
     assert 'id="market-event-how-to-read"' in page.text
     assert 'id="market-event-direction-formula"' in page.text
@@ -260,8 +291,14 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert "function applyEventTabState" in script.text
     assert "function applyRadarTabState" in script.text
     assert "function radarTabFromLocation" in script.text
+    assert 'POSITION: "position"' in script.text
+    assert "function renderRadarPriceFilter" in script.text
+    assert "function renderRadarTableView" in script.text
+    assert "RADAR_POSITION_TABLE_PAGE_SIZE = 50" in script.text
     assert "function openMarketEventDetail" in script.text
-    assert '.workspace[data-projection-kind="market-events"] #quote-scroll' in style.text
+    assert (
+        '.workspace[data-projection-kind="market-events"] #quote-scroll' in style.text
+    )
     assert "buyback-eligibility-dot" in script.text
     assert "buyback-detail-button" not in script.text
     assert '["高吸引力", buybackPayload.high_attractiveness_count]' in script.text
@@ -281,7 +318,12 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
     assert "window.history.replaceState" in script.text
     assert "https://www.binance.com/zh-CN/futures/" in script.text
     assert "https://www.binance.com/zh-CN/trade/" not in script.text
-    assert '.workspace[data-projection-kind="altcoin-radar"] #quote-scroll' in style.text
+    assert (
+        '.workspace[data-projection-kind="altcoin-radar"] #quote-scroll' in style.text
+    )
+    assert '.radar-price-state[data-state="PUMPING"]' in style.text
+    assert 'column.key === "context_stage_label"' in script.text
+    assert '.radar-context-stage[data-group="HIGH_RISK"]' in style.text
     assert "#quote-scroll thead th" in style.text
     assert '.monitor-link-status[data-status="ACTIVE"]' in style.text
     assert '.monitor-link-status[data-status="IDLE"]' in style.text
@@ -298,6 +340,130 @@ def test_page_and_static_assets_are_local_and_hardened(tmp_path: Path) -> None:
         assert "style-src 'self';" in strict_policy
         assert "'unsafe-inline'" not in strict_policy
     assert page.headers["cache-control"] == "no-store"
+
+
+class FakeBtcIntelligenceMonitor:
+    monitor_id = "btc-market-intelligence"
+    display_name = "BTC 专业情报"
+    description = "分层证据测试"
+    interval_seconds = 60
+    projection_kind = "btc_intelligence"
+    view = MonitorView(
+        filters=(),
+        columns=(ViewColumn("symbol", "市场"),),
+        chart_title="BTC 专业情报",
+        table_title="BTC 专业情报",
+    )
+
+    def collect(self) -> CollectionBatch:
+        return CollectionBatch(samples=())
+
+    def network_request_count(self, *, window_seconds: float = 60) -> int:
+        return 0
+
+
+def test_btc_intelligence_projection_includes_forward_ledger_without_generic_rows(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    observed = datetime.now(UTC)
+    started = observed - timedelta(hours=3)
+    event_at = observed - timedelta(hours=2)
+    monthly_signal_at = observed - timedelta(hours=1)
+    monthly_execution_at = observed + timedelta(days=1)
+    signal = {
+        "kind": "SUPPORT",
+        "open_time_ms": int(event_at.timestamp() * 1000),
+        "zone_lower": "100",
+        "zone_upper": "102",
+        "touch_close": "101",
+        "atr_touch": "2",
+        "due_at": (event_at + timedelta(hours=24)).isoformat(),
+    }
+    run_id = store.start_run("btc-market-intelligence", started_at=observed)
+    store.finish_run(
+        run_id,
+        "btc-market-intelligence",
+        CollectionBatch(
+            samples=(
+                MetricSample(
+                    "BTCUSDT|intelligence",
+                    "BTCUSDT",
+                    observed,
+                    "40000",
+                    "USDT",
+                    {
+                        "row_type": "BTC_INTELLIGENCE",
+                        "symbol": "BTCUSDT",
+                        "observed_at": observed.isoformat(),
+                        "current_price": "40000",
+                        "monthly": {"official_target": 1},
+                        "daily": {"agreement": "0.75"},
+                        "structure": {"model_status": "NOT_DEPLOYED"},
+                        "smart_money": {"authority": "CONTEXT_ONLY", "rows": []},
+                    },
+                ),
+            ),
+            btc_structure_history=BtcStructureHistoryObservation(
+                started_at=started,
+                processed_through_at=observed,
+                algorithm_version="btc-structure-causal-v1",
+            ),
+            btc_structure_event_revisions=(
+                BtcStructureEventRevision(
+                    event_key="event-1",
+                    event_at=event_at,
+                    observed_at=observed,
+                    state="PENDING",
+                    payload={
+                        "algorithm_version": "btc-structure-causal-v1",
+                        "signal": signal,
+                        "outcome": None,
+                    },
+                ),
+            ),
+            btc_monthly_research_history=BtcMonthlyResearchHistoryObservation(
+                started_at=monthly_signal_at,
+                processed_through_at=monthly_signal_at,
+                algorithm_version="btc-faber-10m-forward-v1",
+            ),
+            btc_monthly_research_revisions=(
+                BtcMonthlyResearchRevision(
+                    signal_key="btc-faber-10m-forward-v1:2026-07",
+                    signal_at=monthly_signal_at,
+                    observed_at=observed,
+                    state="SIGNAL_FROZEN",
+                    payload={
+                        "algorithm_version": "btc-faber-10m-forward-v1",
+                        "signal": {
+                            "official_target": 1,
+                            "execution_eligible_at": monthly_execution_at.isoformat(),
+                        },
+                        "execution": None,
+                    },
+                ),
+            ),
+        ),
+        completed_at=observed,
+    )
+    registry = MonitorRegistry()
+    registry.register(FakeBtcIntelligenceMonitor())
+    app = create_app(store, registry, None, start_scheduler=False)
+
+    with TestClient(app, base_url="http://127.0.0.1:8790") as client:
+        payload = client.get("/api/view").json()
+
+    assert payload["monitor"]["projection_kind"] == "btc_intelligence"
+    assert payload["rows"] == []
+    assert payload["btc_intelligence"]["current_price"] == "40000"
+    assert payload["btc_intelligence"]["ledger"]["total_events"] == 1
+    assert payload["btc_intelligence"]["ledger"]["events"][0]["state"] == "PENDING"
+    assert payload["btc_intelligence"]["monthly_ledger"]["signal_count"] == 1
+    assert (
+        payload["btc_intelligence"]["monthly_ledger"]["records"][0]["state"]
+        == "SIGNAL_FROZEN"
+    )
 
 
 def test_page_rejects_untrusted_host_header(tmp_path: Path) -> None:
@@ -322,9 +488,7 @@ def test_view_returns_latest_rows_history_and_registration_metadata(
     assert payload["monitor"]["filters"][0]["label"] == "方向"
     assert payload["monitor"]["columns"][1]["maximum_fraction_digits"] == 8
     assert payload["monitor"]["columns"][1]["show_sign"] is True
-    assert payload["monitor"]["columns"][1]["description"] == (
-        "经过校验的核算价格。"
-    )
+    assert payload["monitor"]["columns"][1]["description"] == ("经过校验的核算价格。")
     assert payload["monitor"]["method_note"] == "方法说明"
     assert payload["monitor"]["show_description"] is True
     assert payload["time_windows"] == [
@@ -384,6 +548,18 @@ def test_altcoin_radar_projection_excludes_legacy_spot_samples(
         description: str = "Contract fixture"
         interval_seconds: float = 300
         projection_kind: str = "altcoin_radar"
+        price_position_snapshot_key: str = "price-position-v1"
+        price_position_table_title: str = "日线价格位置"
+        price_position_method_note: str = "位置方法说明"
+        price_position_filter_choices: tuple[FilterChoice, ...] = (
+            FilterChoice("*", "全部状态"),
+            FilterChoice("RISING", "拉升与暴涨"),
+        )
+        price_position_columns: tuple[ViewColumn, ...] = (
+            ViewColumn("symbol", "币种"),
+            ViewColumn("price_state_label", "价格状态"),
+            ViewColumn("return_24h_percent", "24h涨跌", "percent"),
+        )
         view: MonitorView = MonitorView(
             filters=(),
             columns=(ViewColumn("symbol", "合约"),),
@@ -422,7 +598,34 @@ def test_altcoin_radar_projection_excludes_legacy_spot_samples(
                         "market_scope": "USDM_PERPETUAL",
                     },
                 ),
-            )
+            ),
+            projection_snapshots=(
+                ProjectionSnapshot(
+                    snapshot_key="price-position-v1",
+                    observed_at=now,
+                    cutoff_at=now,
+                    payload={
+                        "price_cutoff_at": now.isoformat(),
+                        "daily_cutoff_at": (
+                            now.replace(hour=0, minute=0, second=0, microsecond=0)
+                            - timedelta(milliseconds=1)
+                        ).isoformat(),
+                        "valid_until": (now + timedelta(minutes=15)).isoformat(),
+                        "coverage_label": "1 个合约形成价格位置。",
+                        "counts": {"eligible": 1, "included": 1},
+                        "state_counts": {"SURGE": 1},
+                        "rows": [
+                            {
+                                "symbol": "NEWUSDT",
+                                "price_state": "SURGE",
+                                "price_state_label": "暴涨",
+                                "price_state_group": "RISING",
+                                "return_24h_percent": "18.5",
+                            }
+                        ],
+                    },
+                ),
+            ),
         ),
         completed_at=now,
     )
@@ -438,9 +641,139 @@ def test_altcoin_radar_projection_excludes_legacy_spot_samples(
 
     assert payload["monitor"]["projection_kind"] == "altcoin_radar"
     assert [row["symbol"] for row in payload["rows"]] == ["NEWUSDT"]
-    assert payload["selected_series_key"] == (
-        "NEWUSDT|usdm-perpetual-alert-score"
+    assert payload["selected_series_key"] == ("NEWUSDT|usdm-perpetual-alert-score")
+    price_position = payload["altcoin_price_position"]
+    assert price_position["status"] == "CURRENT"
+    assert price_position["table_title"] == "日线价格位置"
+    assert [row["symbol"] for row in price_position["rows"]] == ["NEWUSDT"]
+    assert price_position["state_counts"] == {"SURGE": 1}
+    assert [column["key"] for column in price_position["columns"]] == [
+        "symbol",
+        "price_state_label",
+        "return_24h_percent",
+    ]
+
+
+def test_forward_evaluation_payload_compares_exact_primary_and_baseline_pairs(
+    tmp_path: Path,
+) -> None:
+    @dataclass
+    class EvaluationMonitor:
+        monitor_id: str = "evaluation-monitor"
+        display_name: str = "Evaluation"
+        description: str = "Evaluation fixture"
+        interval_seconds: float = 300
+        evaluation_source: str = "PRICE_CONTEXT_V1"
+        baseline_evaluation_source: str = "SHORT_RULE_V1"
+        view: MonitorView = MonitorView(
+            filters=(),
+            columns=(ViewColumn("symbol", "币种"),),
+            table_title="候选",
+            chart_title="历史",
+            evaluation=EvaluationView(
+                title="后续行情检验",
+                method_note="同批比较。",
+                minimum_group_samples=1,
+            ),
+        )
+
+        def collect(self) -> CollectionBatch:
+            return CollectionBatch(samples=())
+
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    now = datetime.now(UTC).replace(microsecond=0)
+    due_at = now + timedelta(minutes=15)
+    cases = (
+        ForwardEvaluationCase(
+            case_key="price|AAAUSDT|BLOWOFF_RISK|15",
+            entity_key="AAAUSDT",
+            stage="BLOWOFF_RISK",
+            stage_label="冲高回落风险",
+            direction="DOWN",
+            signal_observed_at=now,
+            source_cutoff_at=now,
+            horizon_minutes=15,
+            due_at=due_at,
+            entry_price_text="10",
+            benchmark_entry_price_text="50000",
+            source="PRICE_CONTEXT_V1",
+        ),
+        ForwardEvaluationCase(
+            case_key="short|AAAUSDT|ACCELERATION|15",
+            entity_key="AAAUSDT",
+            stage="ACCELERATION",
+            stage_label="加速",
+            direction="UP",
+            signal_observed_at=now,
+            source_cutoff_at=now,
+            horizon_minutes=15,
+            due_at=due_at,
+            entry_price_text="10",
+            benchmark_entry_price_text="50000",
+            source="SHORT_RULE_V1",
+        ),
     )
+    source_run = store.start_run("evaluation-monitor", started_at=now)
+    store.finish_run(
+        source_run,
+        "evaluation-monitor",
+        CollectionBatch(
+            samples=(
+                MetricSample(
+                    series_key="AAAUSDT|score",
+                    entity_key="AAAUSDT",
+                    observed_at=now,
+                    value_text="80",
+                    unit="RADAR_SCORE",
+                    payload={"symbol": "AAAUSDT"},
+                ),
+            ),
+            evaluation_cases=cases,
+        ),
+        completed_at=now,
+    )
+    resolved_at = due_at + timedelta(minutes=1)
+    results = tuple(
+        ForwardEvaluationResult(
+            case_key=case.case_key,
+            status="COMPLETE",
+            evaluated_at=resolved_at,
+            outcome_cutoff_at=due_at,
+            exit_price_text="9.5",
+            benchmark_exit_price_text="50000",
+            forward_return_percent=-5,
+            benchmark_return_percent=0,
+            relative_return_percent=-5,
+            maximum_favorable_excursion_percent=1,
+            maximum_adverse_excursion_percent=-6,
+            verdict="ALIGNED" if case.direction == "DOWN" else "OPPOSED",
+        )
+        for case in cases
+    )
+    resolved_run = store.start_run("evaluation-monitor", started_at=resolved_at)
+    store.finish_run(
+        resolved_run,
+        "evaluation-monitor",
+        CollectionBatch(samples=(), evaluation_results=results),
+        completed_at=resolved_at,
+    )
+    registry = MonitorRegistry()
+    registry.register(EvaluationMonitor())
+    app = create_app(store, registry, None, start_scheduler=False)
+
+    with TestClient(app, base_url="http://127.0.0.1:8790") as client:
+        payload = client.get(
+            "/api/view",
+            params={"monitor_id": "evaluation-monitor"},
+        ).json()
+
+    comparison = payload["evaluation"]["comparison"]
+    assert comparison["sample_count"] == 1
+    assert comparison["primary_agreement_rate_percent"] == 100.0
+    assert comparison["baseline_agreement_rate_percent"] == 0.0
+    assert comparison["agreement_change_percentage_points"] == 100.0
+    assert comparison["groups"][0]["stage"] == "BLOWOFF_RISK"
 
 
 def test_view_promotes_uniform_opt_in_columns_and_restores_differing_values(
@@ -510,9 +843,10 @@ def test_view_promotes_uniform_opt_in_columns_and_restores_differing_values(
     add_uniform_run(differing=False)
     with TestClient(app, base_url="http://127.0.0.1:8790") as client:
         uniform_payload = client.get("/api/view").json()
-        assert [
-            column["key"] for column in uniform_payload["monitor"]["columns"]
-        ] == ["symbol", "stage"]
+        assert [column["key"] for column in uniform_payload["monitor"]["columns"]] == [
+            "symbol",
+            "stage",
+        ]
         assert uniform_payload["run_summary"] == [
             {
                 "key": "valid_until",
@@ -531,9 +865,11 @@ def test_view_promotes_uniform_opt_in_columns_and_restores_differing_values(
         add_uniform_run(differing=True)
         differing_payload = client.get("/api/view").json()
 
-    assert [
-        column["key"] for column in differing_payload["monitor"]["columns"]
-    ] == ["symbol", "stage", "valid_until"]
+    assert [column["key"] for column in differing_payload["monitor"]["columns"]] == [
+        "symbol",
+        "stage",
+        "valid_until",
+    ]
     assert differing_payload["run_summary"] == []
 
 
@@ -592,9 +928,7 @@ def test_view_wildcard_filter_returns_all_registered_values(tmp_path: Path) -> N
     app = create_app(store, registry, None, start_scheduler=False)
     with TestClient(app, base_url="http://127.0.0.1:8790") as client:
         all_rows = client.get("/api/view", params={"stage": "*"}).json()["rows"]
-        setup_rows = client.get(
-            "/api/view", params={"stage": "SETUP"}
-        ).json()["rows"]
+        setup_rows = client.get("/api/view", params={"stage": "SETUP"}).json()["rows"]
 
     assert {row["stage"] for row in all_rows} == {"SETUP", "BREAKOUT"}
     assert [row["stage"] for row in setup_rows] == ["SETUP"]
@@ -619,9 +953,7 @@ def test_view_separates_collecting_state_from_previous_result(tmp_path: Path) ->
         "label": "采集中",
     }
     assert payload["monitor"]["data_status"]["kind"] == "COLLECTING_PREVIOUS"
-    assert payload["monitor"]["data_status"]["label"] == (
-        "正在刷新 · 显示上一轮结果"
-    )
+    assert payload["monitor"]["data_status"]["label"] == ("正在刷新 · 显示上一轮结果")
     assert payload["service_status_label"] == "采集中"
 
 
@@ -653,6 +985,42 @@ def test_enabling_monitor_uses_single_scheduler_wakeup(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json()["refresh_requested"] is True
     assert calls == 0
+
+
+def test_observation_endpoint_activates_adaptive_cadence(tmp_path: Path) -> None:
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    monitor = FakeMonitor(
+        interval_seconds=600,
+        foreground_interval_seconds=60,
+    )
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    scheduler = MonitorScheduler(registry, store)
+    scheduler.start()
+    app = create_app(store, registry, scheduler, start_scheduler=False)
+    try:
+        with TestClient(app, base_url="http://127.0.0.1:8790") as client:
+            response = client.post("/api/monitors/fake-monitor/observe")
+            payload = client.get("/api/view").json()
+            rejected = client.post(
+                "/api/monitors/fake-monitor/observe",
+                headers={"Origin": "https://example.invalid"},
+            )
+    finally:
+        scheduler.stop()
+
+    assert response.status_code == 200
+    assert response.json()["collection_cadence"] == {
+        "adaptive": True,
+        "background_interval_seconds": 600.0,
+        "foreground_interval_seconds": 60.0,
+        "effective_interval_seconds": 60.0,
+        "foreground_active": True,
+    }
+    assert payload["monitor"]["collection_cadence"]["foreground_active"] is True
+    assert payload["monitor"]["collection_cadence"]["effective_interval_seconds"] == 60
+    assert rejected.status_code == 403
 
 
 def test_health_reports_managed_worker_liveness(tmp_path: Path) -> None:
@@ -1310,9 +1678,7 @@ def test_buyback_view_uses_durable_entities_after_a_valid_empty_event_scan(
         "不可购买",
     ]
     assert all(choice["description"] for choice in purchase_filter["choices"])
-    assert payload["monitor"]["selected_filters"]["connect_status"] == [
-        "BUY_ELIGIBLE"
-    ]
+    assert payload["monitor"]["selected_filters"]["connect_status"] == ["BUY_ELIGIBLE"]
     assert payload["monitor"]["method_note"] is None
     assert payload["monitor"]["table_title"] == "回购情报清单"
     assert "首次实施" in payload["monitor"]["columns"][0]["description"]
@@ -1335,9 +1701,7 @@ def test_buyback_view_uses_durable_entities_after_a_valid_empty_event_scan(
         "日期",
     ]
     assert "证据" not in [item["label"] for item in payload["monitor"]["columns"]]
-    assert "购买资格" not in [
-        item["label"] for item in payload["monitor"]["columns"]
-    ]
+    assert "购买资格" not in [item["label"] for item in payload["monitor"]["columns"]]
     assert "核验" not in [item["label"] for item in payload["monitor"]["columns"]]
     assert len(payload["rows"]) == 1
     assert payload["rows"][0]["entity_key"] == entity_key

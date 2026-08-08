@@ -9,16 +9,24 @@ from halpha_monitor.monitors.binance_altcoin_radar import (
     BinanceAltcoinRadarClient,
     BinanceAltcoinRadarMonitor,
     BinanceAltcoinRadarSettings,
+    BinanceUsdmDailyCache,
+    BASELINE_EVALUATION_SOURCE,
     CandleFeatures,
     ContractCandle,
+    DailyContractCandle,
+    DailySeriesResult,
     EVALUATION_SOURCE,
     FundingContext,
     OpenInterestPoint,
     RadarSourceError,
     RollingTicker,
     TimedValue,
+    analyze_price_position,
+    classify_contextual_stage,
+    latest_closed_daily_cutoff,
     open_interest_change_15m,
     parse_contract_klines,
+    parse_daily_contract_klines,
     parse_exchange_symbols,
     parse_tickers,
     score_candidate,
@@ -110,6 +118,33 @@ def future_candles(
     return tuple(values)
 
 
+def daily_candles_from_closes(
+    closes: tuple[float, ...],
+    *,
+    cutoff: datetime | None = None,
+) -> tuple[DailyContractCandle, ...]:
+    daily_cutoff = cutoff or latest_closed_daily_cutoff(NOW)
+    next_midnight = daily_cutoff + timedelta(milliseconds=1)
+    start = next_midnight - timedelta(days=len(closes))
+    values: list[DailyContractCandle] = []
+    previous = closes[0]
+    for index, close in enumerate(closes):
+        open_time = start + timedelta(days=index)
+        values.append(
+            DailyContractCandle(
+                open_time=open_time,
+                close_time=open_time + timedelta(days=1) - timedelta(milliseconds=1),
+                open_price=previous,
+                high_price=max(previous, close) * 1.01,
+                low_price=min(previous, close) * 0.99,
+                close_price=close,
+                quote_volume=10_000_000,
+            )
+        )
+        previous = close
+    return tuple(values)
+
+
 def test_parse_contract_klines_uses_only_closed_valid_rows() -> None:
     completed = datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
     closed_at = int(datetime(2026, 8, 6, 11, 59, 59, tzinfo=UTC).timestamp() * 1000)
@@ -151,6 +186,55 @@ def test_parse_contract_klines_uses_only_closed_valid_rows() -> None:
     assert len(parsed) == 1
     assert parsed[0].close_price == 1.5
     assert malformed == 1
+
+
+def test_parse_daily_contract_klines_keeps_only_closed_utc_days() -> None:
+    completed = datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
+    open_at = datetime(2026, 8, 5, tzinfo=UTC)
+    closed_at = open_at + timedelta(days=1) - timedelta(milliseconds=1)
+    open_ms = int(open_at.timestamp() * 1000)
+    close_ms = int(closed_at.timestamp() * 1000)
+    future_open_ms = int(datetime(2026, 8, 6, tzinfo=UTC).timestamp() * 1000)
+    rows = [
+        [
+            open_ms,
+            "100",
+            "110",
+            "90",
+            "105",
+            "10",
+            close_ms,
+            "1000000",
+        ],
+        [
+            future_open_ms,
+            "105",
+            "115",
+            "100",
+            "110",
+            "10",
+            future_open_ms + 86_399_999,
+            "1000000",
+        ],
+        [
+            open_ms + 1_000,
+            "100",
+            "110",
+            "90",
+            "105",
+            "10",
+            close_ms + 1_000,
+            "1000000",
+        ],
+        ["malformed"],
+    ]
+
+    parsed, malformed = parse_daily_contract_klines(rows, completed_at=completed)
+
+    assert len(parsed) == 1
+    assert parsed[0].close_time == closed_at
+    assert parsed[0].close_price == 105
+    assert malformed == 2
 
 
 def test_parse_tickers_ignores_a_trading_market_with_no_trades() -> None:
@@ -292,20 +376,26 @@ def test_scoring_distinguishes_setup_acceleration_and_exhaustion() -> None:
         close_price=100.0,
     )
 
-    assert score_candidate(
-        setup,
-        return_24h_percent=4,
-        relative_return_15m_percent=1,
-        funding_rate_percent=0.01,
-        oi_change_15m_percent=1,
-    )["stage"] == "SETUP"
-    assert score_candidate(
-        acceleration,
-        return_24h_percent=25,
-        relative_return_15m_percent=5,
-        funding_rate_percent=0.01,
-        oi_change_15m_percent=4,
-    )["stage"] == "ACCELERATION"
+    assert (
+        score_candidate(
+            setup,
+            return_24h_percent=4,
+            relative_return_15m_percent=1,
+            funding_rate_percent=0.01,
+            oi_change_15m_percent=1,
+        )["stage"]
+        == "SETUP"
+    )
+    assert (
+        score_candidate(
+            acceleration,
+            return_24h_percent=25,
+            relative_return_15m_percent=5,
+            funding_rate_percent=0.01,
+            oi_change_15m_percent=4,
+        )["stage"]
+        == "ACCELERATION"
+    )
     exhausted = score_candidate(
         exhaustion,
         return_24h_percent=40,
@@ -353,6 +443,154 @@ def test_open_interest_change_requires_contiguous_five_minute_points() -> None:
     assert open_interest_change_15m(with_gap) is None
 
 
+def test_price_position_classifies_fast_move_bottom_and_persistent_decline() -> None:
+    flat_then_rising = tuple([100.0] * 113 + [100, 104, 108, 113, 118, 124, 130])
+    pumping = analyze_price_position(
+        daily_candles_from_closes(flat_then_rising),
+        current_price=132.0,
+        return_24h_percent=4.0,
+    )
+    assert pumping.state == "PUMPING"
+    assert pumping.return_7d_percent >= 25
+
+    falling_then_flat = tuple(
+        [120.0 - index * 0.8 for index in range(90)]
+        + [48.0 + (index % 3) * 0.2 for index in range(30)]
+    )
+    bottom = analyze_price_position(
+        daily_candles_from_closes(falling_then_flat),
+        current_price=48.2,
+        return_24h_percent=0.1,
+    )
+    assert bottom.state == "BOTTOM_CONSOLIDATION"
+    assert bottom.position_90d_percent <= 20
+
+    persistent_fall = tuple(220.0 - index for index in range(120))
+    decline = analyze_price_position(
+        daily_candles_from_closes(persistent_fall),
+        current_price=98.0,
+        return_24h_percent=-2.0,
+    )
+    assert decline.state == "PERSISTENT_DECLINE"
+    assert decline.trend_structure == "空头排列"
+
+    crash = analyze_price_position(
+        daily_candles_from_closes(tuple([100.0] * 120)),
+        current_price=84.0,
+        return_24h_percent=-16.0,
+    )
+    assert crash.state == "CRASH"
+
+
+def test_contextual_stage_only_emits_direction_for_defined_price_combinations() -> None:
+    surge = analyze_price_position(
+        daily_candles_from_closes(tuple([100.0] * 120)),
+        current_price=125.0,
+        return_24h_percent=20.0,
+    )
+    blowoff = classify_contextual_stage("ACCELERATION", surge)
+    assert blowoff.stage == "BLOWOFF_RISK"
+    assert blowoff.direction == "DOWN"
+    assert blowoff.evaluation_horizons_minutes == (240,)
+
+    falling_then_flat = tuple(
+        [120.0 - index * 0.8 for index in range(90)]
+        + [48.0 + (index % 3) * 0.2 for index in range(30)]
+    )
+    bottom = analyze_price_position(
+        daily_candles_from_closes(falling_then_flat),
+        current_price=48.2,
+        return_24h_percent=0.1,
+    )
+    bottom_setup = classify_contextual_stage("SETUP", bottom)
+    assert bottom_setup.stage == "BOTTOM_SETUP"
+    assert bottom_setup.direction == "UP"
+    assert bottom_setup.evaluation_horizons_minutes == (240,)
+
+    decline = analyze_price_position(
+        daily_candles_from_closes(tuple(220.0 - index for index in range(120))),
+        current_price=98.0,
+        return_24h_percent=-2.0,
+    )
+    continuation = classify_contextual_stage("SETUP", decline)
+    assert continuation.stage == "DECLINE_CONTINUATION"
+    assert continuation.direction == "DOWN"
+    assert continuation.evaluation_horizons_minutes == (240,)
+
+    unconfirmed = classify_contextual_stage("SETUP", surge)
+    assert unconfirmed.stage == "SETUP_UNCONFIRMED"
+    assert unconfirmed.direction is None
+    assert unconfirmed.evaluation_horizons_minutes == ()
+
+    unavailable = classify_contextual_stage("BREAKOUT", None)
+    assert unavailable.stage == "PRICE_CONTEXT_UNAVAILABLE"
+    assert unavailable.direction is None
+
+
+def test_price_position_finds_only_a_completed_previous_pump_peak() -> None:
+    closes = (
+        [100.0] * 30
+        + [100.0 + index * 4.0 for index in range(14)]
+        + [160.0]
+        + [155.0 - index * 4.0 for index in range(14)]
+        + [99.0 + index * 0.55 for index in range(61)]
+    )
+    result = analyze_price_position(
+        daily_candles_from_closes(tuple(closes)),
+        current_price=150.0,
+        return_24h_percent=0.5,
+    )
+
+    assert result.state == "RETEST_PREVIOUS_PEAK"
+    assert result.previous_pump_peak_at is not None
+    assert result.previous_pump_peak_price is not None
+    assert result.distance_from_previous_pump_peak_percent == pytest.approx(
+        150.0 / result.previous_pump_peak_price * 100 - 100
+    )
+
+
+def test_daily_cache_fetches_once_per_closed_day_and_survives_reopen(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    cutoff = latest_closed_daily_cutoff(NOW)
+    source_candles = daily_candles_from_closes(tuple([100.0] * 120), cutoff=cutoff)
+
+    class DailyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def daily_klines(
+            self,
+            symbol: str,
+            *,
+            start_at: datetime,
+            end_at: datetime,
+            limit: int,
+        ) -> TimedValue:
+            del symbol, start_at, end_at, limit
+            self.calls += 1
+            return TimedValue(source_candles, NOW)
+
+    client = DailyClient()
+    cache_root = tmp_path / "cache"
+    first = BinanceUsdmDailyCache(cache_root, client).fetch("AAAUSDT", cutoff)  # type: ignore[arg-type]
+    second = BinanceUsdmDailyCache(cache_root, client).fetch("AAAUSDT", cutoff)  # type: ignore[arg-type]
+
+    assert first.status == "FETCHED"
+    assert second.status == "CACHE_CURRENT"
+    assert len(second.candles) == 120
+    assert client.calls == 1
+
+    unicode_symbol = BinanceUsdmDailyCache(cache_root, client).fetch(
+        "币安人生USDT",
+        cutoff,
+    )
+
+    assert unicode_symbol.status == "FETCHED"
+    assert client.calls == 2
+    assert any(path.name.startswith("unicode-") for path in cache_root.iterdir())
+
+
 def test_candidate_selection_excludes_btc_stables_and_leveraged_tokens() -> None:
     symbols = {
         "BTCUSDT": "BTC",
@@ -366,8 +604,7 @@ def test_candidate_selection_excludes_btc_stables_and_leveraged_tokens() -> None
         "BBBUSDT": "BBB",
     }
     day = {
-        symbol: ticker(symbol, change=10, quote_volume=20_000_000)
-        for symbol in symbols
+        symbol: ticker(symbol, change=10, quote_volume=20_000_000) for symbol in symbols
     }
     selected = select_candidate_seeds(
         symbols,
@@ -408,12 +645,8 @@ class FakeProvider:
     def ticker_24h(self) -> TimedValue:
         return TimedValue(
             {
-                "AAAUSDT": ticker(
-                    "AAAUSDT", change=24, quote_volume=30_000_000
-                ),
-                "BBBUSDT": ticker(
-                    "BBBUSDT", change=8, quote_volume=20_000_000
-                ),
+                "AAAUSDT": ticker("AAAUSDT", change=24, quote_volume=30_000_000),
+                "BBBUSDT": ticker("BBBUSDT", change=8, quote_volume=20_000_000),
             },
             NOW,
         )
@@ -451,6 +684,24 @@ class FakeProvider:
         )
 
 
+class FakeDailyProvider:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, datetime]] = []
+
+    def fetch(self, symbol: str, cutoff_at: datetime) -> DailySeriesResult:
+        self.calls.append((symbol, cutoff_at))
+        return DailySeriesResult(
+            symbol=symbol,
+            status="CACHE_CURRENT",
+            candles=daily_candles_from_closes(
+                tuple([100.0] * 120),
+                cutoff=cutoff_at,
+            ),
+            latest_close_at=cutoff_at,
+            acquired_at=NOW,
+        )
+
+
 def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
     provider = FakeProvider()
     monitor = BinanceAltcoinRadarMonitor(
@@ -471,15 +722,11 @@ def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
     assert by_symbol["AAAUSDT"].payload["onchain_state"] == (
         "NOT_INCLUDED_IN_MARKET_SCORE"
     )
-    assert by_symbol["AAAUSDT"].payload["data_scope_label"] == (
-        "USDⓈ-M 永续合约"
-    )
+    assert by_symbol["AAAUSDT"].payload["data_scope_label"] == ("USDⓈ-M 永续合约")
     assert by_symbol["AAAUSDT"].payload["market_scope"] == "USDM_PERPETUAL"
     assert by_symbol["AAAUSDT"].payload["screened_contract_size"] == 2
     assert by_symbol["AAAUSDT"].payload["analyzed_contract_size"] == 1
-    assert by_symbol["AAAUSDT"].series_key.endswith(
-        "|usdm-perpetual-alert-score"
-    )
+    assert by_symbol["AAAUSDT"].series_key.endswith("|usdm-perpetual-alert-score")
     cutoff_at = datetime.fromisoformat(
         by_symbol["AAAUSDT"].payload["data_cutoff_at"].replace("Z", "+00:00")
     )
@@ -487,9 +734,7 @@ def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
         by_symbol["AAAUSDT"].payload["valid_until"].replace("Z", "+00:00")
     )
     assert valid_until - cutoff_at == timedelta(minutes=15)
-    assert by_symbol["AAAUSDT"].payload["review_window_label"] == (
-        "每根 5m K 复核"
-    )
+    assert by_symbol["AAAUSDT"].payload["review_window_label"] == ("每根 5m K 复核")
     assert "evidence_strength" not in by_symbol["AAAUSDT"].payload
     assert "evidence_strength_label" not in by_symbol["AAAUSDT"].payload
     assert any(
@@ -502,13 +747,16 @@ def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
     )
     assert taker_column.show_sign is False
     assert not any(column.key == "coverage_label" for column in monitor.view.columns)
-    assert any(
-        field.key == "coverage_label" for field in monitor.view.summary_fields
-    )
-    assert [definition.key for definition in monitor.view.filters] == ["stage"]
+    assert any(field.key == "coverage_label" for field in monitor.view.summary_fields)
+    assert [definition.key for definition in monitor.view.filters] == [
+        "context_stage_group"
+    ]
     assert [column.key for column in monitor.view.columns] == [
         "symbol",
-        "stage_label",
+        "context_stage_label",
+        "price_state_label",
+        "context_stage_reason",
+        "evaluation_target_label",
         "alert_score",
         "return_15m_percent",
         "quote_volume_ratio_15m",
@@ -519,6 +767,7 @@ def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
         "oi_change_15m_percent",
         "funding_rate_percent",
         "quote_volume_24h",
+        "stage_label",
         "review_window_label",
         "valid_until",
         "data_cutoff_at",
@@ -535,17 +784,49 @@ def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
     assert evidence_column.priority == "primary"
     assert "独立来源佐证" in (evidence_column.description or "")
     assert all(
-        column.description
-        for column in monitor.view.columns
-        if column.key != "symbol"
+        column.description for column in monitor.view.columns if column.key != "symbol"
     )
     assert monitor.description.strip()
     assert monitor.view.show_description is False
     assert monitor.view.method_note is not None
+
+
+def test_monitor_builds_one_current_price_position_snapshot() -> None:
+    daily_provider = FakeDailyProvider()
+    monitor = BinanceAltcoinRadarMonitor(
+        BinanceAltcoinRadarSettings(
+            min_quote_volume_24h=Decimal("5000000"),
+            max_candidates=5,
+            workers=2,
+        ),
+        client=FakeProvider(),
+        daily_provider=daily_provider,
+    )
+
+    batch = monitor.collect()
+
+    assert [symbol for symbol, _ in daily_provider.calls] == ["AAAUSDT"]
+    assert len(batch.projection_snapshots) == 1
+    snapshot = batch.projection_snapshots[0]
+    assert snapshot.snapshot_key == monitor.price_position_snapshot_key
+    assert snapshot.payload["counts"] == {
+        "eligible": 1,
+        "included": 1,
+        "history_insufficient": 0,
+        "unavailable": 0,
+    }
+    assert snapshot.payload["rows"][0]["symbol"] == "AAAUSDT"
+    assert snapshot.payload["rows"][0]["price_state"] == "SURGE"
+    assert snapshot.payload["rows"][0]["history_days"] == 120
+    sample = batch.samples[0]
+    assert sample.payload["context_stage"] == "BLOWOFF_RISK"
+    assert sample.payload["context_direction"] == "DOWN"
+    assert sample.payload["context_evaluation_horizons_minutes"] == [240]
+    assert sample.payload["price_context_price"] == sample.payload["close_price"]
+    assert sample.payload["price_context_price_at"] == sample.payload["data_cutoff_at"]
     assert "不是期望盈利持仓期" in monitor.view.method_note
     assert not any(
-        choice.value == "DATA_GAP"
-        for choice in monitor.view.filters[0].choices
+        choice.value == "DATA_GAP" for choice in monitor.view.filters[0].choices
     )
 
 
@@ -564,6 +845,9 @@ def test_monitor_freezes_one_three_horizon_case_set_per_stage_episode(
     assert [case.horizon_minutes for case in first.evaluation_cases] == [15, 60, 240]
     assert {case.entity_key for case in first.evaluation_cases} == {"AAAUSDT"}
     assert {case.direction for case in first.evaluation_cases} == {"UP"}
+    assert {case.source for case in first.evaluation_cases} == {
+        BASELINE_EVALUATION_SOURCE
+    }
 
     run_id = store.start_run(monitor.monitor_id, started_at=NOW)
     store.finish_run(
@@ -574,6 +858,39 @@ def test_monitor_freezes_one_three_horizon_case_set_per_stage_episode(
     )
     second = monitor.collect()
     assert second.evaluation_cases == ()
+
+
+def test_monitor_freezes_price_context_and_exact_baseline_pair(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    store = SQLiteMonitorStore(tmp_path / "monitor.sqlite3")
+    store.initialize()
+    monitor = BinanceAltcoinRadarMonitor(
+        BinanceAltcoinRadarSettings(max_candidates=5, workers=2),
+        client=FakeProvider(),
+        daily_provider=FakeDailyProvider(),
+        evaluation_store=store,
+    )
+
+    batch = monitor.collect()
+
+    baseline = [
+        case
+        for case in batch.evaluation_cases
+        if case.source == BASELINE_EVALUATION_SOURCE
+    ]
+    contextual = [
+        case for case in batch.evaluation_cases if case.source == EVALUATION_SOURCE
+    ]
+    assert [case.horizon_minutes for case in baseline] == [15, 60, 240]
+    assert len(contextual) == 1
+    assert contextual[0].stage == "BLOWOFF_RISK"
+    assert contextual[0].direction == "DOWN"
+    assert contextual[0].horizon_minutes == 240
+    paired = next(case for case in baseline if case.horizon_minutes == 240)
+    assert contextual[0].source_cutoff_at == paired.source_cutoff_at
+    assert contextual[0].entry_price_text == paired.entry_price_text
+    assert contextual[0].benchmark_entry_price_text == paired.benchmark_entry_price_text
 
 
 def test_due_case_uses_closed_asset_and_btc_candles_for_forward_result() -> None:
@@ -650,7 +967,6 @@ def test_partial_throttle_does_not_clear_shared_backoff() -> None:
 
     assert any(sample.value_text for sample in batch.samples)
     assert any(
-        issue.reason_code == "RADAR_HTTP_THROTTLED_429"
-        for issue in batch.issues
+        issue.reason_code == "RADAR_HTTP_THROTTLED_429" for issue in batch.issues
     )
     assert provider.reset_calls == 0

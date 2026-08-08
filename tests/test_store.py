@@ -18,8 +18,9 @@ from halpha_monitor.contracts import (
     ForwardEvaluationResult,
     MetricSample,
     MarketEventRevision,
+    ProjectionSnapshot,
 )
-from halpha_monitor.store import SQLiteMonitorStore
+from halpha_monitor.store import SCHEMA_VERSION, SQLiteMonitorStore
 
 
 NOW = datetime(2026, 7, 22, 5, 0, tzinfo=UTC)
@@ -157,10 +158,15 @@ def test_version_two_database_adds_raw_artifact_storage_in_place(
     with closing(sqlite3.connect(path)) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         artifact_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(monitor_artifact)")
+            row[1] for row in connection.execute("PRAGMA table_info(monitor_artifact)")
         }
-    assert version == 7
+        snapshot_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(monitor_projection_snapshot)"
+            )
+        }
+    assert version == SCHEMA_VERSION
     assert {
         "request_started_at",
         "response_completed_at",
@@ -168,6 +174,14 @@ def test_version_two_database_adds_raw_artifact_storage_in_place(
         "response_sha256",
         "response_body",
     }.issubset(artifact_columns)
+    assert {
+        "monitor_id",
+        "snapshot_key",
+        "run_id",
+        "observed_at",
+        "cutoff_at",
+        "payload_json",
+    } == snapshot_columns
 
 
 def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
@@ -196,11 +210,14 @@ def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
         completed_at=NOW,
     )
 
-    assert store.pending_forward_evaluations(
-        "test-monitor",
-        due_before=NOW + timedelta(minutes=14),
-        limit=10,
-    ) == ()
+    assert (
+        store.pending_forward_evaluations(
+            "test-monitor",
+            due_before=NOW + timedelta(minutes=14),
+            limit=10,
+        )
+        == ()
+    )
     assert store.pending_forward_evaluations(
         "test-monitor",
         due_before=NOW + timedelta(minutes=15),
@@ -226,7 +243,9 @@ def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
     store.finish_run(
         resolved_run,
         "test-monitor",
-        CollectionBatch(samples=(sample("6.76", resolved_at),), evaluation_results=(result,)),
+        CollectionBatch(
+            samples=(sample("6.76", resolved_at),), evaluation_results=(result,)
+        ),
         completed_at=resolved_at,
     )
 
@@ -240,24 +259,148 @@ def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
     assert summary["due_cases"] == 1
     assert summary["completed_cases"] == 1
     assert summary["groups"][0]["aligned_count"] == 1
-    assert store.recent_forward_evaluations(
+    assert (
+        store.recent_forward_evaluations(
+            "test-monitor",
+            source=case.source,
+        )
+        == stored
+    )
+    assert (
+        store.recent_forward_evaluations(
+            "test-monitor",
+            source="BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES",
+        )
+        == ()
+    )
+    assert (
+        store.latest_forward_evaluations_by_entity(
+            "test-monitor",
+            ("AAAUSDT",),
+            source=case.source,
+        )
+        == stored
+    )
+    assert (
+        store.forward_evaluation_summary(
+            "test-monitor",
+            now=resolved_at,
+            source="BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES",
+        )["total_cases"]
+        == 0
+    )
+
+
+def test_forward_evaluation_comparison_joins_only_exact_completed_pairs(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    primary_source = "PRICE_CONTEXT_V1"
+    baseline_source = "SHORT_RULE_V1"
+    primary = ForwardEvaluationCase(
+        case_key="price-context-v1|AAAUSDT|BLOWOFF_RISK|cutoff|240",
+        entity_key="AAAUSDT",
+        stage="BLOWOFF_RISK",
+        stage_label="冲高回落风险",
+        direction="DOWN",
+        signal_observed_at=NOW,
+        source_cutoff_at=NOW,
+        horizon_minutes=240,
+        due_at=NOW + timedelta(minutes=240),
+        entry_price_text="10",
+        benchmark_entry_price_text="50000",
+        source=primary_source,
+    )
+    baseline = ForwardEvaluationCase(
+        case_key="AAAUSDT|SETUP|cutoff|240",
+        entity_key="AAAUSDT",
+        stage="ACCELERATION",
+        stage_label="加速",
+        direction="UP",
+        signal_observed_at=NOW,
+        source_cutoff_at=NOW,
+        horizon_minutes=240,
+        due_at=NOW + timedelta(minutes=240),
+        entry_price_text="10",
+        benchmark_entry_price_text="50000",
+        source=baseline_source,
+    )
+    source_run = store.start_run("test-monitor", started_at=NOW)
+    store.finish_run(
+        source_run,
         "test-monitor",
-        source=case.source,
-    ) == stored
-    assert store.recent_forward_evaluations(
+        CollectionBatch(
+            samples=(sample("6.75"),),
+            evaluation_cases=(primary, baseline),
+        ),
+        completed_at=NOW,
+    )
+    resolved_at = primary.due_at + timedelta(minutes=1)
+    resolved_run = store.start_run("test-monitor", started_at=resolved_at)
+    store.finish_run(
+        resolved_run,
         "test-monitor",
-        source="BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES",
-    ) == ()
-    assert store.latest_forward_evaluations_by_entity(
+        CollectionBatch(
+            samples=(sample("6.76", resolved_at),),
+            evaluation_results=(
+                ForwardEvaluationResult(
+                    case_key=primary.case_key,
+                    status="COMPLETE",
+                    evaluated_at=resolved_at,
+                    outcome_cutoff_at=primary.due_at,
+                    exit_price_text="9.5",
+                    benchmark_exit_price_text="50000",
+                    forward_return_percent=-5,
+                    benchmark_return_percent=0,
+                    relative_return_percent=-5,
+                    maximum_favorable_excursion_percent=1,
+                    maximum_adverse_excursion_percent=-6,
+                    verdict="ALIGNED",
+                ),
+                ForwardEvaluationResult(
+                    case_key=baseline.case_key,
+                    status="COMPLETE",
+                    evaluated_at=resolved_at,
+                    outcome_cutoff_at=baseline.due_at,
+                    exit_price_text="9.5",
+                    benchmark_exit_price_text="50000",
+                    forward_return_percent=-5,
+                    benchmark_return_percent=0,
+                    relative_return_percent=-5,
+                    maximum_favorable_excursion_percent=1,
+                    maximum_adverse_excursion_percent=-6,
+                    verdict="OPPOSED",
+                ),
+            ),
+        ),
+        completed_at=resolved_at,
+    )
+
+    comparison = store.forward_evaluation_comparison(
         "test-monitor",
-        ("AAAUSDT",),
-        source=case.source,
-    ) == stored
-    assert store.forward_evaluation_summary(
-        "test-monitor",
-        now=resolved_at,
-        source="BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES",
-    )["total_cases"] == 0
+        primary_source=primary_source,
+        baseline_source=baseline_source,
+    )
+
+    assert comparison["sample_count"] == 1
+    assert comparison["primary_aligned_count"] == 1
+    assert comparison["primary_opposed_count"] == 0
+    assert comparison["baseline_aligned_count"] == 0
+    assert comparison["baseline_opposed_count"] == 1
+    assert comparison["first_cutoff_at"] == NOW
+    assert comparison["last_outcome_at"] == primary.due_at
+    assert comparison["groups"] == [
+        {
+            "stage": "BLOWOFF_RISK",
+            "stage_label": "冲高回落风险",
+            "horizon_minutes": 240,
+            "sample_count": 1,
+            "primary_aligned_count": 1,
+            "primary_opposed_count": 0,
+            "baseline_aligned_count": 0,
+            "baseline_opposed_count": 1,
+        }
+    ]
 
 
 def test_configuration_survives_reopen(tmp_path: Path) -> None:
@@ -351,6 +494,63 @@ def test_raw_artifact_survives_reopen_with_the_same_run_transaction(
     assert stored[0].artifact_key == "BTCUSDT:30m:stats"
     assert stored[0].response_body == '{"code":"000000","data":{}}'
     assert stored[0].business_code == "000000"
+
+
+def test_projection_snapshot_is_atomically_replaced_without_history_growth(
+    tmp_path: Path,
+) -> None:
+    store = store_at(tmp_path)
+    first_run = store.start_run("test-monitor", started_at=NOW)
+    store.finish_run(
+        first_run,
+        "test-monitor",
+        CollectionBatch(
+            samples=(sample("6.75"),),
+            projection_snapshots=(
+                ProjectionSnapshot(
+                    snapshot_key="price-position-v1",
+                    observed_at=NOW,
+                    cutoff_at=NOW - timedelta(seconds=1),
+                    payload={"rows": [{"symbol": "AAAUSDT"}]},
+                ),
+            ),
+        ),
+        completed_at=NOW,
+    )
+    second_time = NOW + timedelta(minutes=5)
+    second_run = store.start_run("test-monitor", started_at=second_time)
+    store.finish_run(
+        second_run,
+        "test-monitor",
+        CollectionBatch(
+            samples=(sample("6.80", second_time),),
+            projection_snapshots=(
+                ProjectionSnapshot(
+                    snapshot_key="price-position-v1",
+                    observed_at=second_time,
+                    cutoff_at=second_time - timedelta(seconds=1),
+                    payload={"rows": [{"symbol": "BBBUSDT"}]},
+                ),
+            ),
+        ),
+        completed_at=second_time,
+    )
+
+    reopened = SQLiteMonitorStore(store.path)
+    reopened.initialize()
+    snapshot = reopened.projection_snapshot(
+        "test-monitor",
+        "price-position-v1",
+    )
+    with closing(sqlite3.connect(store.path)) as connection:
+        row_count = connection.execute(
+            "SELECT COUNT(*) FROM monitor_projection_snapshot"
+        ).fetchone()[0]
+
+    assert snapshot is not None
+    assert snapshot.run_id == second_run
+    assert snapshot.payload["rows"] == [{"symbol": "BBBUSDT"}]
+    assert row_count == 1
 
 
 def test_issue_without_any_sample_is_a_failed_run(tmp_path: Path) -> None:
@@ -545,9 +745,7 @@ def test_buyback_state_is_atomic_idempotent_and_outlives_run_retention(
 
     store.prune(1, now=NOW + timedelta(days=2))
     assert store.latest_run("a-hk-buyback") is None
-    preserved = store.buyback_entity(
-        "a-hk-buyback", "A:SH:600000:fixture-document"
-    )
+    preserved = store.buyback_entity("a-hk-buyback", "A:SH:600000:fixture-document")
     assert preserved is not None
     assert preserved.review is not None
     assert preserved.review.decision == "CONFIRMED_EVENT"
@@ -592,9 +790,7 @@ def test_buyback_review_rejects_a_stale_revision(tmp_path: Path) -> None:
         "event_type": "MODIFICATION",
         "review_status": "CANDIDATE_UNCONFIRMED",
     }
-    second_run = store.start_run(
-        "a-hk-buyback", started_at=NOW + timedelta(minutes=10)
-    )
+    second_run = store.start_run("a-hk-buyback", started_at=NOW + timedelta(minutes=10))
     store.finish_run(
         second_run,
         "a-hk-buyback",
@@ -665,12 +861,15 @@ def test_buyback_review_is_invalidated_by_a_new_entity_revision(
     assert current is not None
     assert current.revision_no == 2
     assert current.review is None
-    assert len(
-        store.buyback_reviews(
-            "a-hk-buyback",
-            "A:SH:600000:fixture-document",
+    assert (
+        len(
+            store.buyback_reviews(
+                "a-hk-buyback",
+                "A:SH:600000:fixture-document",
+            )
         )
-    ) == 1
+        == 1
+    )
 
 
 def test_buyback_evidence_quota_counts_unreferenced_files_on_disk(

@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Halpha Monitor</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260808-4">
-    <script src="/static/app.js?v=20260808-4" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260808-8">
+    <script src="/static/app.js?v=20260808-8" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -70,6 +70,13 @@
           </div>
         </section>
 
+        <nav class="monitor-view-tabs radar-view-tabs" id="radar-view-tabs" role="tablist" aria-label="异动雷达数据视图" hidden>
+          <button id="radar-table-tab" type="button" role="tab" aria-controls="table-region" aria-selected="true">异动候选</button>
+          <button id="radar-position-tab" type="button" role="tab" aria-controls="table-region" aria-selected="false">价格位置</button>
+          <button id="radar-history-tab" type="button" role="tab" aria-controls="history-region" aria-selected="false">异动强度历史</button>
+          <button id="radar-evaluation-tab" type="button" role="tab" aria-controls="evaluation-region" aria-selected="false">后续行情检验</button>
+        </nav>
+
         <section class="configuration-region" id="configuration-region" aria-labelledby="configuration-title" hidden>
           <div class="section-head">
             <div>
@@ -118,6 +125,14 @@
                 aria-labelledby="event-search-label"
               >
             </label>
+            <label
+              id="radar-price-state-field"
+              class="filter-field radar-price-state-field"
+              hidden
+            >
+              <span id="radar-price-state-label" class="filter-label">价格状态</span>
+              <select id="radar-price-state" aria-labelledby="radar-price-state-label"></select>
+            </label>
           </div>
           <label
             class="filter-field history-window-field"
@@ -139,6 +154,133 @@
         </section>
 
         <p id="monitor-method-note" class="monitor-method-note" hidden></p>
+
+        <section class="btc-intelligence" id="btc-intelligence" aria-label="BTC 专业情报" hidden>
+          <header class="btc-intelligence-hero">
+            <div>
+              <p class="btc-eyebrow">BTCUSDT · 多时间尺度公开市场情报</p>
+              <div class="btc-price-line">
+                <strong id="btc-current-price">—</strong>
+                <span id="btc-price-state">等待现货参考价</span>
+              </div>
+            </div>
+            <div class="btc-regime-block">
+              <span>统一状态</span>
+              <strong id="btc-regime">数据准备中</strong>
+              <small id="btc-regime-detail"></small>
+            </div>
+          </header>
+          <div class="btc-clock-strip" id="btc-clock-strip" aria-label="各层数据时钟"></div>
+
+          <div class="btc-decision-grid">
+            <article class="btc-panel btc-monthly-panel" aria-labelledby="btc-monthly-title">
+              <header class="btc-panel-head">
+                <div>
+                  <p class="btc-layer-index">01 · 收益核心</p>
+                  <h2 id="btc-monthly-title">BTC Spot 月度状态</h2>
+                </div>
+                <span class="btc-evidence btc-evidence-medium">中等证据</span>
+              </header>
+              <div class="btc-primary-state">
+                <span>本月正式研究目标</span>
+                <strong id="btc-monthly-target">—</strong>
+                <small id="btc-monthly-formed"></small>
+              </div>
+              <dl class="btc-metric-grid" id="btc-monthly-metrics"></dl>
+              <div class="btc-boundary-note" id="btc-monthly-note"></div>
+            </article>
+
+            <article class="btc-panel btc-daily-panel" aria-labelledby="btc-daily-title">
+              <header class="btc-panel-head">
+                <div>
+                  <p class="btc-layer-index">02 · 战术状态</p>
+                  <h2 id="btc-daily-title">日频 Donchian 趋势</h2>
+                </div>
+                <span class="btc-evidence">仅状态</span>
+              </header>
+              <div class="btc-daily-summary">
+                <div>
+                  <span>组件一致度</span>
+                  <strong id="btc-daily-agreement">—</strong>
+                </div>
+                <p id="btc-daily-state">等待闭合日线</p>
+              </div>
+              <div class="btc-component-list" id="btc-daily-components"></div>
+              <p class="btc-transition" id="btc-daily-transition"></p>
+            </article>
+          </div>
+
+          <article class="btc-panel btc-structure-panel" aria-labelledby="btc-structure-title">
+            <header class="btc-panel-head btc-panel-head-wide">
+              <div>
+                <p class="btc-layer-index">03 · 快速结构</p>
+                <h2 id="btc-structure-title">4 小时因果支撑与阻力</h2>
+              </div>
+              <div class="btc-structure-environment">
+                <span id="btc-structure-environment">等待闭合 4h K 线</span>
+                <small id="btc-structure-cutoff"></small>
+              </div>
+            </header>
+            <div class="btc-table-wrap" tabindex="0" aria-label="当前 4 小时因果区间，可横向滚动">
+              <table class="btc-table">
+                <thead>
+                  <tr><th>角色</th><th>区间</th><th>距现价</th><th>强度</th><th>锚点</th><th>年龄</th><th>首次形成</th><th>当前版本确认</th></tr>
+                </thead>
+                <tbody id="btc-zone-body"></tbody>
+              </table>
+            </div>
+            <p class="btc-empty" id="btc-zone-empty" hidden>当前没有满足确认门槛的邻近因果区间。</p>
+          </article>
+
+          <article class="btc-panel btc-smart-panel" aria-labelledby="btc-smart-title">
+            <header class="btc-panel-head btc-panel-head-wide">
+              <div>
+                <p class="btc-layer-index">04 · 衍生品背景</p>
+                <h2 id="btc-smart-title">BTC 聪明钱特征</h2>
+              </div>
+              <span class="btc-evidence btc-evidence-insufficient">证据不足 · 仅背景</span>
+            </header>
+            <div class="btc-table-wrap" tabindex="0" aria-label="BTC 聪明钱特征，可横向滚动">
+              <table class="btc-table">
+                <thead>
+                  <tr><th>窗口</th><th>净流方向</th><th>流量失衡</th><th>净流 / OI</th><th>巨鲸分歧</th><th>资金费率</th><th>来源时间</th></tr>
+                </thead>
+                <tbody id="btc-smart-body"></tbody>
+              </table>
+            </div>
+            <p class="btc-empty" id="btc-smart-empty" hidden>本轮未取得可校验的聪明钱特征；其他结构层不受影响。</p>
+          </article>
+
+          <article class="btc-panel btc-research-panel" aria-labelledby="btc-research-title">
+            <header class="btc-panel-head btc-panel-head-wide">
+              <div>
+                <p class="btc-layer-index">持续前向研究</p>
+                <h2 id="btc-research-title">4h 触碰事件账本</h2>
+              </div>
+              <span class="btc-model-state">概率模型尚未部署</span>
+            </header>
+            <div class="btc-research-layout">
+              <dl class="btc-ledger-metrics" id="btc-ledger-metrics"></dl>
+              <div class="btc-research-copy">
+                <p id="btc-ledger-start">部署后才开始冻结事件，不回填历史胜率。</p>
+                <p>反应、突破与六根内未决全部保留在分母；累计样本通过晋级门之前，不展示概率、edge 或研究优先级。</p>
+              </div>
+            </div>
+            <div class="btc-table-wrap btc-event-table-wrap" tabindex="0" aria-label="最近 4 小时触碰事件，可横向滚动">
+              <table class="btc-table">
+                <thead>
+                  <tr><th>事件时间</th><th>角色</th><th>冻结区间</th><th>触碰收盘</th><th>到期</th><th>结果</th></tr>
+                </thead>
+                <tbody id="btc-event-body"></tbody>
+              </table>
+            </div>
+            <p class="btc-empty" id="btc-event-empty" hidden>前向账本已就绪，尚无部署后触碰事件。</p>
+          </article>
+
+          <footer class="btc-interpretation" id="btc-interpretation">
+            状态与研究目标不是买卖、仓位、杠杆、止损、止盈或跟单指令。
+          </footer>
+        </section>
 
         <section class="buyback-overview-region" id="buyback-overview-region" aria-label="回购情报概览" hidden>
           <dl class="buyback-overview" id="buyback-overview"></dl>
@@ -165,12 +307,6 @@
           <button id="event-history-tab" type="button" role="tab" aria-selected="false">
             历史事件 <span id="event-history-count">0</span>
           </button>
-        </nav>
-
-        <nav class="monitor-view-tabs radar-view-tabs" id="radar-view-tabs" role="tablist" aria-label="异动雷达数据视图" hidden>
-          <button id="radar-table-tab" type="button" role="tab" aria-controls="table-region" aria-selected="true">异动候选</button>
-          <button id="radar-history-tab" type="button" role="tab" aria-controls="history-region" aria-selected="false">异动强度历史</button>
-          <button id="radar-evaluation-tab" type="button" role="tab" aria-controls="evaluation-region" aria-selected="false">后续行情检验</button>
         </nav>
 
         <section class="event-attention-region" id="event-attention-region" aria-labelledby="event-attention-title" hidden>
@@ -291,13 +427,35 @@
             </div>
           </div>
           <dl class="evaluation-overview" id="evaluation-overview"></dl>
+          <div class="evaluation-block" id="evaluation-comparison" hidden>
+            <div class="section-head evaluation-comparison-head">
+              <div>
+                <h3>融合规则与原规则同批比较</h3>
+                <p id="evaluation-comparison-period"></p>
+              </div>
+            </div>
+            <dl class="evaluation-overview" id="evaluation-comparison-overview"></dl>
+            <div class="table-scroll evaluation-scroll" tabindex="0" aria-label="融合规则与原规则同批检验比较">
+              <table>
+                <thead>
+                  <tr>
+                    <th>综合状态</th><th>期限</th><th>可比样本</th>
+                    <th>融合一致率</th><th>原规则一致率</th><th>变化</th>
+                    <th>融合相反率</th><th>原规则相反率</th>
+                  </tr>
+                </thead>
+                <tbody id="evaluation-comparison-body"></tbody>
+              </table>
+            </div>
+            <p class="empty-state" id="evaluation-comparison-empty">尚无完成的同批样本。</p>
+          </div>
           <div class="evaluation-block">
-            <h3>阶段 × 检验期限</h3>
+            <h3>综合状态 × 检验期限</h3>
             <div class="table-scroll evaluation-scroll" tabindex="0" aria-label="阶段与期限检验汇总">
               <table>
                 <thead>
                   <tr>
-                    <th>阶段</th><th>期限</th><th>完成样本</th><th>方向一致率</th>
+                    <th>综合状态</th><th>期限</th><th>完成样本</th><th>方向一致率</th>
                     <th>平均相对 BTC</th><th>平均最大顺向</th><th>平均最大逆向</th>
                   </tr>
                 </thead>
@@ -312,7 +470,7 @@
               <table>
                 <thead>
                   <tr>
-                    <th>币种</th><th>原阶段</th><th>信号截止</th><th>期限</th>
+                    <th>币种</th><th>综合状态</th><th>信号截止</th><th>期限</th>
                     <th>币种涨跌</th><th>相对 BTC</th><th>最大顺向</th><th>最大逆向</th>
                     <th>结果</th><th>状态 / 结果截止</th>
                   </tr>

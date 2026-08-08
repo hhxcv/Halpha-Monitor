@@ -1856,6 +1856,73 @@ def _forward_evaluation_payload(
     definition = monitor.view.evaluation
     if definition is None:
         return None
+
+    def maturity(values: dict[str, Any]) -> dict[str, Any]:
+        sample_count = int(values.get("sample_count", 0))
+        distinct_cutoff_count = int(values.get("distinct_cutoff_count", 0))
+        distinct_entity_count = int(values.get("distinct_entity_count", 0))
+        first_cutoff_at = values.get("first_cutoff_at")
+        last_outcome_at = values.get("last_outcome_at")
+        observation_days = (
+            max(
+                0.0,
+                (last_outcome_at - first_cutoff_at).total_seconds() / 86_400.0,
+            )
+            if first_cutoff_at is not None and last_outcome_at is not None
+            else 0.0
+        )
+        checks = (
+            (
+                "sample_count",
+                sample_count,
+                definition.minimum_group_samples,
+                "完成样本",
+            ),
+            (
+                "distinct_cutoff_count",
+                distinct_cutoff_count,
+                definition.minimum_distinct_cutoffs,
+                "独立信号截止",
+            ),
+            (
+                "distinct_entity_count",
+                distinct_entity_count,
+                definition.minimum_distinct_entities,
+                "覆盖币种",
+            ),
+            (
+                "observation_days",
+                observation_days,
+                definition.minimum_observation_days,
+                "观测跨度",
+            ),
+        )
+        blockers = [
+            {
+                "key": key,
+                "label": (
+                    f"{label} {current:.1f}/{required:.1f}"
+                    if key == "observation_days"
+                    else f"{label} {int(current)}/{int(required)}"
+                ),
+            }
+            for key, current, required, label in checks
+            if current < required
+        ]
+        return {
+            "ready": not blockers,
+            "status_label": "达到展示门槛" if not blockers else "样本继续积累",
+            "sample_count": sample_count,
+            "distinct_cutoff_count": distinct_cutoff_count,
+            "distinct_entity_count": distinct_entity_count,
+            "observation_days": round(observation_days, 2),
+            "minimum_sample_count": definition.minimum_group_samples,
+            "minimum_distinct_cutoffs": definition.minimum_distinct_cutoffs,
+            "minimum_distinct_entities": definition.minimum_distinct_entities,
+            "minimum_observation_days": definition.minimum_observation_days,
+            "blockers": blockers,
+        }
+
     evaluation_source = getattr(monitor, "evaluation_source", None)
     summary = store.forward_evaluation_summary(
         monitor.monitor_id,
@@ -1870,27 +1937,36 @@ def _forward_evaluation_payload(
     groups = []
     for group in summary["groups"]:
         sample_count = int(group["sample_count"])
+        group_maturity = maturity(group)
         groups.append(
             {
-                **group,
+                **{
+                    key: value
+                    for key, value in group.items()
+                    if key not in {"first_cutoff_at", "last_outcome_at"}
+                },
+                "maturity": group_maturity,
                 "agreement_rate_percent": (
                     round(int(group["aligned_count"]) / sample_count * 100.0, 1)
-                    if sample_count >= definition.minimum_group_samples
+                    if group_maturity["ready"] and sample_count > 0
                     else None
                 ),
                 "average_relative_return_percent": (
                     round(float(group["average_relative_return_percent"]), 4)
-                    if group["average_relative_return_percent"] is not None
+                    if group_maturity["ready"]
+                    and group["average_relative_return_percent"] is not None
                     else None
                 ),
                 "average_favorable_excursion_percent": (
                     round(float(group["average_favorable_excursion_percent"]), 4)
-                    if group["average_favorable_excursion_percent"] is not None
+                    if group_maturity["ready"]
+                    and group["average_favorable_excursion_percent"] is not None
                     else None
                 ),
                 "average_adverse_excursion_percent": (
                     round(float(group["average_adverse_excursion_percent"]), 4)
-                    if group["average_adverse_excursion_percent"] is not None
+                    if group_maturity["ready"]
+                    and group["average_adverse_excursion_percent"] is not None
                     else None
                 ),
             }
@@ -1908,52 +1984,79 @@ def _forward_evaluation_payload(
             baseline_source=str(baseline_evaluation_source),
         )
 
-        def comparison_rates(values: dict[str, Any]) -> dict[str, Any]:
+        relation_labels = {
+            "DIRECTION_FLIP": "方向翻转（增量检验）",
+            "SAME_DIRECTION": "方向同向（筛选检验）",
+        }
+
+        def comparison_rates(
+            values: dict[str, Any],
+            *,
+            direction_relation: str,
+        ) -> dict[str, Any]:
             sample_count = int(values["sample_count"])
-            enough_samples = sample_count >= definition.minimum_group_samples
+            relation_maturity = maturity(values)
             primary_aligned = int(values["primary_aligned_count"])
             primary_opposed = int(values["primary_opposed_count"])
             baseline_aligned = int(values["baseline_aligned_count"])
             baseline_opposed = int(values["baseline_opposed_count"])
             primary_rate = (
                 round(primary_aligned / sample_count * 100.0, 1)
-                if enough_samples
+                if relation_maturity["ready"] and sample_count > 0
                 else None
             )
             baseline_rate = (
                 round(baseline_aligned / sample_count * 100.0, 1)
-                if enough_samples
+                if relation_maturity["ready"] and sample_count > 0
                 else None
             )
+            incremental_comparison = direction_relation == "DIRECTION_FLIP"
             return {
+                "direction_relation": direction_relation,
+                "relation_label": relation_labels[direction_relation],
+                "incremental_comparison": incremental_comparison,
+                "paired_case_count": int(values["paired_case_count"]),
                 "sample_count": sample_count,
+                "pending_pair_count": int(values["pending_pair_count"]),
+                "unavailable_pair_count": int(values["unavailable_pair_count"]),
                 "primary_aligned_count": primary_aligned,
                 "primary_opposed_count": primary_opposed,
                 "baseline_aligned_count": baseline_aligned,
                 "baseline_opposed_count": baseline_opposed,
+                "maturity": relation_maturity,
                 "primary_agreement_rate_percent": primary_rate,
                 "primary_opposed_rate_percent": (
                     round(primary_opposed / sample_count * 100.0, 1)
-                    if enough_samples
+                    if relation_maturity["ready"] and sample_count > 0
                     else None
                 ),
                 "baseline_agreement_rate_percent": baseline_rate,
                 "baseline_opposed_rate_percent": (
                     round(baseline_opposed / sample_count * 100.0, 1)
-                    if enough_samples
+                    if relation_maturity["ready"] and sample_count > 0
                     else None
                 ),
                 "agreement_change_percentage_points": (
                     round(primary_rate - baseline_rate, 1)
-                    if primary_rate is not None and baseline_rate is not None
+                    if incremental_comparison
+                    and primary_rate is not None
+                    and baseline_rate is not None
                     else None
                 ),
             }
 
         comparison_payload = {
-            **comparison_rates(comparison),
             "primary_label": "价格位置融合规则",
             "baseline_label": "原短线规则",
+            **{
+                key: int(comparison[key])
+                for key in (
+                    "paired_case_count",
+                    "sample_count",
+                    "pending_pair_count",
+                    "unavailable_pair_count",
+                )
+            },
             "first_cutoff_at": (
                 iso_utc(comparison["first_cutoff_at"])
                 if comparison["first_cutoff_at"] is not None
@@ -1964,12 +2067,22 @@ def _forward_evaluation_payload(
                 if comparison["last_outcome_at"] is not None
                 else None
             ),
+            "relations": [
+                comparison_rates(
+                    item,
+                    direction_relation=str(item["direction_relation"]),
+                )
+                for item in comparison["relations"]
+            ],
             "groups": [
                 {
                     "stage": item["stage"],
                     "stage_label": item["stage_label"],
                     "horizon_minutes": item["horizon_minutes"],
-                    **comparison_rates(item),
+                    **comparison_rates(
+                        item,
+                        direction_relation=str(item["direction_relation"]),
+                    ),
                 }
                 for item in comparison["groups"]
             ],
@@ -1978,6 +2091,15 @@ def _forward_evaluation_payload(
         "title": definition.title,
         "method_note": definition.method_note,
         "minimum_group_samples": definition.minimum_group_samples,
+        "maturity": maturity(
+            {
+                "sample_count": summary["completed_cases"],
+                "distinct_cutoff_count": summary["distinct_cutoff_count"],
+                "distinct_entity_count": summary["distinct_entity_count"],
+                "first_cutoff_at": summary["first_cutoff_at"],
+                "last_outcome_at": summary["last_outcome_at"],
+            }
+        ),
         "overview": {
             **{
                 key: summary[key]

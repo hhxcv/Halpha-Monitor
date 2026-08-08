@@ -3530,9 +3530,15 @@ function evaluationPercent(value) {
   return `${numeric >= 0 ? "+" : ""}${numeric.toFixed(4)}%`;
 }
 
-function evaluationComparisonRate(value, sampleCount, minimumSamples) {
+function evaluationMaturityText(maturity) {
+  if (!maturity) return "样本继续积累";
+  const coverage = `${maturity.sample_count}/${maturity.minimum_sample_count}例 · ${maturity.distinct_cutoff_count}/${maturity.minimum_distinct_cutoffs}截止点 · ${maturity.distinct_entity_count}/${maturity.minimum_distinct_entities}币种 · ${Number(maturity.observation_days).toFixed(1)}/${Number(maturity.minimum_observation_days).toFixed(0)}天`;
+  return maturity.ready ? `已达门槛 · ${coverage}` : coverage;
+}
+
+function evaluationComparisonRate(value, maturity) {
   if (value === null || value === undefined) {
-    return `样本积累中（${sampleCount}/${minimumSamples}）`;
+    return maturity?.ready ? "无结果" : "暂不显示";
   }
   return `${Number(value).toFixed(1)}%`;
 }
@@ -3558,6 +3564,7 @@ function renderEvaluation(evaluation) {
   ui.evaluationMethodNote.textContent = evaluation.method_note;
 
   const overview = evaluation.overview;
+  const maturity = evaluation.maturity;
   const overviewItems = [
     ["已固定期限样本", overview.total_cases],
     ["已到期", overview.due_cases],
@@ -3565,6 +3572,10 @@ function renderEvaluation(evaluation) {
     ["到期覆盖", overview.coverage_percent === null ? "等待首批到期" : `${Number(overview.coverage_percent).toFixed(1)}%`],
     ["等待到期", overview.pending_future_cases],
     ["待补采 / 无法检验", `${overview.pending_due_cases} / ${overview.unavailable_cases}`],
+    ["独立信号截止", maturity.distinct_cutoff_count],
+    ["覆盖币种", maturity.distinct_entity_count],
+    ["观测跨度", `${Number(maturity.observation_days).toFixed(1)} 天`],
+    ["率值状态", maturity.status_label],
   ];
   ui.evaluationOverview.replaceChildren();
   overviewItems.forEach(([label, value]) => {
@@ -3579,28 +3590,15 @@ function renderEvaluation(evaluation) {
   ui.evaluationComparisonOverview.replaceChildren();
   ui.evaluationComparisonBody.replaceChildren();
   if (comparison) {
-    const minimumSamples = Number(evaluation.minimum_group_samples);
-    const sampleCount = Number(comparison.sample_count);
+    const flipRelation = comparison.relations.find((item) => item.direction_relation === "DIRECTION_FLIP");
+    const sameRelation = comparison.relations.find((item) => item.direction_relation === "SAME_DIRECTION");
     const comparisonItems = [
-      ["同批完成", sampleCount],
-      [
-        "融合 / 原规则一致",
-        comparison.primary_agreement_rate_percent === null
-          ? `样本积累中（${sampleCount}/${minimumSamples}）`
-          : `${Number(comparison.primary_agreement_rate_percent).toFixed(1)}% / ${Number(comparison.baseline_agreement_rate_percent).toFixed(1)}%`,
-      ],
-      [
-        "融合 / 原规则相反",
-        comparison.primary_opposed_rate_percent === null
-          ? `样本积累中（${sampleCount}/${minimumSamples}）`
-          : `${Number(comparison.primary_opposed_rate_percent).toFixed(1)}% / ${Number(comparison.baseline_opposed_rate_percent).toFixed(1)}%`,
-      ],
-      [
-        "一致率变化",
-        comparison.agreement_change_percentage_points === null
-          ? "等待足够样本"
-          : `${Number(comparison.agreement_change_percentage_points) >= 0 ? "+" : ""}${Number(comparison.agreement_change_percentage_points).toFixed(1)} 个百分点`,
-      ],
+      ["同批已建", comparison.paired_case_count],
+      ["同批完成", comparison.sample_count],
+      ["方向同向（已建 / 完成）", `${sameRelation?.paired_case_count || 0} / ${sameRelation?.sample_count || 0}`],
+      ["方向翻转（已建 / 完成）", `${flipRelation?.paired_case_count || 0} / ${flipRelation?.sample_count || 0}`],
+      ["等待完成", comparison.pending_pair_count],
+      ["无法比较", comparison.unavailable_pair_count],
     ];
     comparisonItems.forEach(([label, value]) => {
       const group = document.createElement("div");
@@ -3609,56 +3607,35 @@ function renderEvaluation(evaluation) {
       ui.evaluationComparisonOverview.append(group);
     });
     ui.evaluationComparisonPeriod.textContent = comparison.first_cutoff_at
-      ? `同批比较从 ${formatTime(comparison.first_cutoff_at)} 开始，结果截至 ${formatTime(comparison.last_outcome_at)}。`
-      : "新规则启用后，将只比较同一币种、同一信号截止和同一期限的实际结果。";
+      ? `增量只看“方向翻转”样本；同方向样本仅检查筛选表现。完成结果从 ${formatTime(comparison.first_cutoff_at)} 覆盖至 ${formatTime(comparison.last_outcome_at)}。`
+      : "增量只看价格位置使原规则方向发生翻转的同批样本；同方向样本不重复计算为规则增益。";
     comparison.groups.forEach((group) => {
       const row = document.createElement("tr");
       row.className = "evaluation-row";
+      row.dataset.relation = group.direction_relation;
+      appendEvaluationCell(row, group.relation_label);
       appendEvaluationCell(row, group.stage_label);
       appendEvaluationCell(row, evaluationHorizonLabel(group.horizon_minutes));
-      appendEvaluationCell(row, String(group.sample_count), { numeric: true });
+      appendEvaluationCell(row, `${group.paired_case_count} / ${group.sample_count}`, { numeric: true });
+      appendEvaluationCell(row, evaluationMaturityText(group.maturity));
       appendEvaluationCell(
         row,
-        evaluationComparisonRate(
-          group.primary_agreement_rate_percent,
-          group.sample_count,
-          minimumSamples,
-        ),
+        evaluationComparisonRate(group.primary_agreement_rate_percent, group.maturity),
         { numeric: group.primary_agreement_rate_percent !== null },
       );
       appendEvaluationCell(
         row,
-        evaluationComparisonRate(
-          group.baseline_agreement_rate_percent,
-          group.sample_count,
-          minimumSamples,
-        ),
+        evaluationComparisonRate(group.baseline_agreement_rate_percent, group.maturity),
         { numeric: group.baseline_agreement_rate_percent !== null },
       );
       appendEvaluationCell(
         row,
-        group.agreement_change_percentage_points === null
-          ? "—"
+        !group.incremental_comparison
+          ? "不衡量增量"
+          : group.agreement_change_percentage_points === null
+            ? "等待样本成熟"
           : `${Number(group.agreement_change_percentage_points) >= 0 ? "+" : ""}${Number(group.agreement_change_percentage_points).toFixed(1)} 个百分点`,
         { numeric: group.agreement_change_percentage_points !== null },
-      );
-      appendEvaluationCell(
-        row,
-        evaluationComparisonRate(
-          group.primary_opposed_rate_percent,
-          group.sample_count,
-          minimumSamples,
-        ),
-        { numeric: group.primary_opposed_rate_percent !== null },
-      );
-      appendEvaluationCell(
-        row,
-        evaluationComparisonRate(
-          group.baseline_opposed_rate_percent,
-          group.sample_count,
-          minimumSamples,
-        ),
-        { numeric: group.baseline_opposed_rate_percent !== null },
       );
       ui.evaluationComparisonBody.append(row);
     });
@@ -3672,11 +3649,10 @@ function renderEvaluation(evaluation) {
     appendEvaluationCell(row, group.stage_label);
     appendEvaluationCell(row, evaluationHorizonLabel(group.horizon_minutes));
     appendEvaluationCell(row, String(group.sample_count), { numeric: true });
+    appendEvaluationCell(row, evaluationMaturityText(group.maturity));
     appendEvaluationCell(
       row,
-      group.agreement_rate_percent === null
-        ? `样本积累中（${group.sample_count}/${evaluation.minimum_group_samples}）`
-        : `${Number(group.agreement_rate_percent).toFixed(1)}%`,
+      evaluationComparisonRate(group.agreement_rate_percent, group.maturity),
       { numeric: group.agreement_rate_percent !== null },
     );
     appendEvaluationCell(row, evaluationPercent(group.average_relative_return_percent), { numeric: true });

@@ -258,6 +258,10 @@ def test_forward_evaluation_case_is_frozen_then_resolved_atomically(
     assert stored[0].relative_return_percent == 4.5
     assert summary["due_cases"] == 1
     assert summary["completed_cases"] == 1
+    assert summary["distinct_cutoff_count"] == 1
+    assert summary["distinct_entity_count"] == 1
+    assert summary["first_cutoff_at"] == NOW
+    assert summary["last_outcome_at"] == case.due_at
     assert summary["groups"][0]["aligned_count"] == 1
     assert (
         store.recent_forward_evaluations(
@@ -382,25 +386,36 @@ def test_forward_evaluation_comparison_joins_only_exact_completed_pairs(
         baseline_source=baseline_source,
     )
 
+    assert comparison["paired_case_count"] == 1
     assert comparison["sample_count"] == 1
+    assert comparison["pending_pair_count"] == 0
+    assert comparison["unavailable_pair_count"] == 0
     assert comparison["primary_aligned_count"] == 1
     assert comparison["primary_opposed_count"] == 0
     assert comparison["baseline_aligned_count"] == 0
     assert comparison["baseline_opposed_count"] == 1
     assert comparison["first_cutoff_at"] == NOW
     assert comparison["last_outcome_at"] == primary.due_at
-    assert comparison["groups"] == [
-        {
-            "stage": "BLOWOFF_RISK",
-            "stage_label": "冲高回落风险",
-            "horizon_minutes": 240,
-            "sample_count": 1,
-            "primary_aligned_count": 1,
-            "primary_opposed_count": 0,
-            "baseline_aligned_count": 0,
-            "baseline_opposed_count": 1,
-        }
-    ]
+    flip_relation = comparison["relations"][0]
+    same_relation = comparison["relations"][1]
+    assert flip_relation["direction_relation"] == "DIRECTION_FLIP"
+    assert flip_relation["paired_case_count"] == 1
+    assert flip_relation["sample_count"] == 1
+    assert flip_relation["distinct_cutoff_count"] == 1
+    assert flip_relation["distinct_entity_count"] == 1
+    assert same_relation["direction_relation"] == "SAME_DIRECTION"
+    assert same_relation["paired_case_count"] == 0
+    assert same_relation["sample_count"] == 0
+    assert len(comparison["groups"]) == 1
+    group = comparison["groups"][0]
+    assert group["stage"] == "BLOWOFF_RISK"
+    assert group["stage_label"] == "冲高回落风险"
+    assert group["horizon_minutes"] == 240
+    assert group["direction_relation"] == "DIRECTION_FLIP"
+    assert group["paired_case_count"] == 1
+    assert group["sample_count"] == 1
+    assert group["primary_aligned_count"] == 1
+    assert group["baseline_opposed_count"] == 1
 
 
 def test_configuration_survives_reopen(tmp_path: Path) -> None:

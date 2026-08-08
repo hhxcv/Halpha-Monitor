@@ -445,13 +445,18 @@ def test_open_interest_change_requires_contiguous_five_minute_points() -> None:
 
 def test_price_position_classifies_fast_move_bottom_and_persistent_decline() -> None:
     flat_then_rising = tuple([100.0] * 113 + [100, 104, 108, 113, 118, 124, 130])
+    pumping_candles = daily_candles_from_closes(flat_then_rising)
     pumping = analyze_price_position(
-        daily_candles_from_closes(flat_then_rising),
+        pumping_candles,
         current_price=132.0,
         return_24h_percent=4.0,
     )
     assert pumping.state == "PUMPING"
     assert pumping.return_7d_percent >= 25
+    assert pumping.current_pump_multiple == pytest.approx(1.32)
+    assert pumping.pump_baseline_price == pytest.approx(100.0)
+    assert pumping.pump_start_at == pumping_candles[-6].open_time
+    assert pumping.pump_start_trigger == "DAILY_WINDOW_7D_25"
 
     falling_then_flat = tuple(
         [120.0 - index * 0.8 for index in range(90)]
@@ -464,6 +469,9 @@ def test_price_position_classifies_fast_move_bottom_and_persistent_decline() -> 
     )
     assert bottom.state == "BOTTOM_CONSOLIDATION"
     assert bottom.position_90d_percent <= 20
+    assert bottom.current_pump_multiple is None
+    assert bottom.pump_baseline_price is None
+    assert bottom.pump_start_at is None
 
     persistent_fall = tuple(220.0 - index for index in range(120))
     decline = analyze_price_position(
@@ -480,6 +488,44 @@ def test_price_position_classifies_fast_move_bottom_and_persistent_decline() -> 
         return_24h_percent=-16.0,
     )
     assert crash.state == "CRASH"
+
+
+def test_current_pump_uses_pre_start_closes_and_resets_after_closed_drawdown() -> None:
+    closes = tuple(
+        [100.0] * 90
+        + [120.0, 150.0, 120.0]
+        + [120.0] * 7
+        + [126.0, 132.0, 140.0, 148.0, 156.0, 164.0]
+    )
+    candles = daily_candles_from_closes(closes)
+
+    result = analyze_price_position(
+        candles,
+        current_price=168.0,
+        return_24h_percent=2.0,
+    )
+
+    assert result.state == "PUMPING"
+    assert result.pump_start_at == candles[-6].open_time
+    assert result.pump_baseline_price == pytest.approx(120.0)
+    assert result.current_pump_multiple == pytest.approx(1.4)
+    assert result.pump_start_trigger == "DAILY_WINDOW_7D_25"
+
+
+def test_current_utc_day_can_be_the_pump_start_without_entering_baseline() -> None:
+    candles = daily_candles_from_closes(tuple([100.0] * 120))
+
+    result = analyze_price_position(
+        candles,
+        current_price=120.0,
+        return_24h_percent=20.0,
+    )
+
+    assert result.state == "SURGE"
+    assert result.pump_start_at == candles[-1].open_time + timedelta(days=1)
+    assert result.pump_baseline_price == pytest.approx(100.0)
+    assert result.current_pump_multiple == pytest.approx(1.2)
+    assert result.pump_start_trigger == "DAILY_WINDOW_1D_15"
 
 
 def test_contextual_stage_only_emits_direction_for_defined_price_combinations() -> None:
@@ -755,6 +801,9 @@ def test_monitor_omits_incomplete_contract_and_preserves_valid_rows() -> None:
         "symbol",
         "context_stage_label",
         "price_state_label",
+        "current_pump_multiple",
+        "pump_start_date",
+        "pump_baseline_price",
         "context_stage_reason",
         "evaluation_target_label",
         "alert_score",
@@ -818,6 +867,19 @@ def test_monitor_builds_one_current_price_position_snapshot() -> None:
     assert snapshot.payload["rows"][0]["symbol"] == "AAAUSDT"
     assert snapshot.payload["rows"][0]["price_state"] == "SURGE"
     assert snapshot.payload["rows"][0]["history_days"] == 120
+    assert snapshot.payload["rows"][0]["current_pump_multiple"] == "1.050000"
+    assert snapshot.payload["rows"][0]["pump_baseline_price"] == "100.000000000000"
+    assert snapshot.payload["rows"][0]["pump_start_date"] == "2026-08-06"
+    assert snapshot.payload["rows"][0]["pump_start_trigger"] == "ROLLING_24H_15"
+    assert [column.key for column in monitor.price_position_columns[:7]] == [
+        "symbol",
+        "price_state_label",
+        "state_reason",
+        "current_price",
+        "current_pump_multiple",
+        "pump_start_date",
+        "pump_baseline_price",
+    ]
     sample = batch.samples[0]
     assert sample.payload["context_stage"] == "BLOWOFF_RISK"
     assert sample.payload["context_direction"] == "DOWN"

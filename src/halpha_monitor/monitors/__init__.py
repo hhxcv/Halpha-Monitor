@@ -13,9 +13,9 @@ from halpha_monitor.monitors.binance_c2c import (
     BinanceC2CMonitor,
     BinanceC2CSettings,
 )
-from halpha_monitor.monitors.binance_smart_money import (
-    BinanceSmartMoneyMonitor,
-    BinanceSmartMoneySettings,
+from halpha_monitor.monitors.binance_btc_intelligence import (
+    BinanceBtcIntelligenceMonitor,
+    BinanceBtcIntelligenceSettings,
 )
 from halpha_monitor.monitors.binance_altcoin_radar import (
     BinanceAltcoinRadarMonitor,
@@ -53,14 +53,27 @@ def _positive_decimal(value: str) -> Decimal:
     return parsed
 
 
+def _btc_smart_money_symbol(value: str) -> str:
+    if value.strip().upper() != "BTCUSDT":
+        raise argparse.ArgumentTypeError(
+            "the integrated BTC intelligence monitor only supports BTCUSDT"
+        )
+    return "BTCUSDT"
+
+
 def add_builtin_monitor_arguments(parser: argparse.ArgumentParser) -> None:
     """Declare built-in monitor settings without coupling the service entry point."""
 
-    parser.add_argument("--interval-seconds", type=float, default=60)
-    parser.add_argument("--smart-money-interval-seconds", type=float, default=60)
-    parser.add_argument("--smart-money-jitter-seconds", type=float, default=5)
-    parser.add_argument("--smart-money-symbols", default="BTCUSDT")
-    parser.add_argument("--altcoin-radar-interval-seconds", type=float, default=300)
+    parser.add_argument("--interval-seconds", type=float, default=300)
+    parser.add_argument("--smart-money-interval-seconds", type=float, default=600)
+    parser.add_argument("--smart-money-jitter-seconds", type=float, default=30)
+    parser.add_argument(
+        "--smart-money-symbols",
+        type=_btc_smart_money_symbol,
+        default="BTCUSDT",
+        help="compatibility option; the integrated monitor requires BTCUSDT",
+    )
+    parser.add_argument("--altcoin-radar-interval-seconds", type=float, default=3600)
     parser.add_argument("--altcoin-radar-jitter-seconds", type=float, default=30)
     parser.add_argument(
         "--altcoin-radar-min-quote-volume",
@@ -118,19 +131,21 @@ def register_builtin_monitors(
         )
     )
     registry.register(
-        BinanceSmartMoneyMonitor(
-            BinanceSmartMoneySettings(
+        BinanceBtcIntelligenceMonitor(
+            BinanceBtcIntelligenceSettings(
+                cache_root=store.path.parent / "cache" / "btc-intelligence",
                 interval_seconds=args.smart_money_interval_seconds,
                 jitter_seconds=args.smart_money_jitter_seconds,
-                symbols=_csv_tokens(args.smart_money_symbols),
                 timeout_seconds=args.timeout_seconds,
                 proxy_url=args.proxy_url,
-            )
+            ),
+            store=store,
         )
     )
     registry.register(
         BinanceAltcoinRadarMonitor(
             BinanceAltcoinRadarSettings(
+                cache_root=store.path.parent / "cache" / "altcoin-radar",
                 interval_seconds=args.altcoin_radar_interval_seconds,
                 jitter_seconds=args.altcoin_radar_jitter_seconds,
                 min_quote_volume_24h=args.altcoin_radar_min_quote_volume,
@@ -146,9 +161,7 @@ def register_builtin_monitors(
     registry.register(
         BinanceBtcRelationshipMonitor(
             BinanceBtcRelationshipSettings(
-                cache_root=store.path.parent
-                / "cache"
-                / "btc-relationship",
+                cache_root=store.path.parent / "cache" / "btc-relationship",
                 interval_seconds=args.btc_relationship_interval_seconds,
                 jitter_seconds=args.btc_relationship_jitter_seconds,
                 timeout_seconds=args.timeout_seconds,
@@ -200,8 +213,8 @@ __all__ = [
     "BinanceC2CSettings",
     "BinanceBtcRelationshipMonitor",
     "BinanceBtcRelationshipSettings",
-    "BinanceSmartMoneyMonitor",
-    "BinanceSmartMoneySettings",
+    "BinanceBtcIntelligenceMonitor",
+    "BinanceBtcIntelligenceSettings",
     "MarketEventMonitor",
     "MarketEventSettings",
     "add_builtin_monitor_arguments",

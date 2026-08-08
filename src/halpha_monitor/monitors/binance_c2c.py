@@ -81,7 +81,7 @@ def decimal_value(value: Any, *, field: str, positive: bool = False) -> Decimal:
 
 @dataclass(frozen=True)
 class BinanceC2CSettings:
-    interval_seconds: float = 60
+    interval_seconds: float = 300
     fiat: str = "CNY"
     assets: tuple[str, ...] = ("USDT", "USDC", "BTC", "ETH", "BNB", "SOL")
     target_fiat: Decimal = Decimal("2000")

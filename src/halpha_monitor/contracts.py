@@ -17,6 +17,8 @@ EvaluationVerdict = Literal["ALIGNED", "INCONCLUSIVE", "OPPOSED", "UNAVAILABLE"]
 BuybackEntityType = Literal["DISCLOSURE_CANDIDATE", "HKEX_EXECUTION"]
 BuybackSourceStatus = Literal["SUCCESS", "EMPTY", "PARTIAL", "STALE", "ERROR"]
 AutomaticCollectionStatus = Literal["OPEN", "CLOSED", "UNAVAILABLE"]
+BtcStructureEventState = Literal["PENDING", "REACTION", "BREAK", "UNRESOLVED"]
+BtcMonthlyResearchState = Literal["SIGNAL_FROZEN", "EXECUTION_CAPTURED"]
 
 
 class CollectionCancelled(RuntimeError):
@@ -191,6 +193,46 @@ class MarketEventRevision:
 
 
 @dataclass(frozen=True)
+class BtcStructureHistoryObservation:
+    """Forward-only ledger clock for causal BTC 4h structure events."""
+
+    started_at: datetime
+    processed_through_at: datetime
+    algorithm_version: str
+
+
+@dataclass(frozen=True)
+class BtcStructureEventRevision:
+    """Immutable signal or outcome revision for one BTC 4h touch event."""
+
+    event_key: str
+    event_at: datetime
+    observed_at: datetime
+    state: BtcStructureEventState
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BtcMonthlyResearchHistoryObservation:
+    """Forward-only clock for monthly Faber signals and execution proxies."""
+
+    started_at: datetime
+    processed_through_at: datetime
+    algorithm_version: str
+
+
+@dataclass(frozen=True)
+class BtcMonthlyResearchRevision:
+    """Immutable signal or execution revision for one completed UTC month."""
+
+    signal_key: str
+    signal_at: datetime
+    observed_at: datetime
+    state: BtcMonthlyResearchState
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ForwardEvaluationCase:
     """A signal-time observation frozen before its future outcome is known."""
 
@@ -228,6 +270,20 @@ class ForwardEvaluationResult:
 
 
 @dataclass(frozen=True)
+class ProjectionSnapshot:
+    """Bounded current-only projection committed atomically with one run.
+
+    This is for a large decision view whose latest rows must survive a process
+    restart without appending a duplicate copy on every collection cycle.
+    """
+
+    snapshot_key: str
+    observed_at: datetime
+    cutoff_at: datetime
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class CollectionBatch:
     samples: tuple[MetricSample, ...]
     issues: tuple[CollectionIssue, ...] = ()
@@ -238,6 +294,11 @@ class CollectionBatch:
     buyback_revisions: tuple[BuybackEntityRevision, ...] = ()
     buyback_source_observations: tuple[BuybackSourceObservation, ...] = ()
     market_event_revisions: tuple[MarketEventRevision, ...] = ()
+    btc_structure_history: BtcStructureHistoryObservation | None = None
+    btc_structure_event_revisions: tuple[BtcStructureEventRevision, ...] = ()
+    btc_monthly_research_history: BtcMonthlyResearchHistoryObservation | None = None
+    btc_monthly_research_revisions: tuple[BtcMonthlyResearchRevision, ...] = ()
+    projection_snapshots: tuple[ProjectionSnapshot, ...] = ()
 
 
 class RegisteredMonitor(Protocol):

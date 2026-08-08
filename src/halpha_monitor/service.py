@@ -23,6 +23,7 @@ from halpha_monitor.store import SQLiteMonitorStore, StoredControl, utc_now
 
 
 MONITOR_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+DEFAULT_OBSERVATION_LEASE_SECONDS = 45.0
 
 
 def _safe_runtime_log(message: str) -> None:
@@ -43,6 +44,21 @@ class WorkerState:
     last_error: str | None
 
 
+@dataclass(frozen=True)
+class CollectionCadence:
+    monitor_id: str
+    background_interval_seconds: float
+    foreground_interval_seconds: float | None
+    effective_interval_seconds: float
+    foreground_active: bool
+
+
+@dataclass(frozen=True)
+class ObservationResult:
+    cadence: CollectionCadence
+    refresh_requested: bool
+
+
 class MonitorRegistry:
     """Explicit registration avoids dynamic plugin discovery and hidden side effects."""
 
@@ -58,6 +74,18 @@ class MonitorRegistry:
             raise ValueError("MONITOR_INTERVAL_INVALID")
         if monitor.interval_seconds < 15:
             raise ValueError("MONITOR_INTERVAL_TOO_SHORT")
+        foreground_interval = getattr(
+            monitor,
+            "foreground_interval_seconds",
+            None,
+        )
+        if foreground_interval is not None:
+            if not math.isfinite(float(foreground_interval)):
+                raise ValueError("MONITOR_FOREGROUND_INTERVAL_INVALID")
+            if float(foreground_interval) < 15:
+                raise ValueError("MONITOR_FOREGROUND_INTERVAL_TOO_SHORT")
+            if float(foreground_interval) > float(monitor.interval_seconds):
+                raise ValueError("MONITOR_FOREGROUND_INTERVAL_EXCEEDS_BACKGROUND")
         self._monitors[monitor.monitor_id] = monitor
 
     def get(self, monitor_id: str) -> RegisteredMonitor:
@@ -106,9 +134,11 @@ class MonitorScheduler:
         self._maintenance_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._worker_state_lock = threading.Lock()
+        self._observation_lock = threading.Lock()
         self._worker_last_seen_at: dict[str, datetime] = {}
         self._worker_last_error: dict[str, str] = {}
         self._collecting: set[str] = set()
+        self._observation_expires_at: dict[str, float] = {}
         self._next_maintenance_at = 0.0
         self._started_at = 0.0
         self._started = False
@@ -140,6 +170,8 @@ class MonitorScheduler:
                     self._worker_last_seen_at.clear()
                     self._worker_last_error.clear()
                     self._collecting.clear()
+                with self._observation_lock:
+                    self._observation_expires_at.clear()
                 self._started = True
                 for monitor in monitors:
                     if isinstance(monitor, CooperativeMonitor):
@@ -171,6 +203,8 @@ class MonitorScheduler:
                 self._wake_events.clear()
                 self._manual_run_events.clear()
                 self._started = False
+            with self._observation_lock:
+                self._observation_expires_at.clear()
             raise
 
     def stop(self) -> None:
@@ -192,6 +226,8 @@ class MonitorScheduler:
             self._wake_events.clear()
             self._manual_run_events.clear()
             self._started = False
+        with self._observation_lock:
+            self._observation_expires_at.clear()
 
     def request_run(self, monitor_id: str) -> bool:
         self.registry.get(monitor_id)
@@ -207,6 +243,83 @@ class MonitorScheduler:
             manual_event.set()
             wake_event.set()
         return True
+
+    def collection_cadence(self, monitor_id: str) -> CollectionCadence:
+        monitor = self.registry.get(monitor_id)
+        background_interval = float(monitor.interval_seconds)
+        raw_foreground_interval = getattr(
+            monitor,
+            "foreground_interval_seconds",
+            None,
+        )
+        foreground_interval = (
+            float(raw_foreground_interval)
+            if raw_foreground_interval is not None
+            else None
+        )
+        foreground_active = False
+        if foreground_interval is not None:
+            now = time.monotonic()
+            with self._observation_lock:
+                expires_at = self._observation_expires_at.get(monitor_id, 0.0)
+                foreground_active = expires_at > now
+                if expires_at and not foreground_active:
+                    self._observation_expires_at.pop(monitor_id, None)
+        return CollectionCadence(
+            monitor_id=monitor_id,
+            background_interval_seconds=background_interval,
+            foreground_interval_seconds=foreground_interval,
+            effective_interval_seconds=(
+                foreground_interval
+                if foreground_active and foreground_interval is not None
+                else background_interval
+            ),
+            foreground_active=foreground_active,
+        )
+
+    def observe_monitor(
+        self,
+        monitor_id: str,
+        *,
+        lease_seconds: float = DEFAULT_OBSERVATION_LEASE_SECONDS,
+    ) -> ObservationResult:
+        monitor = self.registry.get(monitor_id)
+        foreground_interval = getattr(
+            monitor,
+            "foreground_interval_seconds",
+            None,
+        )
+        if foreground_interval is None:
+            raise ValueError("MONITOR_FOREGROUND_CADENCE_UNSUPPORTED")
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("MONITOR_OBSERVATION_LEASE_INVALID")
+
+        with self._observation_lock:
+            self._observation_expires_at[monitor_id] = (
+                time.monotonic() + lease_seconds
+            )
+
+        refresh_requested = False
+        if self.started and self.store.is_enabled(monitor_id):
+            latest = self.store.latest_run(monitor_id)
+            due = latest is None
+            if latest is not None and latest.status != "RUNNING":
+                due = latest.completed_at is None or (
+                    utc_now() - latest.completed_at
+                ).total_seconds() >= float(foreground_interval)
+            schedule = self.automatic_collection_state(
+                monitor_id,
+                now=utc_now(),
+            )
+            if due and (schedule is None or schedule.allowed):
+                # The existing event-based request path coalesces heartbeats
+                # from one or many visible tabs into at most one pending run.
+                refresh_requested = self.request_run(monitor_id)
+
+        return ObservationResult(
+            cadence=self.collection_cadence(monitor_id),
+            refresh_requested=refresh_requested,
+        )
 
     @property
     def started(self) -> bool:

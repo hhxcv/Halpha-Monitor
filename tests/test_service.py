@@ -26,6 +26,7 @@ class FakeMonitor:
     display_name: str = "Fake"
     description: str = "Fake monitor"
     interval_seconds: float = 15
+    foreground_interval_seconds: float | None = None
     default_enabled: bool = True
     view: MonitorView = MonitorView(filters=(), columns=(), chart_title="History")
     calls: int = 0
@@ -60,6 +61,22 @@ def test_registry_rejects_duplicate_ids() -> None:
 
     with pytest.raises(ValueError, match="MONITOR_ID_DUPLICATE"):
         registry.register(FakeMonitor("fake-monitor"))
+
+
+def test_registry_rejects_foreground_interval_longer_than_background() -> None:
+    registry = MonitorRegistry()
+
+    with pytest.raises(
+        ValueError,
+        match="MONITOR_FOREGROUND_INTERVAL_EXCEEDS_BACKGROUND",
+    ):
+        registry.register(
+            FakeMonitor(
+                "adaptive-monitor",
+                interval_seconds=60,
+                foreground_interval_seconds=300,
+            )
+        )
 
 
 def test_one_monitor_failure_does_not_block_another(tmp_path: Path) -> None:
@@ -106,6 +123,54 @@ def test_request_run_wakes_only_requested_monitor(tmp_path: Path) -> None:
 
     assert requested.calls == 2
     assert untouched.calls == 1
+
+
+def test_visible_observation_requests_due_run_and_expires_to_background(
+    tmp_path: Path,
+) -> None:
+    monitor = FakeMonitor(
+        "adaptive-monitor",
+        interval_seconds=3600,
+        foreground_interval_seconds=15,
+    )
+    registry = MonitorRegistry()
+    registry.register(monitor)
+    store = make_store(tmp_path)
+    scheduler = MonitorScheduler(registry, store)
+    scheduler.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and monitor.calls < 1:
+        time.sleep(0.02)
+
+    stale_completed_at = datetime.now(UTC) - timedelta(seconds=20)
+    stale_run = store.start_run(
+        monitor.monitor_id,
+        started_at=stale_completed_at - timedelta(seconds=1),
+    )
+    store.finish_run(
+        stale_run,
+        monitor.monitor_id,
+        CollectionBatch(samples=()),
+        completed_at=stale_completed_at,
+    )
+    observed = scheduler.observe_monitor(
+        monitor.monitor_id,
+        lease_seconds=0.1,
+    )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and monitor.calls < 2:
+        time.sleep(0.02)
+
+    assert observed.refresh_requested is True
+    assert observed.cadence.foreground_active is True
+    assert observed.cadence.effective_interval_seconds == 15
+    assert monitor.calls == 2
+    time.sleep(0.12)
+    expired = scheduler.collection_cadence(monitor.monitor_id)
+    scheduler.stop()
+
+    assert expired.foreground_active is False
+    assert expired.effective_interval_seconds == 3600
 
 
 def test_scheduled_monitor_is_static_when_closed_but_manual_run_bypasses_gate(

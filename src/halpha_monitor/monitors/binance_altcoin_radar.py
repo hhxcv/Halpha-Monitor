@@ -7,11 +7,16 @@ not claim a calibrated probability, causal prediction, or trading instruction.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import gzip
+import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import random
 import threading
 from typing import Any, Protocol, Sequence
@@ -29,6 +34,7 @@ from halpha_monitor.contracts import (
     ForwardEvaluationResult,
     MetricSample,
     MonitorView,
+    ProjectionSnapshot,
     ViewColumn,
     ViewFilter,
     ViewSummaryField,
@@ -41,8 +47,15 @@ BINANCE_USDM_BASE = "https://fapi.binance.com"
 USER_AGENT = "Halpha-Monitor/0.1 public-market-read-only"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 KLINE_INTERVAL_MINUTES = 5
+DAILY_INTERVAL_SECONDS = 86_400
+DAILY_HISTORY_DAYS = 220
+DAILY_MINIMUM_DAYS = 90
+DAILY_CACHE_OVERLAP_DAYS = 3
+PRICE_POSITION_SNAPSHOT_KEY = "price-position-v1"
 MARKET_SCOPE = "USDM_PERPETUAL"
-EVALUATION_SOURCE = "BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES"
+BASELINE_EVALUATION_SOURCE = "BINANCE_USDM_PUBLIC_CLOSED_5M_KLINES"
+EVALUATION_SOURCE = "BINANCE_USDM_PRICE_CONTEXT_V1_CLOSED_5M_KLINES"
+PRICE_CONTEXT_MODEL_VERSION = "price-context-v1"
 EVALUATION_HORIZONS_MINUTES = (15, 60, 240)
 EVALUATION_REPEAT_AFTER = timedelta(hours=4)
 EVALUATION_GRACE = timedelta(hours=1)
@@ -131,6 +144,85 @@ STAGE_REVIEW_LABELS = {
     "EXHAUSTION": "当前即复核",
     "COOLDOWN": "每根 5m K 复核",
     "NEUTRAL": "下次采集重算",
+}
+
+PRICE_POSITION_LABELS = {
+    "CRASH": "暴跌",
+    "SURGE": "暴涨",
+    "PUMPING": "拉升中",
+    "RETEST_PREVIOUS_PEAK": "前轮高点附近",
+    "HIGH_CONSOLIDATION": "高位整理",
+    "BOTTOM_CONSOLIDATION": "底部横盘",
+    "REBOUND": "底部反弹",
+    "PERSISTENT_DECLINE": "持续下跌",
+    "HIGH_ZONE": "高位",
+    "BOTTOM_ZONE": "底部",
+    "MID_RANGE": "区间中部",
+}
+PRICE_POSITION_GROUPS = {
+    "CRASH": "FALLING",
+    "SURGE": "RISING",
+    "PUMPING": "RISING",
+    "RETEST_PREVIOUS_PEAK": "HIGH",
+    "HIGH_CONSOLIDATION": "HIGH",
+    "BOTTOM_CONSOLIDATION": "BOTTOM",
+    "REBOUND": "BOTTOM",
+    "PERSISTENT_DECLINE": "FALLING",
+    "HIGH_ZONE": "HIGH",
+    "BOTTOM_ZONE": "BOTTOM",
+    "MID_RANGE": "NEUTRAL",
+}
+PRICE_POSITION_TONES = {
+    "CRASH": "DANGER",
+    "SURGE": "WARNING",
+    "PUMPING": "WARNING",
+    "RETEST_PREVIOUS_PEAK": "INFO",
+    "HIGH_CONSOLIDATION": "INFO",
+    "BOTTOM_CONSOLIDATION": "HEALTHY",
+    "REBOUND": "HEALTHY",
+    "PERSISTENT_DECLINE": "MUTED",
+    "HIGH_ZONE": "INFO",
+    "BOTTOM_ZONE": "HEALTHY",
+    "MID_RANGE": "NEUTRAL",
+}
+PRICE_POSITION_RANKS = {
+    "CRASH": 1,
+    "SURGE": 2,
+    "PUMPING": 3,
+    "RETEST_PREVIOUS_PEAK": 4,
+    "PERSISTENT_DECLINE": 5,
+    "REBOUND": 6,
+    "HIGH_CONSOLIDATION": 7,
+    "BOTTOM_CONSOLIDATION": 8,
+    "HIGH_ZONE": 9,
+    "BOTTOM_ZONE": 10,
+    "MID_RANGE": 11,
+}
+
+CONTEXT_STAGE_GROUP_LABELS = {
+    "EARLY_RISE": "低位与突破",
+    "HIGH_RISK": "高位回落风险",
+    "DECLINING": "下跌延续",
+    "WATCHING": "等待位置确认",
+    "NEUTRAL": "尚未形成",
+}
+
+CONTEXT_STAGE_RANKS = {
+    "BLOWOFF_RISK": 1,
+    "HIGH_REVERSAL_RISK": 2,
+    "HIGH_REJECTION_RISK": 3,
+    "DECLINE_CONTINUATION": 4,
+    "LOW_REVERSAL_ACCELERATION": 5,
+    "LOW_BREAKOUT": 6,
+    "PEAK_BREAKOUT_TEST": 7,
+    "BOTTOM_SETUP": 8,
+    "SETUP_UNCONFIRMED": 9,
+    "BREAKOUT_UNCONFIRMED": 9,
+    "ACCELERATION_UNCONFIRMED": 9,
+    "EXHAUSTION_UNCONFIRMED": 9,
+    "COOLDOWN_UNCONFIRMED": 9,
+    "PRICE_CONTEXT_UNAVAILABLE": 10,
+    "NO_SIGNAL": 11,
 }
 
 
@@ -230,6 +322,31 @@ class ContractCandle:
 
 
 @dataclass(frozen=True)
+class DailyContractCandle:
+    open_time: datetime
+    close_time: datetime
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    quote_volume: float
+
+
+@dataclass(frozen=True)
+class DailySeriesResult:
+    symbol: str
+    status: str
+    candles: tuple[DailyContractCandle, ...]
+    latest_close_at: datetime | None
+    acquired_at: datetime | None
+    reason_code: str | None = None
+
+    @property
+    def current(self) -> bool:
+        return self.status in {"FETCHED", "CACHE_CURRENT"}
+
+
+@dataclass(frozen=True)
 class FundingContext:
     symbol: str
     funding_rate_percent: float
@@ -263,6 +380,66 @@ class CandleFeatures:
     peak_drawdown_15m_percent: float
     latest_candle_return_percent: float
     close_price: float
+
+
+@dataclass(frozen=True)
+class PricePositionFeatures:
+    daily_cutoff_at: datetime
+    history_days: int
+    range_days: int
+    current_price: float
+    return_24h_percent: float
+    return_3d_percent: float
+    return_7d_percent: float
+    return_14d_percent: float
+    return_30d_percent: float
+    return_90d_percent: float
+    position_90d_percent: float
+    distance_from_range_high_percent: float
+    distance_from_range_low_percent: float
+    distance_from_previous_pump_peak_percent: float | None
+    previous_pump_peak_at: datetime | None
+    previous_pump_peak_price: float | None
+    ma20_gap_percent: float
+    ma60_gap_percent: float
+    trend_structure: str
+    range_30d_percent: float
+    volatility_compression_ratio: float | None
+    state: str
+    state_label: str
+    state_group: str
+    state_reason: str
+    row_tone: str
+    state_rank: int
+
+
+@dataclass(frozen=True)
+class ContextualStage:
+    """Price-aware interpretation of one already-observed short-term stage."""
+
+    stage: str
+    label: str
+    group: str
+    direction: str | None
+    evaluation_horizons_minutes: tuple[int, ...]
+    reason: str
+    row_tone: str
+    rank: int
+
+    @property
+    def evaluation_target_label(self) -> str:
+        if self.direction is None or not self.evaluation_horizons_minutes:
+            return "不输出方向"
+        horizon_labels = {
+            15: "15分钟",
+            60: "1小时",
+            240: "4小时",
+        }
+        direction_label = "向上" if self.direction == "UP" else "向下"
+        horizons = "/".join(
+            horizon_labels[value] for value in self.evaluation_horizons_minutes
+        )
+        return f"{direction_label} · {horizons}"
 
 
 @dataclass(frozen=True)
@@ -300,6 +477,15 @@ class AltcoinRadarProvider(Protocol):
 
     def klines(self, symbol: str, *, limit: int) -> TimedValue: ...
 
+    def daily_klines(
+        self,
+        symbol: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int,
+    ) -> TimedValue: ...
+
     def klines_between(
         self,
         symbol: str,
@@ -312,6 +498,10 @@ class AltcoinRadarProvider(Protocol):
     def futures_premium_index(self) -> TimedValue: ...
 
     def open_interest_history(self, symbol: str, *, limit: int) -> TimedValue: ...
+
+
+class DailySeriesProvider(Protocol):
+    def fetch(self, symbol: str, cutoff: datetime) -> DailySeriesResult: ...
 
 
 def parse_exchange_symbols(payload: Any) -> tuple[dict[str, str], int]:
@@ -467,6 +657,65 @@ def parse_contract_klines(
     return candles, malformed
 
 
+def parse_daily_contract_klines(
+    payload: Any,
+    *,
+    completed_at: datetime,
+) -> tuple[tuple[DailyContractCandle, ...], int]:
+    """Normalize only fully closed UTC daily USDⓈ-M candles."""
+
+    if not isinstance(payload, list):
+        raise RadarSourceError("RADAR_DAILY_KLINES_SCHEMA_INVALID")
+    parsed: dict[int, DailyContractCandle] = {}
+    malformed = 0
+    completed_ms = int(completed_at.timestamp() * 1000)
+    for row in payload:
+        if not isinstance(row, list) or len(row) < 8:
+            malformed += 1
+            continue
+        try:
+            open_time = _timestamp_ms(row[0], field="dailyKline.openTime")
+            close_time = _timestamp_ms(row[6], field="dailyKline.closeTime")
+            if int(row[6]) > completed_ms:
+                continue
+            open_price = float(_decimal(row[1], field="dailyKline.open", positive=True))
+            high_price = float(_decimal(row[2], field="dailyKline.high", positive=True))
+            low_price = float(_decimal(row[3], field="dailyKline.low", positive=True))
+            close_price = float(
+                _decimal(row[4], field="dailyKline.close", positive=True)
+            )
+            quote_volume = float(_decimal(row[7], field="dailyKline.quoteVolume"))
+            duration = (close_time - open_time).total_seconds()
+            if (
+                duration <= 0
+                or abs(duration - (DAILY_INTERVAL_SECONDS - 0.001)) > 5
+                or open_time.hour != 0
+                or open_time.minute != 0
+                or open_time.second != 0
+                or open_time.microsecond != 0
+                or low_price > min(open_price, close_price)
+                or high_price < max(open_price, close_price)
+                or quote_volume < 0
+            ):
+                raise ValueError("daily kline values invalid")
+        except (OverflowError, TypeError, ValueError):
+            malformed += 1
+            continue
+        parsed[int(row[0])] = DailyContractCandle(
+            open_time=open_time,
+            close_time=close_time,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+            quote_volume=quote_volume,
+        )
+    candles = tuple(parsed[key] for key in sorted(parsed))
+    if not candles:
+        raise RadarSourceError("RADAR_DAILY_KLINES_EMPTY")
+    return candles, malformed
+
+
 def parse_funding_contexts(payload: Any) -> tuple[dict[str, FundingContext], int]:
     rows = payload if isinstance(payload, list) else [payload]
     if not rows or not isinstance(rows, list):
@@ -605,6 +854,33 @@ class BinanceAltcoinRadarClient:
         )
         return TimedValue(value, response.completed_at, malformed)
 
+    def daily_klines(
+        self,
+        symbol: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        limit: int,
+    ) -> TimedValue:
+        if limit < 1 or limit > 500 or end_at <= start_at:
+            raise ValueError("RADAR_DAILY_RANGE_INVALID")
+        response = self._get_json(
+            BINANCE_USDM_BASE,
+            "/fapi/v1/klines",
+            (
+                ("symbol", symbol),
+                ("interval", "1d"),
+                ("startTime", str(int(start_at.timestamp() * 1000))),
+                ("endTime", str(int(end_at.timestamp() * 1000))),
+                ("limit", str(limit)),
+            ),
+        )
+        value, malformed = parse_daily_contract_klines(
+            response.value,
+            completed_at=response.completed_at,
+        )
+        return TimedValue(value, response.completed_at, malformed)
+
     def klines_between(
         self,
         symbol: str,
@@ -664,7 +940,9 @@ class BinanceAltcoinRadarClient:
         try:
             with self.opener.open(request, timeout=self.timeout_seconds) as response:
                 raw_status = getattr(response, "status", None)
-                status = int(raw_status if raw_status is not None else response.getcode())
+                status = int(
+                    raw_status if raw_status is not None else response.getcode()
+                )
                 body = response.read(MAX_RESPONSE_BYTES + 1)
                 headers = response.headers
         except HTTPError as exc:
@@ -682,9 +960,7 @@ class BinanceAltcoinRadarClient:
         if status in {418, 429}:
             retry_after = headers.get("Retry-After") if headers is not None else None
             self._open_throttle_backoff(retry_after)
-            raise RadarSourceError(
-                f"RADAR_HTTP_THROTTLED_{status}", throttled=True
-            )
+            raise RadarSourceError(f"RADAR_HTTP_THROTTLED_{status}", throttled=True)
         if status < 200 or status >= 300:
             raise RadarSourceError(f"RADAR_HTTP_{status}")
         if len(body) > MAX_RESPONSE_BYTES:
@@ -715,9 +991,228 @@ class BinanceAltcoinRadarClient:
                 self._backoff_until = candidate
 
 
+def latest_closed_daily_cutoff(now: datetime | None = None) -> datetime:
+    current = (now or utc_now()).astimezone(UTC)
+    return current.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        milliseconds=1
+    )
+
+
+def _read_daily_cache(path: Path) -> tuple[DailyContractCandle, ...]:
+    if not path.is_file() or path.is_symlink():
+        return ()
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            expected = {
+                "open_time_ms",
+                "close_time_ms",
+                "open",
+                "high",
+                "low",
+                "close",
+                "quote_volume",
+            }
+            if set(reader.fieldnames or ()) != expected:
+                return ()
+            parsed: dict[int, DailyContractCandle] = {}
+            for row in reader:
+                open_time_ms = int(row["open_time_ms"])
+                close_time_ms = int(row["close_time_ms"])
+                open_price = float(row["open"])
+                high_price = float(row["high"])
+                low_price = float(row["low"])
+                close_price = float(row["close"])
+                quote_volume = float(row["quote_volume"])
+                numbers = (
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    quote_volume,
+                )
+                if (
+                    not all(math.isfinite(value) for value in numbers)
+                    or min(open_price, high_price, low_price, close_price) <= 0
+                    or quote_volume < 0
+                    or low_price > min(open_price, close_price)
+                    or high_price < max(open_price, close_price)
+                    or abs(
+                        (close_time_ms - open_time_ms)
+                        - (DAILY_INTERVAL_SECONDS * 1000 - 1)
+                    )
+                    > 5_000
+                    or open_time_ms % int(DAILY_INTERVAL_SECONDS * 1000) != 0
+                ):
+                    return ()
+                parsed[open_time_ms] = DailyContractCandle(
+                    open_time=datetime.fromtimestamp(open_time_ms / 1000, tz=UTC),
+                    close_time=datetime.fromtimestamp(close_time_ms / 1000, tz=UTC),
+                    open_price=open_price,
+                    high_price=high_price,
+                    low_price=low_price,
+                    close_price=close_price,
+                    quote_volume=quote_volume,
+                )
+    except (KeyError, OSError, TypeError, ValueError, csv.Error):
+        return ()
+    return tuple(parsed[key] for key in sorted(parsed))
+
+
+def _write_daily_cache(
+    candles: Sequence[DailyContractCandle],
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with gzip.open(temporary, "wt", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=(
+                    "open_time_ms",
+                    "close_time_ms",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "quote_volume",
+                ),
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for candle in candles:
+                writer.writerow(
+                    {
+                        "open_time_ms": int(candle.open_time.timestamp() * 1000),
+                        "close_time_ms": int(candle.close_time.timestamp() * 1000),
+                        "open": format(candle.open_price, ".12g"),
+                        "high": format(candle.high_price, ".12g"),
+                        "low": format(candle.low_price, ".12g"),
+                        "close": format(candle.close_price, ".12g"),
+                        "quote_volume": format(candle.quote_volume, ".12g"),
+                    }
+                )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class BinanceUsdmDailyCache:
+    """Bounded normalized daily cache backed by the radar's public client."""
+
+    def __init__(self, cache_root: Path, client: AltcoinRadarProvider) -> None:
+        self.cache_root = cache_root.resolve()
+        self.client = client
+
+    def fetch(self, symbol: str, cutoff: datetime) -> DailySeriesResult:
+        if (
+            not symbol
+            or len(symbol) > 64
+            or not symbol.isalnum()
+            or not symbol.upper().endswith("USDT")
+        ):
+            return DailySeriesResult(
+                symbol,
+                "FAILED",
+                (),
+                None,
+                None,
+                "RADAR_DAILY_SYMBOL_INVALID",
+            )
+        cache_key = (
+            symbol
+            if symbol.isascii()
+            else f"unicode-{hashlib.sha256(symbol.encode('utf-8')).hexdigest()}"
+        )
+        cache_path = self.cache_root / f"{cache_key}.csv.gz"
+        current = _read_daily_cache(cache_path)
+        cutoff = cutoff.astimezone(UTC)
+        latest = current[-1].close_time if current else None
+        acquired_at = (
+            datetime.fromtimestamp(cache_path.stat().st_mtime, tz=UTC)
+            if cache_path.is_file() and not cache_path.is_symlink()
+            else None
+        )
+        if latest is not None and latest >= cutoff:
+            return DailySeriesResult(
+                symbol,
+                "CACHE_CURRENT",
+                current,
+                latest,
+                acquired_at,
+            )
+
+        next_midnight = cutoff + timedelta(milliseconds=1)
+        earliest_open = next_midnight - timedelta(days=DAILY_HISTORY_DAYS)
+        start_at = earliest_open
+        if current:
+            overlap_index = max(0, len(current) - DAILY_CACHE_OVERLAP_DAYS)
+            start_at = max(earliest_open, current[overlap_index].open_time)
+        requested_days = (
+            math.ceil(
+                max(1.0, (cutoff - start_at).total_seconds()) / DAILY_INTERVAL_SECONDS
+            )
+            + 2
+        )
+        try:
+            result = self.client.daily_klines(
+                symbol,
+                start_at=start_at,
+                end_at=cutoff,
+                limit=min(500, max(1, requested_days)),
+            )
+        except RadarSourceError as exc:
+            return DailySeriesResult(
+                symbol,
+                "FAILED" if not current else "STALE",
+                current,
+                latest,
+                acquired_at,
+                exc.reason_code,
+            )
+        except ValueError:
+            return DailySeriesResult(
+                symbol,
+                "FAILED" if not current else "STALE",
+                current,
+                latest,
+                acquired_at,
+                "RADAR_DAILY_RANGE_INVALID",
+            )
+
+        merged = {
+            int(candle.open_time.timestamp() * 1000): candle
+            for candle in (*current, *tuple(result.value))
+            if candle.open_time >= earliest_open and candle.close_time <= cutoff
+        }
+        candles = tuple(merged[key] for key in sorted(merged))[
+            -(DAILY_HISTORY_DAYS + DAILY_CACHE_OVERLAP_DAYS) :
+        ]
+        latest = candles[-1].close_time if candles else None
+        if latest is None or latest < cutoff:
+            return DailySeriesResult(
+                symbol,
+                "FAILED" if not candles else "STALE",
+                candles,
+                latest,
+                result.completed_at,
+                "RADAR_DAILY_KLINES_STALE",
+            )
+        _write_daily_cache(candles, cache_path)
+        return DailySeriesResult(
+            symbol,
+            "FETCHED",
+            candles,
+            latest,
+            result.completed_at,
+            ("RADAR_DAILY_SOURCE_ROWS_MALFORMED" if result.malformed_count else None),
+        )
+
+
 @dataclass(frozen=True)
 class BinanceAltcoinRadarSettings:
-    interval_seconds: float = 300
+    interval_seconds: float = 3600
     jitter_seconds: float = 30
     min_quote_volume_24h: Decimal = Decimal("5000000")
     max_candidates: int = 30
@@ -729,16 +1224,14 @@ class BinanceAltcoinRadarSettings:
     ticker_stale_seconds: int = 180
     kline_stale_seconds: int = 15 * 60
     futures_stale_seconds: int = 15 * 60
+    cache_root: Path | None = None
 
     def __post_init__(self) -> None:
         if self.interval_seconds < 300:
             raise ValueError("RADAR_INTERVAL_TOO_SHORT")
         if not 0 <= self.jitter_seconds <= 120:
             raise ValueError("RADAR_JITTER_INVALID")
-        if (
-            not self.min_quote_volume_24h.is_finite()
-            or self.min_quote_volume_24h <= 0
-        ):
+        if not self.min_quote_volume_24h.is_finite() or self.min_quote_volume_24h <= 0:
             raise ValueError("RADAR_MIN_QUOTE_VOLUME_INVALID")
         if not 5 <= self.max_candidates <= 50:
             raise ValueError("RADAR_MAX_CANDIDATES_INVALID")
@@ -846,6 +1339,448 @@ def analyze_candles(candles: Sequence[ContractCandle]) -> CandleFeatures:
     )
 
 
+def _daily_return(
+    current_price: float,
+    candles: Sequence[DailyContractCandle],
+    days: int,
+) -> float:
+    if len(candles) < days:
+        raise RadarSourceError("RADAR_DAILY_HISTORY_INSUFFICIENT")
+    result = _percent_change(current_price, candles[-days].close_price)
+    if result is None:
+        raise RadarSourceError("RADAR_DAILY_COMPUTATION_INVALID")
+    return result
+
+
+def _previous_pump_peak(
+    candles: Sequence[DailyContractCandle],
+) -> tuple[datetime, float] | None:
+    """Return the most recent completed price-spike peak in the lookback.
+
+    A peak must be a local 11-day high, rise at least 30% from the prior
+    14-day low, and then draw down at least 18% in the following 14 days.
+    Requiring the subsequent drawdown prevents the current move from being
+    mislabeled as a completed previous episode.
+    """
+
+    if len(candles) < 43:
+        return None
+    matches: list[tuple[datetime, float]] = []
+    for index in range(14, len(candles) - 14):
+        peak = candles[index].high_price
+        local = candles[max(0, index - 5) : index + 6]
+        if peak < max(candle.high_price for candle in local) - 1e-12:
+            continue
+        prior_low = min(candle.low_price for candle in candles[index - 14 : index])
+        following_low = min(
+            candle.low_price for candle in candles[index + 1 : index + 15]
+        )
+        advance = _percent_change(peak, prior_low)
+        drawdown = _percent_change(following_low, peak)
+        if (
+            advance is not None
+            and drawdown is not None
+            and advance >= 30.0
+            and drawdown <= -18.0
+        ):
+            matches.append((candles[index].close_time, peak))
+    return matches[-1] if matches else None
+
+
+def analyze_price_position(
+    candles: Sequence[DailyContractCandle],
+    *,
+    current_price: float,
+    return_24h_percent: float,
+) -> PricePositionFeatures:
+    """Classify an explainable current price location from closed UTC days."""
+
+    if not math.isfinite(current_price) or current_price <= 0:
+        raise RadarSourceError("RADAR_CURRENT_PRICE_INVALID")
+    ordered = tuple(sorted(candles, key=lambda candle: candle.open_time))
+    if len(ordered) < DAILY_MINIMUM_DAYS:
+        raise RadarSourceError("RADAR_DAILY_HISTORY_INSUFFICIENT")
+    recent = ordered[-min(DAILY_HISTORY_DAYS, len(ordered)) :]
+    if any(
+        current.open_time <= previous.open_time
+        or abs(
+            (current.open_time - previous.open_time).total_seconds()
+            - DAILY_INTERVAL_SECONDS
+        )
+        > 5
+        for previous, current in zip(recent, recent[1:])
+    ):
+        raise RadarSourceError("RADAR_DAILY_KLINES_NON_CONTIGUOUS")
+
+    return_3d = _daily_return(current_price, recent, 3)
+    return_7d = _daily_return(current_price, recent, 7)
+    return_14d = _daily_return(current_price, recent, 14)
+    return_30d = _daily_return(current_price, recent, 30)
+    return_90d = _daily_return(current_price, recent, 90)
+    window_90 = recent[-90:]
+    range_window = recent[-min(180, len(recent)) :]
+    high_90 = max(current_price, *(candle.high_price for candle in window_90))
+    low_90 = min(current_price, *(candle.low_price for candle in window_90))
+    span_90 = high_90 - low_90
+    if span_90 <= 0:
+        raise RadarSourceError("RADAR_DAILY_COMPUTATION_INVALID")
+    position_90 = _bounded((current_price - low_90) / span_90 * 100.0)
+    range_high = max(
+        current_price,
+        *(candle.high_price for candle in range_window),
+    )
+    range_low = min(
+        current_price,
+        *(candle.low_price for candle in range_window),
+    )
+    distance_high = _percent_change(current_price, range_high)
+    distance_low = _percent_change(current_price, range_low)
+    if distance_high is None or distance_low is None:
+        raise RadarSourceError("RADAR_DAILY_COMPUTATION_INVALID")
+
+    closes = [candle.close_price for candle in recent]
+    ma20 = sum(closes[-20:]) / 20.0
+    ma60 = sum(closes[-60:]) / 60.0
+    ma20_gap = _percent_change(current_price, ma20)
+    ma60_gap = _percent_change(current_price, ma60)
+    if ma20_gap is None or ma60_gap is None:
+        raise RadarSourceError("RADAR_DAILY_COMPUTATION_INVALID")
+    if current_price > ma20 > ma60:
+        trend_structure = "多头排列"
+    elif current_price < ma20 < ma60:
+        trend_structure = "空头排列"
+    elif current_price > ma20 and ma20 <= ma60:
+        trend_structure = "短线转强"
+    elif current_price < ma20 and ma20 >= ma60:
+        trend_structure = "短线转弱"
+    else:
+        trend_structure = "均线交错"
+
+    window_30 = recent[-30:]
+    range_30_high = max(current_price, *(candle.high_price for candle in window_30))
+    range_30_low = min(current_price, *(candle.low_price for candle in window_30))
+    range_30 = _percent_change(range_30_high, range_30_low)
+    if range_30 is None:
+        raise RadarSourceError("RADAR_DAILY_COMPUTATION_INVALID")
+    true_range_percent: list[float] = []
+    for previous, candle in zip(recent, recent[1:]):
+        true_range = max(
+            candle.high_price - candle.low_price,
+            abs(candle.high_price - previous.close_price),
+            abs(candle.low_price - previous.close_price),
+        )
+        true_range_percent.append(true_range / previous.close_price * 100.0)
+    atr20 = sum(true_range_percent[-20:]) / 20.0
+    atr60 = sum(true_range_percent[-60:]) / 60.0
+    compression = atr20 / atr60 if atr60 > 0 else None
+
+    previous_peak = _previous_pump_peak(range_window)
+    previous_peak_at = previous_peak[0] if previous_peak else None
+    previous_peak_price = previous_peak[1] if previous_peak else None
+    previous_peak_distance = (
+        _percent_change(current_price, previous_peak_price)
+        if previous_peak_price is not None
+        else None
+    )
+
+    facts = {
+        "24h": return_24h_percent,
+        "3日": return_3d,
+        "7日": return_7d,
+        "14日": return_14d,
+        "30日": return_30d,
+        "90日": return_90d,
+    }
+
+    def signed(key: str) -> str:
+        return f"{key} {facts[key]:+.1f}%"
+
+    if return_24h_percent <= -12.0 or return_3d <= -20.0:
+        state = "CRASH"
+        reason = f"{signed('24h')}，{signed('3日')}"
+    elif return_24h_percent >= 15.0 or return_3d >= 25.0:
+        state = "SURGE"
+        reason = f"{signed('24h')}，{signed('3日')}"
+    elif return_7d >= 25.0 and distance_high >= -12.0 and current_price > ma20:
+        state = "PUMPING"
+        reason = f"{signed('7日')}，距{len(range_window)}日高点 {distance_high:+.1f}%"
+    elif previous_peak_distance is not None and -12.0 <= previous_peak_distance <= 8.0:
+        state = "RETEST_PREVIOUS_PEAK"
+        reason = f"距上一轮完整拉升峰值 {previous_peak_distance:+.1f}%"
+    elif position_90 >= 80.0 and abs(return_7d) <= 10.0 and distance_high >= -15.0:
+        state = "HIGH_CONSOLIDATION"
+        reason = f"90日位置 {position_90:.0f}%，{signed('7日')}"
+    elif (
+        position_90 <= 20.0
+        and abs(return_14d) <= 8.0
+        and range_30 <= 18.0
+        and compression is not None
+        and compression <= 0.90
+    ):
+        state = "BOTTOM_CONSOLIDATION"
+        reason = f"90日位置 {position_90:.0f}%，30日振幅 {range_30:.1f}%"
+    elif position_90 <= 45.0 and return_7d >= 12.0 and current_price > ma20:
+        state = "REBOUND"
+        reason = f"90日位置 {position_90:.0f}%，{signed('7日')}"
+    elif return_30d <= -20.0 and current_price < ma20 < ma60:
+        state = "PERSISTENT_DECLINE"
+        reason = f"{signed('30日')}，现价低于20日与60日均线"
+    elif position_90 >= 75.0:
+        state = "HIGH_ZONE"
+        reason = f"90日位置 {position_90:.0f}%，距区间高点 {distance_high:+.1f}%"
+    elif position_90 <= 25.0:
+        state = "BOTTOM_ZONE"
+        reason = f"90日位置 {position_90:.0f}%，距区间低点 {distance_low:+.1f}%"
+    else:
+        state = "MID_RANGE"
+        reason = f"90日位置 {position_90:.0f}%，{signed('30日')}"
+
+    return PricePositionFeatures(
+        daily_cutoff_at=recent[-1].close_time,
+        history_days=len(recent),
+        range_days=len(range_window),
+        current_price=current_price,
+        return_24h_percent=return_24h_percent,
+        return_3d_percent=return_3d,
+        return_7d_percent=return_7d,
+        return_14d_percent=return_14d,
+        return_30d_percent=return_30d,
+        return_90d_percent=return_90d,
+        position_90d_percent=position_90,
+        distance_from_range_high_percent=distance_high,
+        distance_from_range_low_percent=distance_low,
+        distance_from_previous_pump_peak_percent=previous_peak_distance,
+        previous_pump_peak_at=previous_peak_at,
+        previous_pump_peak_price=previous_peak_price,
+        ma20_gap_percent=ma20_gap,
+        ma60_gap_percent=ma60_gap,
+        trend_structure=trend_structure,
+        range_30d_percent=range_30,
+        volatility_compression_ratio=compression,
+        state=state,
+        state_label=PRICE_POSITION_LABELS[state],
+        state_group=PRICE_POSITION_GROUPS[state],
+        state_reason=reason,
+        row_tone=PRICE_POSITION_TONES[state],
+        state_rank=PRICE_POSITION_RANKS[state],
+    )
+
+
+def classify_contextual_stage(
+    short_stage: str,
+    price_position: PricePositionFeatures | None,
+) -> ContextualStage:
+    """Combine short-horizon flow with signal-time daily price location.
+
+    The rules deliberately emit a direction for only a small set of combinations.
+    A visible state without a direction remains useful for screening but does not
+    create a forward-evaluation claim.
+    """
+
+    if short_stage not in STAGE_LABELS:
+        raise ValueError("RADAR_STAGE_INVALID")
+
+    def result(
+        stage: str,
+        label: str,
+        group: str,
+        direction: str | None,
+        horizons: tuple[int, ...],
+        reason: str,
+        row_tone: str,
+    ) -> ContextualStage:
+        return ContextualStage(
+            stage=stage,
+            label=label,
+            group=group,
+            direction=direction,
+            evaluation_horizons_minutes=horizons,
+            reason=reason,
+            row_tone=row_tone,
+            rank=CONTEXT_STAGE_RANKS[stage],
+        )
+
+    short_label = STAGE_LABELS[short_stage]
+    if price_position is None:
+        return result(
+            "PRICE_CONTEXT_UNAVAILABLE",
+            f"{short_label} · 仅短线",
+            "WATCHING",
+            None,
+            (),
+            "本轮没有连续90根已闭合日线；保留短线触发，但不输出融合方向。",
+            "NEUTRAL",
+        )
+    if short_stage == "NEUTRAL":
+        return result(
+            "NO_SIGNAL",
+            "尚未形成",
+            "NEUTRAL",
+            None,
+            (),
+            f"短线尚未形成异动；日线处于{price_position.state_label}。",
+            "NEUTRAL",
+        )
+
+    state = price_position.state
+    position = price_position.position_90d_percent
+    return_7d = price_position.return_7d_percent
+    return_30d = price_position.return_30d_percent
+    high_context = state in {
+        "SURGE",
+        "PUMPING",
+        "RETEST_PREVIOUS_PEAK",
+        "HIGH_CONSOLIDATION",
+        "HIGH_ZONE",
+    }
+    low_context = state in {
+        "CRASH",
+        "PERSISTENT_DECLINE",
+        "BOTTOM_CONSOLIDATION",
+        "BOTTOM_ZONE",
+        "REBOUND",
+    }
+    bearish_context = state in {"CRASH", "PERSISTENT_DECLINE"} or (
+        return_30d <= -20.0 and price_position.trend_structure == "空头排列"
+    )
+
+    if short_stage in {"EXHAUSTION", "COOLDOWN"}:
+        if high_context or position >= 70.0 or return_7d >= 15.0:
+            return result(
+                "HIGH_REVERSAL_RISK",
+                "高位回落风险",
+                "HIGH_RISK",
+                "DOWN",
+                (60,),
+                f"短线{short_label}；日线{price_position.state_label}，"
+                f"90日位置{position:.0f}%。",
+                "DANGER",
+            )
+        if bearish_context:
+            return result(
+                "DECLINE_CONTINUATION",
+                "下跌延续",
+                "DECLINING",
+                "DOWN",
+                (240,),
+                f"短线{short_label}；日线{price_position.state_label}，"
+                f"30日{return_30d:+.1f}%。",
+                "MUTED",
+            )
+
+    if short_stage == "ACCELERATION":
+        if state in {"SURGE", "PUMPING"} or return_7d >= 25.0 or position >= 85.0:
+            return result(
+                "BLOWOFF_RISK",
+                "冲高回落风险",
+                "HIGH_RISK",
+                "DOWN",
+                (240,),
+                f"短线加速；日线{price_position.state_label}，"
+                f"7日{return_7d:+.1f}%，90日位置{position:.0f}%。",
+                "DANGER",
+            )
+        if low_context and position <= 45.0:
+            return result(
+                "LOW_REVERSAL_ACCELERATION",
+                "超跌反弹加速",
+                "EARLY_RISE",
+                "UP",
+                (15, 60),
+                f"短线加速；日线{price_position.state_label}，"
+                f"90日位置{position:.0f}%。",
+                "WARNING",
+            )
+
+    if short_stage == "BREAKOUT":
+        if state in {"SURGE", "PUMPING"} or return_7d >= 25.0 or position >= 90.0:
+            return result(
+                "BLOWOFF_RISK",
+                "冲高回落风险",
+                "HIGH_RISK",
+                "DOWN",
+                (240,),
+                f"短线启动但日线已{price_position.state_label}；"
+                f"7日{return_7d:+.1f}%，90日位置{position:.0f}%。",
+                "DANGER",
+            )
+        if state == "RETEST_PREVIOUS_PEAK" or position >= 75.0:
+            return result(
+                "PEAK_BREAKOUT_TEST",
+                "前高突破测试",
+                "EARLY_RISE",
+                "UP",
+                (15,),
+                f"短线启动；日线{price_position.state_label}，"
+                f"90日位置{position:.0f}%。",
+                "WARNING",
+            )
+        if low_context or position <= 35.0:
+            return result(
+                "LOW_BREAKOUT",
+                "低位启动",
+                "EARLY_RISE",
+                "UP",
+                (15,),
+                f"短线启动；日线{price_position.state_label}，"
+                f"90日位置{position:.0f}%。",
+                "WARNING",
+            )
+
+    if short_stage == "SETUP":
+        if state == "BOTTOM_CONSOLIDATION" or (
+            state == "BOTTOM_ZONE" and price_position.range_30d_percent <= 30.0
+        ):
+            return result(
+                "BOTTOM_SETUP",
+                "底部蓄势",
+                "EARLY_RISE",
+                "UP",
+                (240,),
+                f"短线蓄势；日线{price_position.state_label}，"
+                f"90日位置{position:.0f}%，30日振幅"
+                f"{price_position.range_30d_percent:.1f}%。",
+                "INFO",
+            )
+        if bearish_context:
+            return result(
+                "DECLINE_CONTINUATION",
+                "下跌延续",
+                "DECLINING",
+                "DOWN",
+                (240,),
+                f"短线蓄势未改变日线{price_position.state_label}；"
+                f"30日{return_30d:+.1f}%。",
+                "MUTED",
+            )
+        if state in {
+            "RETEST_PREVIOUS_PEAK",
+            "HIGH_ZONE",
+            "HIGH_CONSOLIDATION",
+        } and position >= 70.0:
+            return result(
+                "HIGH_REJECTION_RISK",
+                "高位受阻风险",
+                "HIGH_RISK",
+                "DOWN",
+                (240,),
+                f"短线仅蓄势；日线{price_position.state_label}，"
+                f"90日位置{position:.0f}%。",
+                "WARNING",
+            )
+
+    return result(
+        f"{short_stage}_UNCONFIRMED",
+        f"{short_label}待位置确认",
+        "WATCHING",
+        None,
+        (),
+        f"短线{short_label}与日线{price_position.state_label}未形成已定义组合；"
+        "本轮不输出方向。",
+        "NEUTRAL",
+    )
+
+
 def open_interest_change_15m(
     points: Sequence[OpenInterestPoint],
 ) -> float | None:
@@ -870,9 +1805,7 @@ def _screening_priority(ticker_24h: RollingTicker) -> float:
     """Prioritize broad daily anomalies only when the bounded screen must truncate."""
 
     daily_range_percent = (
-        (ticker_24h.high_price - ticker_24h.low_price)
-        / ticker_24h.open_price
-        * 100.0
+        (ticker_24h.high_price - ticker_24h.low_price) / ticker_24h.open_price * 100.0
     )
     range_position = ticker_24h.range_position_percent
     range_extremity = abs(
@@ -899,10 +1832,7 @@ def select_candidate_seeds(
         if not _eligible_altcoin(base_asset):
             continue
         ticker_24h = tickers_24h.get(symbol)
-        if (
-            ticker_24h is None
-            or ticker_24h.quote_volume < min_quote_volume_24h
-        ):
+        if ticker_24h is None or ticker_24h.quote_volume < min_quote_volume_24h:
             continue
         seeds.append(
             CandidateSeed(
@@ -990,9 +1920,7 @@ def score_candidate(
         )
     ):
         stage = "COOLDOWN"
-    elif tail_risk_score >= 55.0 and (
-        pump_score >= 45.0 or return_24h_percent >= 10.0
-    ):
+    elif tail_risk_score >= 55.0 and (pump_score >= 45.0 or return_24h_percent >= 10.0):
         stage = "EXHAUSTION"
     elif pump_score >= 70.0 and features.return_15m_percent >= 3.0:
         stage = "ACCELERATION"
@@ -1096,19 +2024,163 @@ class BinanceAltcoinRadarMonitor:
     monitor_id = "binance-altcoin-radar"
     display_name = "山寨币异动雷达"
     projection_kind = "altcoin_radar"
+    price_position_snapshot_key = PRICE_POSITION_SNAPSHOT_KEY
+    price_position_table_title = "日线价格位置"
+    price_position_method_note = (
+        "状态使用当前合约价与最多180根已闭合UTC日线计算；"
+        "90日位置、距区间高低点、均线结构和独立收益窗口均保留为可排序事实。"
+        "“上一轮拉升峰值”只认定先在14日内上涨至少30%、随后14日回撤至少18%的"
+        "已完成价格段，不把当前上涨直接当作上一轮。"
+    )
+    price_position_filter_choices = (
+        FilterChoice("*", "全部状态"),
+        FilterChoice("RISING", "拉升与暴涨", "暴涨或仍处于快速拉升规则内。"),
+        FilterChoice("HIGH", "高位与前高", "处于高位、整理或接近上一轮拉升峰值。"),
+        FilterChoice("BOTTOM", "底部与反弹", "处于区间底部、底部横盘或低位反弹。"),
+        FilterChoice("FALLING", "下跌与暴跌", "持续下跌或短期暴跌。"),
+        FilterChoice("NEUTRAL", "区间中部", "未落入上述状态的区间中部。"),
+    )
+    price_position_columns = (
+        ViewColumn("symbol", "币种"),
+        ViewColumn(
+            "price_state_label",
+            "价格状态",
+            description=(
+                "按顺序判定：24h≤-12%或3日≤-20%为暴跌；24h≥15%或3日≥25%"
+                "为暴涨；7日≥25%、距区间高点不超过12%且高于20日均线为拉升中；"
+                "距上一轮完整拉升峰值-12%至+8%为前高附近；90日位置≥80%、"
+                "7日波动≤10%且距区间高点≤15%为高位整理；90日位置≤20%、"
+                "14日波动≤8%、30日振幅≤18%且20日波动不高于60日的90%为底部横盘；"
+                "随后依次检查低位反弹、持续下跌、高位、底部和区间中部。"
+                "它描述价格形态，不证明操纵主体。"
+            ),
+        ),
+        ViewColumn(
+            "state_reason",
+            "判定依据",
+            description="触发当前价格状态的最少一组可核验价格事实。",
+        ),
+        ViewColumn(
+            "current_price",
+            "现价",
+            "number",
+            maximum_fraction_digits=8,
+            use_grouping=True,
+        ),
+        ViewColumn(
+            "return_24h_percent",
+            "24h涨跌",
+            "percent",
+            description="Binance USDⓈ-M合约滚动24小时价格涨跌幅。",
+        ),
+        ViewColumn(
+            "return_7d_percent",
+            "7日涨跌",
+            "percent",
+            description="当前价相对7根前闭合UTC日线收盘价的涨跌幅。",
+        ),
+        ViewColumn(
+            "return_30d_percent",
+            "30日涨跌",
+            "percent",
+            description="当前价相对30根前闭合UTC日线收盘价的涨跌幅。",
+        ),
+        ViewColumn(
+            "position_90d_percent",
+            "90日位置",
+            "percent",
+            show_sign=False,
+            description=(
+                "当前价在最近90根闭合日线最高价与最低价之间的位置；"
+                "0%为区间最低，100%为区间最高。"
+            ),
+        ),
+        ViewColumn(
+            "distance_from_range_high_percent",
+            "距区间高点",
+            "percent",
+            description=(
+                "当前价相对最多180根闭合日线最高价的距离；负值表示仍低于高点。"
+                "实际覆盖日数见“日线覆盖”。"
+            ),
+        ),
+        ViewColumn(
+            "distance_from_previous_pump_peak_percent",
+            "距前轮高点",
+            "percent",
+            description=(
+                "当前价相对最近一个完整拉升回落段峰值的距离。该峰值必须是局部高点，"
+                "此前14日内从低点上涨至少30%，此后14日内回撤至少18%；"
+                "未识别到完整价格段时保持为空。"
+            ),
+        ),
+        ViewColumn(
+            "previous_pump_peak_date",
+            "前轮高点日期",
+            priority="secondary",
+            description="最近一个满足完整拉升回落规则的UTC日线峰值日期。",
+        ),
+        ViewColumn(
+            "trend_structure",
+            "均线结构",
+            priority="secondary",
+            description=(
+                "比较当前价、最近20根与60根闭合日线收盘均值，"
+                "显示多头排列、空头排列、短线转强、短线转弱或均线交错。"
+            ),
+        ),
+        ViewColumn(
+            "return_90d_percent",
+            "90日涨跌",
+            "percent",
+            priority="secondary",
+            description="当前价相对90根前闭合UTC日线收盘价的涨跌幅。",
+        ),
+        ViewColumn(
+            "distance_from_range_low_percent",
+            "距区间低点",
+            "percent",
+            priority="secondary",
+            description=(
+                "当前价相对最多180根闭合日线最低价的距离；0%表示正在该区间最低点。"
+            ),
+        ),
+        ViewColumn(
+            "range_30d_percent",
+            "30日振幅",
+            "percent",
+            priority="secondary",
+            show_sign=False,
+            description="最近30根闭合日线最高价相对最低价的区间宽度。",
+        ),
+        ViewColumn(
+            "history_days",
+            "日线覆盖",
+            "number",
+            priority="secondary",
+            maximum_fraction_digits=0,
+            description=(
+                "本轮连续闭合UTC日线的实际覆盖根数，最多220根；"
+                "价格区间指标最多使用其中最近180根。"
+            ),
+        ),
+    )
     evaluation_source = EVALUATION_SOURCE
+    baseline_evaluation_source = BASELINE_EVALUATION_SOURCE
     description = (
-        "Binance USDⓈ-M 永续合约全市场初筛与候选详查；识别蓄势、启动、加速、"
-        "尾声风险和回落确认。评分是可解释异常证据，不是上涨概率、买卖建议或拉盘定性。"
+        "Binance USDⓈ-M 永续合约全市场初筛与候选详查；把闭合5m异动与信号当时"
+        "已闭合日线价格位置结合，区分低位启动、冲高回落风险和下跌延续等状态。"
     )
     default_enabled = False
-    evaluation_batch_limit = 12
+    evaluation_batch_limit = 36
+    foreground_interval_seconds = 300.0
 
     def __init__(
         self,
         settings: BinanceAltcoinRadarSettings,
         *,
         client: AltcoinRadarProvider | None = None,
+        daily_provider: DailySeriesProvider | None = None,
         evaluation_store: SQLiteMonitorStore | None = None,
     ) -> None:
         self.settings = settings
@@ -1118,20 +2190,40 @@ class BinanceAltcoinRadarMonitor:
             timeout_seconds=settings.timeout_seconds,
             proxy_url=settings.proxy_url,
         )
+        self.daily_provider = daily_provider or (
+            BinanceUsdmDailyCache(settings.cache_root, self.client)
+            if settings.cache_root is not None
+            else None
+        )
         self.evaluation_store = evaluation_store
         self.view = MonitorView(
             filters=(
                 ViewFilter(
-                    key="stage",
-                    label="异动阶段",
+                    key="context_stage_group",
+                    label="综合状态",
                     default="*",
                     choices=(
                         FilterChoice("*", "全部候选"),
-                        FilterChoice("SETUP", "蓄势观察"),
-                        FilterChoice("BREAKOUT", "启动"),
-                        FilterChoice("ACCELERATION", "加速"),
-                        FilterChoice("EXHAUSTION", "尾声风险"),
-                        FilterChoice("COOLDOWN", "回落确认"),
+                        FilterChoice(
+                            "EARLY_RISE",
+                            "低位与突破",
+                            "底部蓄势、低位启动、超跌反弹加速或前高突破测试。",
+                        ),
+                        FilterChoice(
+                            "HIGH_RISK",
+                            "高位回落风险",
+                            "短线触发位于日线高位、快速拉升或上一轮峰值附近。",
+                        ),
+                        FilterChoice(
+                            "DECLINING",
+                            "下跌延续",
+                            "短线触发没有改变日线空头排列或持续下跌。",
+                        ),
+                        FilterChoice(
+                            "WATCHING",
+                            "等待位置确认",
+                            "短线与日线位置尚未形成已定义组合，本轮不输出方向。",
+                        ),
                         FilterChoice("NEUTRAL", "尚未形成"),
                     ),
                 ),
@@ -1139,14 +2231,37 @@ class BinanceAltcoinRadarMonitor:
             columns=(
                 ViewColumn("symbol", "币种"),
                 ViewColumn(
-                    "stage_label",
-                    "阶段",
+                    "context_stage_label",
+                    "综合状态",
                     description=(
-                        "按优先级判定：1h≤-3%且24h≥5%，并伴随1h区间位置<45%"
-                        "或主动买入<45%时为回落确认；尾声风险分≥55且启动分≥45"
-                        "或24h≥10%时为尾声风险；启动分≥70且15m≥3%时为加速；"
-                        "启动分≥55且突破前高或1h区间位置≥80%时为启动；蓄势分≥60"
-                        "且15m处于-0.75%至+2.5%时为蓄势观察；否则尚未形成。"
+                        "先按闭合5m成交、主动买入、突破、相对BTC、资金费率和OI"
+                        "形成短线触发，再用信号当时最多180根已闭合UTC日线判断"
+                        "其位于底部、高位、前高附近或持续下跌。只有规则明确的组合"
+                        "才输出限定期限方向；其他组合显示等待位置确认。"
+                    ),
+                ),
+                ViewColumn(
+                    "price_state_label",
+                    "价格位置",
+                    description=(
+                        "与“价格位置”标签同源、同轮且不晚于短线信号的日线状态；"
+                        "连续日线不足90根时保持为空。"
+                    ),
+                ),
+                ViewColumn(
+                    "context_stage_reason",
+                    "融合依据",
+                    description=(
+                        "列出触发综合状态的短线阶段、日线状态及关键位置事实；"
+                        "未满足组合规则时明确不输出方向。"
+                    ),
+                ),
+                ViewColumn(
+                    "evaluation_target_label",
+                    "待检验方向",
+                    description=(
+                        "显示本状态将由后续闭合5m行情检验的方向与期限。"
+                        "“不输出方向”表示当前只有筛选价值，不计入准确性统计。"
                     ),
                 ),
                 ViewColumn(
@@ -1244,6 +2359,15 @@ class BinanceAltcoinRadarMonitor:
                     ),
                 ),
                 ViewColumn(
+                    "stage_label",
+                    "短线触发",
+                    priority="secondary",
+                    description=(
+                        "只使用闭合5m行情、相对BTC、资金费率和OI得到的原始阶段；"
+                        "综合状态会再结合日线价格位置。"
+                    ),
+                ),
+                ViewColumn(
                     "review_window_label",
                     "复核节奏",
                     priority="secondary",
@@ -1281,7 +2405,9 @@ class BinanceAltcoinRadarMonitor:
             chart_title="异动强度历史（0–100）",
             method_note=(
                 "分析周期：每根闭合5m K重算，短线主判看15m，趋势背景看1h，"
-                "波动压缩比较覆盖约2小时15分，流动性与部分风险条件看24h。"
+                "再用信号当时已闭合日线判断价格位于底部、高位、前高或下跌趋势。"
+                "综合状态只在规则明确时给出15分钟、1小时或4小时待检验方向；"
+                "其余状态明确不输出方向。"
                 "“本轮结论有效至”是规则结论的硬截止；“复核节奏”是风险检查频率，"
                 "不是期望盈利持仓期。当前尚无含手续费、滑点的样本外回测，"
                 "因此不推断持仓时长。"
@@ -1301,12 +2427,13 @@ class BinanceAltcoinRadarMonitor:
             evaluation=EvaluationView(
                 title="后续行情检验",
                 method_note=(
-                    "阶段首次出现、发生变化或连续4小时未复建样本时，固定记录信号"
-                    "截止价，并在15分钟、1小时、4小时后用同一USDⓈ-M合约的闭合"
-                    "5m K线检验。"
+                    "综合状态首次出现、发生变化或连续4小时未复建样本时，冻结当时"
+                    "可见的短线触发、日线价格位置和信号截止价，并只在该状态指定的"
+                    "15分钟、1小时或4小时时限后用闭合5m K线检验。"
                     "方向一致要求绝对方向正确且相对BTC超出±0.5个百分点；"
                     "该带宽是暂定噪声区间，不含手续费、滑点或可成交性。"
-                    "每个阶段×期限完成少于30例时只显示样本积累，不报告一致率。"
+                    "页面用同一币种、同一信号截止和同一期限同步比较原短线规则；"
+                    "每组完成少于30例时只显示样本积累，不报告一致率。"
                 ),
                 minimum_group_samples=30,
             ),
@@ -1372,8 +2499,7 @@ class BinanceAltcoinRadarMonitor:
             return CollectionBatch(
                 samples=(),
                 issues=tuple(
-                    issues
-                    or [CollectionIssue("universe", "RADAR_NO_LIQUID_SYMBOLS")]
+                    issues or [CollectionIssue("universe", "RADAR_NO_LIQUID_SYMBOLS")]
                 ),
             )
 
@@ -1387,16 +2513,13 @@ class BinanceAltcoinRadarMonitor:
             return CollectionBatch(
                 samples=(),
                 issues=tuple(
-                    issues
-                    or [CollectionIssue("universe", "RADAR_NO_CANDIDATES")]
+                    issues or [CollectionIssue("universe", "RADAR_NO_CANDIDATES")]
                 ),
             )
 
         benchmark_features: CandleFeatures | None = None
         try:
-            benchmark = self.client.klines(
-                "BTCUSDT", limit=self.settings.kline_limit
-            )
+            benchmark = self.client.klines("BTCUSDT", limit=self.settings.kline_limit)
             benchmark_features = self._validated_features("BTCUSDT", benchmark)
             self._append_malformed_issue(issues, "BTCUSDT", benchmark)
         except RadarSourceError as exc:
@@ -1453,16 +2576,13 @@ class BinanceAltcoinRadarMonitor:
         for enrichment in screened:
             issues.extend(enrichment.issues)
         analyzed = [
-            enrichment
-            for enrichment in screened
-            if enrichment.features is not None
+            enrichment for enrichment in screened if enrichment.features is not None
         ]
         if not analyzed:
             return CollectionBatch(
                 samples=(),
                 issues=tuple(
-                    issues
-                    or [CollectionIssue("universe", "RADAR_NO_CANDIDATES")]
+                    issues or [CollectionIssue("universe", "RADAR_NO_CANDIDATES")]
                 ),
             )
         analyzed.sort(
@@ -1471,6 +2591,25 @@ class BinanceAltcoinRadarMonitor:
                 benchmark_features=benchmark_features,
             )
         )
+        price_position_rows: tuple[dict[str, Any], ...] = ()
+        price_position_counts = {
+            "eligible": len(analyzed),
+            "included": 0,
+            "history_insufficient": 0,
+            "unavailable": len(analyzed),
+        }
+        price_positions_by_symbol: dict[str, PricePositionFeatures] = {}
+        if self.daily_provider is not None:
+            (
+                price_position_rows,
+                price_position_issues,
+                price_position_counts,
+                price_positions_by_symbol,
+            ) = self._collect_price_positions(
+                analyzed,
+                daily_cutoff=latest_closed_daily_cutoff(day.completed_at),
+            )
+            issues.extend(price_position_issues)
         shortlist = analyzed[: self.settings.max_candidates]
 
         enrichments: list[CandidateEnrichment] = []
@@ -1515,11 +2654,15 @@ class BinanceAltcoinRadarMonitor:
                     screened_size=len(screening_seeds),
                     analyzed_size=len(analyzed),
                     shortlist_size=len(shortlist),
+                    price_position=price_positions_by_symbol.get(
+                        enrichment.seed.symbol
+                    ),
                 )
             )
 
         samples.sort(
             key=lambda sample: (
+                int(sample.payload.get("context_stage_rank") or 999),
                 sample.payload.get("alert_score") is None,
                 -float(sample.payload.get("alert_score") or 0),
                 sample.entity_key,
@@ -1530,17 +2673,263 @@ class BinanceAltcoinRadarMonitor:
         ):
             self.client.reset_throttle_backoff()
         evaluation_cases = self._new_evaluation_cases(tuple(samples))
+        projection_snapshots: tuple[ProjectionSnapshot, ...] = ()
+        if price_position_rows:
+            projection_snapshots = (
+                self._price_position_snapshot(
+                    price_position_rows,
+                    counts=price_position_counts,
+                    observed_at=observed_at,
+                ),
+            )
         return CollectionBatch(
             samples=tuple(samples),
             issues=tuple(issues),
             evaluation_cases=evaluation_cases,
+            projection_snapshots=projection_snapshots,
+        )
+
+    def _collect_price_positions(
+        self,
+        analyzed: Sequence[CandidateEnrichment],
+        *,
+        daily_cutoff: datetime,
+    ) -> tuple[
+        tuple[dict[str, Any], ...],
+        tuple[CollectionIssue, ...],
+        dict[str, int],
+        dict[str, PricePositionFeatures],
+    ]:
+        provider = self.daily_provider
+        if provider is None:
+            return (
+                (),
+                (),
+                {
+                    "eligible": len(analyzed),
+                    "included": 0,
+                    "history_insufficient": 0,
+                    "unavailable": len(analyzed),
+                },
+                {},
+            )
+        issues: list[CollectionIssue] = []
+        results: list[tuple[CandidateEnrichment, DailySeriesResult]] = []
+        unavailable = 0
+        with ThreadPoolExecutor(max_workers=self.settings.workers) as pool:
+            futures = {
+                pool.submit(provider.fetch, item.seed.symbol, daily_cutoff): item
+                for item in analyzed
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    result = future.result()
+                except CollectionCancelled:
+                    raise
+                except Exception:
+                    unavailable += 1
+                    issues.append(
+                        CollectionIssue(
+                            item.seed.symbol,
+                            "RADAR_DAILY_COLLECTION_FAILED",
+                        )
+                    )
+                    continue
+                if not result.current or result.latest_close_at is None:
+                    unavailable += 1
+                    issues.append(
+                        CollectionIssue(
+                            item.seed.symbol,
+                            result.reason_code or "RADAR_DAILY_KLINES_UNAVAILABLE",
+                        )
+                    )
+                    continue
+                if abs((result.latest_close_at - daily_cutoff).total_seconds()) > 5:
+                    unavailable += 1
+                    issues.append(
+                        CollectionIssue(
+                            item.seed.symbol,
+                            "RADAR_DAILY_KLINES_STALE",
+                        )
+                    )
+                    continue
+                if result.reason_code is not None:
+                    issues.append(CollectionIssue(item.seed.symbol, result.reason_code))
+                results.append((item, result))
+
+        rows: list[dict[str, Any]] = []
+        features_by_symbol: dict[str, PricePositionFeatures] = {}
+        history_insufficient = 0
+        for item, result in results:
+            try:
+                current_features = analyze_price_position(
+                    result.candles,
+                    current_price=item.seed.ticker_24h.last_price,
+                    return_24h_percent=item.seed.ticker_24h.price_change_percent,
+                )
+                if item.features is None:
+                    raise RadarSourceError("RADAR_FEATURES_REQUIRED")
+                signal_return_24h = _percent_change(
+                    item.features.close_price,
+                    item.seed.ticker_24h.open_price,
+                )
+                if signal_return_24h is None:
+                    raise RadarSourceError("RADAR_DAILY_COMPUTATION_INVALID")
+                signal_features = analyze_price_position(
+                    result.candles,
+                    current_price=item.features.close_price,
+                    return_24h_percent=signal_return_24h,
+                )
+            except RadarSourceError as exc:
+                if exc.reason_code == "RADAR_DAILY_HISTORY_INSUFFICIENT":
+                    history_insufficient += 1
+                else:
+                    unavailable += 1
+                    issues.append(CollectionIssue(item.seed.symbol, exc.reason_code))
+                continue
+            features_by_symbol[item.seed.symbol] = signal_features
+            rows.append(self._price_position_row(item, current_features))
+        rows.sort(
+            key=lambda row: (
+                int(row["price_state_rank"]),
+                -abs(float(row["return_24h_percent"])),
+                str(row["symbol"]),
+            )
+        )
+        counts = {
+            "eligible": len(analyzed),
+            "included": len(rows),
+            "history_insufficient": history_insufficient,
+            "unavailable": unavailable,
+        }
+        return tuple(rows), tuple(issues), counts, features_by_symbol
+
+    @staticmethod
+    def _price_position_row(
+        item: CandidateEnrichment,
+        features: PricePositionFeatures,
+    ) -> dict[str, Any]:
+        peak_missing = (
+            "最近最多180根闭合日线中未识别到先涨至少30%、"
+            "随后回撤至少18%的完整拉升回落段。"
+        )
+        missing_reasons: dict[str, str] = {}
+        if features.previous_pump_peak_at is None:
+            missing_reasons.update(
+                {
+                    "distance_from_previous_pump_peak_percent": peak_missing,
+                    "previous_pump_peak_date": peak_missing,
+                    "previous_pump_peak_price": peak_missing,
+                }
+            )
+        return {
+            "symbol": item.seed.symbol,
+            "entity_key": item.seed.symbol,
+            "series_key": (f"{item.seed.symbol}|usdm-perpetual-price-position"),
+            "market_scope": MARKET_SCOPE,
+            "price_state": features.state,
+            "price_state_label": features.state_label,
+            "price_state_group": features.state_group,
+            "price_state_rank": features.state_rank,
+            "state_reason": features.state_reason,
+            "row_tone": features.row_tone,
+            "current_price": _float_text(features.current_price, 12),
+            "current_price_at": iso_utc(item.seed.ticker_24h.close_time),
+            "return_24h_percent": _float_text(features.return_24h_percent),
+            "return_3d_percent": _float_text(features.return_3d_percent),
+            "return_7d_percent": _float_text(features.return_7d_percent),
+            "return_14d_percent": _float_text(features.return_14d_percent),
+            "return_30d_percent": _float_text(features.return_30d_percent),
+            "return_90d_percent": _float_text(features.return_90d_percent),
+            "position_90d_percent": _float_text(features.position_90d_percent),
+            "distance_from_range_high_percent": _float_text(
+                features.distance_from_range_high_percent
+            ),
+            "distance_from_range_low_percent": _float_text(
+                features.distance_from_range_low_percent
+            ),
+            "distance_from_previous_pump_peak_percent": _float_text(
+                features.distance_from_previous_pump_peak_percent
+            ),
+            "previous_pump_peak_date": (
+                features.previous_pump_peak_at.date().isoformat()
+                if features.previous_pump_peak_at is not None
+                else None
+            ),
+            "previous_pump_peak_price": _float_text(
+                features.previous_pump_peak_price,
+                12,
+            ),
+            "trend_structure": features.trend_structure,
+            "ma20_gap_percent": _float_text(features.ma20_gap_percent),
+            "ma60_gap_percent": _float_text(features.ma60_gap_percent),
+            "range_30d_percent": _float_text(features.range_30d_percent),
+            "volatility_compression_ratio": _float_text(
+                features.volatility_compression_ratio
+            ),
+            "history_days": features.history_days,
+            "range_days": features.range_days,
+            "daily_cutoff_at": iso_utc(features.daily_cutoff_at),
+            "missing_reasons": missing_reasons,
+        }
+
+    @staticmethod
+    def _price_position_snapshot(
+        rows: tuple[dict[str, Any], ...],
+        *,
+        counts: dict[str, int],
+        observed_at: datetime,
+    ) -> ProjectionSnapshot:
+        price_cutoff_at = min(
+            datetime.fromisoformat(
+                str(row["current_price_at"]).replace("Z", "+00:00")
+            ).astimezone(UTC)
+            for row in rows
+        )
+        daily_cutoff_at = min(
+            datetime.fromisoformat(
+                str(row["daily_cutoff_at"]).replace("Z", "+00:00")
+            ).astimezone(UTC)
+            for row in rows
+        )
+        coverage_parts = [
+            f"{counts['eligible']} 个合约完成短周期分析",
+            f"{counts['included']} 个具备连续90日日线并形成价格位置",
+        ]
+        if counts["history_insufficient"]:
+            coverage_parts.append(
+                f"{counts['history_insufficient']} 个上市历史不足90日"
+            )
+        if counts["unavailable"]:
+            coverage_parts.append(f"{counts['unavailable']} 个本轮日线缺失或不连续")
+        state_counts: dict[str, int] = {}
+        for row in rows:
+            state = str(row["price_state"])
+            state_counts[state] = state_counts.get(state, 0) + 1
+        return ProjectionSnapshot(
+            snapshot_key=PRICE_POSITION_SNAPSHOT_KEY,
+            observed_at=observed_at,
+            cutoff_at=price_cutoff_at,
+            payload={
+                "schema_version": 1,
+                "market_scope": MARKET_SCOPE,
+                "source": "BINANCE_USDM_PUBLIC_CURRENT_AND_CLOSED_1D_KLINES",
+                "price_cutoff_at": iso_utc(price_cutoff_at),
+                "daily_cutoff_at": iso_utc(daily_cutoff_at),
+                "valid_until": iso_utc(price_cutoff_at + timedelta(minutes=15)),
+                "coverage_label": "；".join(coverage_parts) + "。",
+                "counts": dict(counts),
+                "state_counts": state_counts,
+                "rows": list(rows),
+            },
         )
 
     def _new_evaluation_cases(
         self,
         samples: tuple[MetricSample, ...],
     ) -> tuple[ForwardEvaluationCase, ...]:
-        """Freeze bounded stage episodes before any future return is observable."""
+        """Freeze baseline and price-aware claims before outcomes are observable."""
 
         if self.evaluation_store is None:
             return ()
@@ -1554,7 +2943,7 @@ class BinanceAltcoinRadarMonitor:
         )
         if not candidates:
             return ()
-        entity_keys = tuple(sample.entity_key for sample in candidates)
+        entity_keys = tuple(dict.fromkeys(sample.entity_key for sample in candidates))
         previous_samples = {
             sample.entity_key: sample
             for sample in self.evaluation_store.latest_samples_by_entity(
@@ -1562,7 +2951,15 @@ class BinanceAltcoinRadarMonitor:
                 entity_keys,
             )
         }
-        previous_evaluations = {
+        previous_baseline_evaluations = {
+            evaluation.entity_key: evaluation
+            for evaluation in self.evaluation_store.latest_forward_evaluations_by_entity(
+                self.monitor_id,
+                entity_keys,
+                source=self.baseline_evaluation_source,
+            )
+        }
+        previous_context_evaluations = {
             evaluation.entity_key: evaluation
             for evaluation in self.evaluation_store.latest_forward_evaluations_by_entity(
                 self.monitor_id,
@@ -1572,37 +2969,103 @@ class BinanceAltcoinRadarMonitor:
         }
         cases: list[ForwardEvaluationCase] = []
         for sample in candidates:
-            stage = str(sample.payload["stage"])
             cutoff = datetime.fromisoformat(
                 str(sample.payload["data_cutoff_at"]).replace("Z", "+00:00")
             ).astimezone(UTC)
             previous_sample = previous_samples.get(sample.entity_key)
-            previous_stage = (
+            previous_short_stage = (
                 str(previous_sample.payload.get("stage"))
                 if previous_sample is not None
                 and previous_sample.payload.get("market_scope") == MARKET_SCOPE
                 else None
             )
-            previous_evaluation = previous_evaluations.get(sample.entity_key)
-            repeated_after_gap = (
-                previous_evaluation is None
-                or cutoff - previous_evaluation.source_cutoff_at
+            previous_context_stage = (
+                str(previous_sample.payload.get("context_stage"))
+                if previous_sample is not None
+                and previous_sample.payload.get("market_scope") == MARKET_SCOPE
+                and previous_sample.payload.get("context_stage")
+                else None
+            )
+
+            short_stage = str(sample.payload["stage"])
+            context_stage = str(sample.payload.get("context_stage") or "")
+            context_direction = str(sample.payload.get("context_direction") or "")
+            context_horizons = tuple(
+                int(value)
+                for value in sample.payload.get(
+                    "context_evaluation_horizons_minutes",
+                    (),
+                )
+                if int(value) in EVALUATION_HORIZONS_MINUTES
+            )
+            previous_context = previous_context_evaluations.get(sample.entity_key)
+            context_repeated_after_gap = (
+                previous_context is None
+                or cutoff - previous_context.source_cutoff_at >= EVALUATION_REPEAT_AFTER
+            )
+            create_context_cases = (
+                context_direction in {"UP", "DOWN"}
+                and bool(context_horizons)
+                and (
+                    previous_context_stage != context_stage
+                    or context_repeated_after_gap
+                )
+            )
+
+            previous_baseline = previous_baseline_evaluations.get(sample.entity_key)
+            baseline_repeated_after_gap = (
+                previous_baseline is None
+                or cutoff - previous_baseline.source_cutoff_at
                 >= EVALUATION_REPEAT_AFTER
             )
-            if previous_stage == stage and not repeated_after_gap:
+            create_baseline_episode = (
+                previous_short_stage != short_stage or baseline_repeated_after_gap
+            )
+            baseline_horizons = (
+                EVALUATION_HORIZONS_MINUTES
+                if create_baseline_episode
+                else context_horizons
+                if create_context_cases
+                else ()
+            )
+            if baseline_horizons:
+                baseline_direction = EVALUATION_DIRECTIONS[short_stage]
+                for horizon_minutes in baseline_horizons:
+                    cases.append(
+                        ForwardEvaluationCase(
+                            case_key=(
+                                f"{sample.entity_key}|{short_stage}|"
+                                f"{iso_utc(cutoff)}|{horizon_minutes}"
+                            ),
+                            entity_key=sample.entity_key,
+                            stage=short_stage,
+                            stage_label=str(sample.payload["stage_label"]),
+                            direction=baseline_direction,  # type: ignore[arg-type]
+                            signal_observed_at=sample.observed_at,
+                            source_cutoff_at=cutoff,
+                            horizon_minutes=horizon_minutes,
+                            due_at=cutoff + timedelta(minutes=horizon_minutes),
+                            entry_price_text=str(sample.payload["close_price"]),
+                            benchmark_entry_price_text=str(
+                                sample.payload["benchmark_close_price"]
+                            ),
+                            source=self.baseline_evaluation_source,
+                        )
+                    )
+
+            if not create_context_cases:
                 continue
-            direction = EVALUATION_DIRECTIONS[stage]
-            for horizon_minutes in EVALUATION_HORIZONS_MINUTES:
+            for horizon_minutes in context_horizons:
                 cases.append(
                     ForwardEvaluationCase(
                         case_key=(
-                            f"{sample.entity_key}|{stage}|"
-                            f"{iso_utc(cutoff)}|{horizon_minutes}"
+                            f"{PRICE_CONTEXT_MODEL_VERSION}|{sample.entity_key}|"
+                            f"{context_stage}|{iso_utc(cutoff)}|{horizon_minutes}"
                         ),
                         entity_key=sample.entity_key,
-                        stage=stage,
-                        stage_label=str(sample.payload["stage_label"]),
-                        direction=direction,  # type: ignore[arg-type]
+                        stage=context_stage,
+                        stage_label=str(sample.payload["context_stage_label"]),
+                        direction=context_direction,  # type: ignore[arg-type]
                         signal_observed_at=sample.observed_at,
                         source_cutoff_at=cutoff,
                         horizon_minutes=horizon_minutes,
@@ -1627,11 +3090,13 @@ class BinanceAltcoinRadarMonitor:
         pending = tuple(cases)
         if not pending:
             return ()
-        incompatible = tuple(
-            case for case in pending if case.source != self.evaluation_source
-        )
+        supported_sources = {
+            self.evaluation_source,
+            self.baseline_evaluation_source,
+        }
+        incompatible = tuple(case for case in pending if case.source not in supported_sources)
         pending = tuple(
-            case for case in pending if case.source == self.evaluation_source
+            case for case in pending if case.source in supported_sources
         )
         resolved: list[ForwardEvaluationResult] = [
             self._unavailable_evaluation(
@@ -1710,8 +3175,7 @@ class BinanceAltcoinRadarMonitor:
     @staticmethod
     def _evaluation_range_limit(start_at: datetime, end_at: datetime) -> int:
         candle_count = math.ceil(
-            (end_at - start_at).total_seconds()
-            / (KLINE_INTERVAL_MINUTES * 60)
+            (end_at - start_at).total_seconds() / (KLINE_INTERVAL_MINUTES * 60)
         )
         return min(1000, max(1, candle_count + 2))
 
@@ -1763,16 +3227,20 @@ class BinanceAltcoinRadarMonitor:
                 reason_code="RADAR_EVALUATION_KLINES_UNAVAILABLE",
             )
         try:
-            entry_price = float(_decimal(
-                case.entry_price_text,
-                field="evaluation.entryPrice",
-                positive=True,
-            ))
-            benchmark_entry = float(_decimal(
-                case.benchmark_entry_price_text,
-                field="evaluation.benchmarkEntryPrice",
-                positive=True,
-            ))
+            entry_price = float(
+                _decimal(
+                    case.entry_price_text,
+                    field="evaluation.entryPrice",
+                    positive=True,
+                )
+            )
+            benchmark_entry = float(
+                _decimal(
+                    case.benchmark_entry_price_text,
+                    field="evaluation.benchmarkEntryPrice",
+                    positive=True,
+                )
+            )
         except ValueError:
             return self._unavailable_evaluation(
                 case,
@@ -1914,9 +3382,7 @@ class BinanceAltcoinRadarMonitor:
     ) -> CandidateEnrichment:
         issues: list[CollectionIssue] = []
         try:
-            candles = self.client.klines(
-                seed.symbol, limit=self.settings.kline_limit
-            )
+            candles = self.client.klines(seed.symbol, limit=self.settings.kline_limit)
             features = self._validated_features(seed.symbol, candles)
             self._append_malformed_issue(issues, seed.symbol, candles)
         except RadarSourceError as exc:
@@ -2080,6 +3546,7 @@ class BinanceAltcoinRadarMonitor:
         screened_size: int,
         analyzed_size: int,
         shortlist_size: int,
+        price_position: PricePositionFeatures | None,
     ) -> MetricSample:
         features = enrichment.features
         if features is None:
@@ -2107,11 +3574,11 @@ class BinanceAltcoinRadarMonitor:
             oi_change_15m_percent=enrichment.oi_change_15m_percent,
         )
         stage = str(scoring["stage"])
+        contextual_stage = classify_contextual_stage(stage, price_position)
         missing_reasons: dict[str, str] = {}
         if relative_return is None:
             missing_reasons["relative_return_15m_percent"] = (
-                "未取得 BTC 同期通过校验的闭合 K 线；"
-                "相对表现保持为空，未使用替代值。"
+                "未取得 BTC 同期通过校验的闭合 K 线；相对表现保持为空，未使用替代值。"
             )
             missing_reasons["benchmark_close_price"] = (
                 "未取得BTC同期通过校验的闭合K线；本轮不建立后续行情检验样本。"
@@ -2124,6 +3591,13 @@ class BinanceAltcoinRadarMonitor:
             missing_reasons["oi_change_15m_percent"] = (
                 "该币种没有连续、新鲜的 5m OI 历史；未使用当前 OI 代替变化率。"
             )
+        if price_position is None:
+            price_context_missing = (
+                "本轮未取得连续90根已闭合日线；价格位置保持为空，"
+                "综合状态只保留短线触发且不输出方向。"
+            )
+            missing_reasons["price_state_label"] = price_context_missing
+            missing_reasons["price_position_90d_percent"] = price_context_missing
 
         alert_score = float(scoring["alert_score"])
         payload = {
@@ -2138,16 +3612,60 @@ class BinanceAltcoinRadarMonitor:
             ),
             "stage": stage,
             "stage_label": STAGE_LABELS[stage],
-            "row_tone": STAGE_TONES[stage],
+            "context_stage": contextual_stage.stage,
+            "context_stage_label": contextual_stage.label,
+            "context_stage_group": contextual_stage.group,
+            "context_stage_group_label": CONTEXT_STAGE_GROUP_LABELS[
+                contextual_stage.group
+            ],
+            "context_stage_rank": contextual_stage.rank,
+            "context_stage_reason": contextual_stage.reason,
+            "context_direction": contextual_stage.direction,
+            "context_evaluation_horizons_minutes": list(
+                contextual_stage.evaluation_horizons_minutes
+            ),
+            "evaluation_target_label": contextual_stage.evaluation_target_label,
+            "price_context_model_version": PRICE_CONTEXT_MODEL_VERSION,
+            "price_context_price": (
+                _float_text(price_position.current_price, 12)
+                if price_position is not None
+                else None
+            ),
+            "price_context_price_at": (
+                iso_utc(features.cutoff_at) if price_position is not None else None
+            ),
+            "price_state": price_position.state if price_position is not None else None,
+            "price_state_label": (
+                price_position.state_label if price_position is not None else None
+            ),
+            "price_position_90d_percent": (
+                _float_text(price_position.position_90d_percent)
+                if price_position is not None
+                else None
+            ),
+            "price_return_7d_percent": (
+                _float_text(price_position.return_7d_percent)
+                if price_position is not None
+                else None
+            ),
+            "price_return_30d_percent": (
+                _float_text(price_position.return_30d_percent)
+                if price_position is not None
+                else None
+            ),
+            "price_daily_cutoff_at": (
+                iso_utc(price_position.daily_cutoff_at)
+                if price_position is not None
+                else None
+            ),
+            "row_tone": contextual_stage.row_tone,
             "review_window_label": STAGE_REVIEW_LABELS[stage],
             "alert_score": _float_text(alert_score, 3),
             "setup_score": _float_text(float(scoring["setup_score"]), 3),
             "pump_score": _float_text(float(scoring["pump_score"]), 3),
             "tail_risk_score": _float_text(float(scoring["tail_risk_score"]), 3),
             "return_15m_percent": _float_text(features.return_15m_percent),
-            "quote_volume_ratio_15m": _float_text(
-                features.quote_volume_ratio_15m
-            ),
+            "quote_volume_ratio_15m": _float_text(features.quote_volume_ratio_15m),
             "trade_count_ratio_15m": _float_text(features.trade_count_ratio_15m),
             "taker_buy_percent": _float_text(features.taker_buy_percent),
             "breakout_percent": _float_text(features.breakout_percent),
@@ -2160,9 +3678,7 @@ class BinanceAltcoinRadarMonitor:
             ),
             "relative_return_15m_percent": _float_text(relative_return),
             "funding_rate_percent": _float_text(funding_rate),
-            "oi_change_15m_percent": _float_text(
-                enrichment.oi_change_15m_percent
-            ),
+            "oi_change_15m_percent": _float_text(enrichment.oi_change_15m_percent),
             "evidence_label": _evidence_label(
                 stage,
                 features,
@@ -2178,7 +3694,8 @@ class BinanceAltcoinRadarMonitor:
                 else None
             ),
             "valid_until": iso_utc(
-                features.cutoff_at + timedelta(seconds=self.settings.kline_stale_seconds)
+                features.cutoff_at
+                + timedelta(seconds=self.settings.kline_stale_seconds)
             ),
             "missing_reasons": missing_reasons,
         }

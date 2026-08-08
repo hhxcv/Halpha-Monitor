@@ -4,6 +4,7 @@ const MONITOR_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const RADAR_MONITOR_ID = "binance-altcoin-radar";
 const RADAR_TAB_LOCATION_VALUES = {
   TABLE: "candidates",
+  POSITION: "position",
   HISTORY: "history",
   EVALUATION: "evaluation",
 };
@@ -44,6 +45,31 @@ const ui = {
   monitorTitle: document.querySelector("#monitor-title"),
   monitorDescription: document.querySelector("#monitor-description"),
   monitorMethodNote: document.querySelector("#monitor-method-note"),
+  btcIntelligence: document.querySelector("#btc-intelligence"),
+  btcCurrentPrice: document.querySelector("#btc-current-price"),
+  btcPriceState: document.querySelector("#btc-price-state"),
+  btcRegime: document.querySelector("#btc-regime"),
+  btcRegimeDetail: document.querySelector("#btc-regime-detail"),
+  btcClockStrip: document.querySelector("#btc-clock-strip"),
+  btcMonthlyTarget: document.querySelector("#btc-monthly-target"),
+  btcMonthlyFormed: document.querySelector("#btc-monthly-formed"),
+  btcMonthlyMetrics: document.querySelector("#btc-monthly-metrics"),
+  btcMonthlyNote: document.querySelector("#btc-monthly-note"),
+  btcDailyAgreement: document.querySelector("#btc-daily-agreement"),
+  btcDailyState: document.querySelector("#btc-daily-state"),
+  btcDailyComponents: document.querySelector("#btc-daily-components"),
+  btcDailyTransition: document.querySelector("#btc-daily-transition"),
+  btcStructureEnvironment: document.querySelector("#btc-structure-environment"),
+  btcStructureCutoff: document.querySelector("#btc-structure-cutoff"),
+  btcZoneBody: document.querySelector("#btc-zone-body"),
+  btcZoneEmpty: document.querySelector("#btc-zone-empty"),
+  btcSmartBody: document.querySelector("#btc-smart-body"),
+  btcSmartEmpty: document.querySelector("#btc-smart-empty"),
+  btcLedgerMetrics: document.querySelector("#btc-ledger-metrics"),
+  btcLedgerStart: document.querySelector("#btc-ledger-start"),
+  btcEventBody: document.querySelector("#btc-event-body"),
+  btcEventEmpty: document.querySelector("#btc-event-empty"),
+  btcInterpretation: document.querySelector("#btc-interpretation"),
   monitorState: document.querySelector("#monitor-state"),
   diagnosticsOpen: document.querySelector("#diagnostics-open"),
   diagnosticsOpenCount: document.querySelector("#diagnostics-open-count"),
@@ -62,6 +88,8 @@ const ui = {
   buybackStockSearch: document.querySelector("#buyback-stock-search"),
   eventSearchField: document.querySelector("#event-search-field"),
   eventSearch: document.querySelector("#event-search"),
+  radarPriceStateField: document.querySelector("#radar-price-state-field"),
+  radarPriceState: document.querySelector("#radar-price-state"),
   timeWindow: document.querySelector("#time-window"),
   dataCutoff: document.querySelector("#data-cutoff"),
   quoteScroll: document.querySelector("#quote-scroll"),
@@ -92,6 +120,7 @@ const ui = {
   eventHistoryCount: document.querySelector("#event-history-count"),
   radarViewTabs: document.querySelector("#radar-view-tabs"),
   radarTableTab: document.querySelector("#radar-table-tab"),
+  radarPositionTab: document.querySelector("#radar-position-tab"),
   radarHistoryTab: document.querySelector("#radar-history-tab"),
   radarEvaluationTab: document.querySelector("#radar-evaluation-tab"),
   eventAttentionRegion: document.querySelector("#event-attention-region"),
@@ -127,6 +156,11 @@ const ui = {
   evaluationTitle: document.querySelector("#evaluation-title"),
   evaluationMethodNote: document.querySelector("#evaluation-method-note"),
   evaluationOverview: document.querySelector("#evaluation-overview"),
+  evaluationComparison: document.querySelector("#evaluation-comparison"),
+  evaluationComparisonPeriod: document.querySelector("#evaluation-comparison-period"),
+  evaluationComparisonOverview: document.querySelector("#evaluation-comparison-overview"),
+  evaluationComparisonBody: document.querySelector("#evaluation-comparison-body"),
+  evaluationComparisonEmpty: document.querySelector("#evaluation-comparison-empty"),
   evaluationGroupBody: document.querySelector("#evaluation-group-body"),
   evaluationGroupEmpty: document.querySelector("#evaluation-group-empty"),
   evaluationRecentBody: document.querySelector("#evaluation-recent-body"),
@@ -205,6 +239,8 @@ const state = {
   eventSearchTimer: null,
   eventTab: "UPCOMING",
   radarTab: radarTabFromLocation(),
+  radarPriceState: "*",
+  viewPayload: null,
   eventHistoryPage: 1,
   marketEventPayload: null,
   buybackDetailEntityKey: null,
@@ -219,11 +255,12 @@ const TABLE_TEXT_COLLATOR = new Intl.Collator("zh-CN", {
 
 const BUYBACK_TABLE_PAGE_SIZE = 50;
 const MARKET_EVENT_TABLE_PAGE_SIZE = 50;
+const RADAR_POSITION_TABLE_PAGE_SIZE = 50;
 const MARKET_EVENT_HISTORY_PAGE_SIZE = 50;
 
 const MONITOR_COMPACT_LABELS = {
   "binance-c2c-normalized": "C2C",
-  "binance-usdm-smart-money": "合约",
+  "btc-market-intelligence": "BTC",
   "binance-altcoin-radar": "异动",
   "binance-btc-relationship": "BTC",
   "a-hk-buyback": "回购",
@@ -253,6 +290,24 @@ const ISSUE_REASON_LABELS = {
   SMART_MONEY_OI_STALE: "持仓量陈旧",
   SMART_MONEY_OVERVIEW_STALE: "仓位总览陈旧",
   SMART_MONEY_SCHEMA_CHANGED: "接口字段契约变化",
+  SMART_MONEY_COLLECTION_FAILED: "聪明钱采集隔离失败",
+  BTC_INTELLIGENCE_HTTP_BACKOFF_ACTIVE: "现货公开接口退避中",
+  BTC_INTELLIGENCE_HTTP_THROTTLED: "现货公开接口限流并退避",
+  BTC_INTELLIGENCE_UPSTREAM_HTTP_ERROR: "现货公开接口响应异常",
+  BTC_INTELLIGENCE_UPSTREAM_UNAVAILABLE: "现货公开接口暂时不可用",
+  BTC_INTELLIGENCE_RESPONSE_INVALID: "现货公开接口响应无法解析",
+  BTC_INTELLIGENCE_SOURCE_STALE: "现货闭合 K 线未更新到当前截止",
+  BTC_INTELLIGENCE_KLINES_NON_CONTIGUOUS: "现货闭合 K 线不连续",
+  BTC_INTELLIGENCE_KLINES_INSUFFICIENT: "现货闭合 K 线历史不足",
+  BTC_INTELLIGENCE_TICKER_FAILED: "现货参考价暂时不可用",
+  BTC_INTELLIGENCE_TICKER_SCHEMA_CHANGED: "现货参考价字段变化",
+  BTC_INTELLIGENCE_SERIES_COLLECTION_FAILED: "现货 K 线采集隔离失败",
+  BTC_INTELLIGENCE_KLINE_SCHEMA_CHANGED: "现货 K 线字段变化",
+  BTC_INTELLIGENCE_KLINES_DUPLICATE: "现货闭合 K 线重复",
+  BTC_INTELLIGENCE_KLINES_INVALID: "现货闭合 K 线数值无效",
+  BTC_INTELLIGENCE_RESPONSE_TOO_LARGE: "现货公开接口响应超过上限",
+  BTC_INTELLIGENCE_PAGINATION_STALLED: "现货 K 线分页没有前进",
+  BTC_STRUCTURE_EVENT_MISSED_DURING_DOWNTIME: "停机期间事件未作为前向预测入账",
   RADAR_BACKOFF_ACTIVE: "异动雷达退避中",
   RADAR_CANDIDATE_COLLECTION_FAILED: "候选详查失败",
   RADAR_FUTURES_ROWS_STALE: "合约数据陈旧",
@@ -262,6 +317,17 @@ const ISSUE_REASON_LABELS = {
   RADAR_KLINES_INSUFFICIENT: "闭合 K 线不足",
   RADAR_KLINES_NON_CONTIGUOUS: "闭合 K 线不连续",
   RADAR_KLINES_STALE: "闭合 K 线陈旧",
+  RADAR_DAILY_COLLECTION_FAILED: "日线价格位置采集失败",
+  RADAR_DAILY_COMPUTATION_INVALID: "日线价格位置计算失败",
+  RADAR_DAILY_HISTORY_INSUFFICIENT: "日线上市历史不足",
+  RADAR_DAILY_KLINES_EMPTY: "闭合日线为空",
+  RADAR_DAILY_KLINES_NON_CONTIGUOUS: "闭合日线不连续",
+  RADAR_DAILY_KLINES_SCHEMA_INVALID: "日线响应结构变化",
+  RADAR_DAILY_KLINES_STALE: "闭合日线未更新",
+  RADAR_DAILY_KLINES_UNAVAILABLE: "日线价格位置暂缺",
+  RADAR_DAILY_RANGE_INVALID: "日线请求范围无效",
+  RADAR_DAILY_SOURCE_ROWS_MALFORMED: "部分日线记录未通过校验",
+  RADAR_DAILY_SYMBOL_INVALID: "合约代码无效",
   RADAR_OI_EMPTY: "OI 历史为空",
   RADAR_OI_INSUFFICIENT: "OI 历史不足",
   RADAR_OI_STALE: "OI 历史陈旧",
@@ -332,6 +398,10 @@ const ISSUE_SCOPE_LABELS = {
   "fomc-calendar": "美联储议息日历",
   "bls-macro-data": "美国通胀与就业数据",
   "market-consensus": "本周市场一致预期",
+  "BTCUSDT:1d": "BTC Spot 日线",
+  "BTCUSDT:4h": "BTC Spot 4小时",
+  "BTCUSDT:spot-price": "BTC Spot 参考价",
+  "BTCUSDT:smart-money": "BTC 聪明钱",
 };
 
 const ISSUE_REASON_DETAILS = {
@@ -346,6 +416,24 @@ const ISSUE_REASON_DETAILS = {
   SMART_MONEY_OI_STALE: "官方 USDⓈ-M 持仓量时间超过允许阈值，未生成新特征",
   SMART_MONEY_OVERVIEW_STALE: "仓位总览更新时间陈旧，资金流特征保留但不使用总览字段",
   SMART_MONEY_SCHEMA_CHANGED: "未文档化接口的字段集合与预期契约不一致，未生成新特征",
+  SMART_MONEY_COLLECTION_FAILED: "聪明钱采集器发生未预期异常；该来源被隔离，月线、日线与 4 小时结构仍可独立更新。",
+  BTC_INTELLIGENCE_HTTP_BACKOFF_ACTIVE: "Binance Spot 公开接口仍在限流退避窗口，本轮没有继续请求。",
+  BTC_INTELLIGENCE_HTTP_THROTTLED: "Binance Spot 返回限流状态；采集器已经打开有界指数退避。",
+  BTC_INTELLIGENCE_UPSTREAM_HTTP_ERROR: "Binance Spot 公开接口没有返回成功响应；可用缓存仅在截止时间仍当前时使用。",
+  BTC_INTELLIGENCE_UPSTREAM_UNAVAILABLE: "连接 Binance Spot 公开接口失败；各来源独立隔离，聪明钱层仍可更新。",
+  BTC_INTELLIGENCE_RESPONSE_INVALID: "Binance Spot 响应无法按冻结字段契约解析，没有生成替代指标。",
+  BTC_INTELLIGENCE_SOURCE_STALE: "缓存或公开来源没有覆盖最新闭合周期，相关结构层保持不可用。",
+  BTC_INTELLIGENCE_KLINES_NON_CONTIGUOUS: "闭合 K 线时间轴存在缺口，本轮不产生正式状态或事件。",
+  BTC_INTELLIGENCE_KLINES_INSUFFICIENT: "历史长度不足以覆盖指标暖机与 1080 根因果枢轴窗口。",
+  BTC_INTELLIGENCE_TICKER_FAILED: "实时现货参考价读取失败；若 4h 数据当前，页面明确降级为最近闭合 4h 收盘。",
+  BTC_INTELLIGENCE_TICKER_SCHEMA_CHANGED: "现货参考价字段与冻结契约不符，没有猜测或替代字段。",
+  BTC_INTELLIGENCE_SERIES_COLLECTION_FAILED: "现货 K 线采集发生未预期异常；对应周期保持不可用，不沿用陈旧状态。",
+  BTC_INTELLIGENCE_KLINE_SCHEMA_CHANGED: "K 线记录不符合冻结的 Binance Spot 字段契约，本轮没有计算指标。",
+  BTC_INTELLIGENCE_KLINES_DUPLICATE: "闭合 K 线时间戳重复，本轮没有猜测重复记录的优先级。",
+  BTC_INTELLIGENCE_KLINES_INVALID: "K 线价格、成交量或时间关系未通过数值校验，本轮没有计算指标。",
+  BTC_INTELLIGENCE_RESPONSE_TOO_LARGE: "公开接口正文超过有界响应上限，采集已停止。",
+  BTC_INTELLIGENCE_PAGINATION_STALLED: "分页返回没有推进到更早的 K 线，采集已停止以避免无界循环。",
+  BTC_STRUCTURE_EVENT_MISSED_DURING_DOWNTIME: "事件在服务恢复时已经超过六根结果窗口，无法证明结果发生前已冻结，因此不计入前向账本。",
   RADAR_BACKOFF_ACTIVE: "Binance 上游退避窗口尚未结束，本轮没有继续发送公开行情请求",
   RADAR_CANDIDATE_COLLECTION_FAILED: "单个候选详查发生隔离失败，其他候选仍可展示",
   RADAR_FUTURES_ROWS_STALE: "资金费率来源时间超过有效截止点，相关字段保持为空",
@@ -355,6 +443,17 @@ const ISSUE_REASON_DETAILS = {
   RADAR_KLINES_INSUFFICIENT: "连续闭合 5 分钟 K 线少于计算窗口，未生成评分",
   RADAR_KLINES_NON_CONTIGUOUS: "K 线窗口存在空档，未插值或跨空档计算",
   RADAR_KLINES_STALE: "最近闭合 K 线超过有效截止点，未沿用旧数据",
+  RADAR_DAILY_COLLECTION_FAILED: "该合约的日线价格位置采集发生未分类失败，本轮不进入价格位置表。",
+  RADAR_DAILY_COMPUTATION_INVALID: "日线价格或区间无法形成有限值，本轮不生成价格位置。",
+  RADAR_DAILY_HISTORY_INSUFFICIENT: "连续闭合 UTC 日线不足 90 根，本轮不生成价格位置。",
+  RADAR_DAILY_KLINES_EMPTY: "公开接口没有返回已闭合 UTC 日线，本轮不生成价格位置。",
+  RADAR_DAILY_KLINES_NON_CONTIGUOUS: "日线序列存在断档，本轮不生成价格位置，也不跨空档计算。",
+  RADAR_DAILY_KLINES_SCHEMA_INVALID: "公开日线响应不符合预期结构，本轮不生成价格位置。",
+  RADAR_DAILY_KLINES_STALE: "最新闭合 UTC 日线未到达本轮截止日，本轮不生成价格位置。",
+  RADAR_DAILY_KLINES_UNAVAILABLE: "该合约本轮没有可用于价格位置的完整日线序列。",
+  RADAR_DAILY_RANGE_INVALID: "公开日线请求范围无法安全构造，本轮不生成价格位置。",
+  RADAR_DAILY_SOURCE_ROWS_MALFORMED: "少量来源行未通过数值与时间校验；表内只使用通过校验的闭合日线。",
+  RADAR_DAILY_SYMBOL_INVALID: "合约代码未通过本地格式校验，未向公开接口发送请求。",
   RADAR_OI_EMPTY: "同名 USDⓈ-M 合约没有返回 OI 历史",
   RADAR_OI_INSUFFICIENT: "OI 历史不足以计算 15 分钟变化率",
   RADAR_OI_STALE: "最新 OI 时间超过有效截止点，变化率保持为空",
@@ -456,6 +555,14 @@ function formatTime(value) {
   return `${rendered} UTC+8`;
 }
 
+function formatCadenceSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "未知周期";
+  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+  if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
+  return `${seconds} 秒`;
+}
+
 function formatDate(value) {
   if (!value) return "未知";
   const text = String(value);
@@ -538,6 +645,24 @@ function queryUrl() {
   return `/api/view?${params.toString()}`;
 }
 
+async function maintainForegroundObservation(monitor) {
+  const cadence = monitor?.collection_cadence;
+  if (
+    document.visibilityState !== "visible"
+    || !monitor?.enabled
+    || !cadence?.adaptive
+  ) return false;
+  try {
+    const response = await fetch(
+      `/api/monitors/${encodeURIComponent(monitor.monitor_id)}/observe`,
+      { method: "POST", headers: { Accept: "application/json" } },
+    );
+    return response.ok;
+  } catch (_error) {
+    return false;
+  }
+}
+
 async function loadView({ preserveSeries = true } = {}) {
   let nextRefreshMilliseconds = 15000;
   if (!preserveSeries) state.seriesKey = null;
@@ -557,6 +682,7 @@ async function loadView({ preserveSeries = true } = {}) {
       state.buybackStockQuery = "";
       state.eventQuery = "";
       state.radarTab = "TABLE";
+      state.radarPriceState = "*";
       state.tableSort = null;
       state.tablePage = 1;
       syncMonitorLocation(null);
@@ -591,8 +717,10 @@ async function loadView({ preserveSeries = true } = {}) {
     state.seriesKey = payload.selected_series_key;
     state.filters = payload.monitor.selected_filters;
     state.latestRunId = payload.monitor.latest_run?.run_id ?? null;
+    state.viewPayload = payload;
     syncMonitorLocation(state.monitorId);
     render(payload);
+    await maintainForegroundObservation(payload.monitor);
     if (state.pendingManualRefresh?.monitorId === state.monitorId) {
       const manualRunStarted = Number(payload.monitor.latest_run?.run_id ?? 0)
         > state.pendingManualRefresh.runAfter;
@@ -609,7 +737,9 @@ async function loadView({ preserveSeries = true } = {}) {
   } finally {
     ui.workspace.setAttribute("aria-busy", "false");
     clearTimeout(state.refreshTimer);
-    state.refreshTimer = setTimeout(() => loadView(), nextRefreshMilliseconds);
+    state.refreshTimer = document.visibilityState === "visible"
+      ? setTimeout(() => loadView(), nextRefreshMilliseconds)
+      : null;
   }
 }
 
@@ -617,13 +747,16 @@ function render(payload) {
   const isBuyback = payload.monitor.projection_kind === "buyback";
   const isMarketEvents = payload.monitor.projection_kind === "market_events";
   const isAltcoinRadar = payload.monitor.projection_kind === "altcoin_radar";
+  const isBtcIntelligence = payload.monitor.projection_kind === "btc_intelligence";
   ui.workspace.dataset.projectionKind = isBuyback
     ? "buyback"
     : isMarketEvents
       ? "market-events"
       : isAltcoinRadar
         ? "altcoin-radar"
-        : "time-series";
+        : isBtcIntelligence
+          ? "btc-intelligence"
+          : "time-series";
   renderGlobal(payload);
   renderMonitorList(payload.monitors);
   renderContext(payload.monitor);
@@ -637,9 +770,10 @@ function render(payload) {
   renderBuybackOverview(payload.buyback);
   renderBuybackSources(payload.buyback);
   renderMarketEvents(payload.market_events);
-  ui.historyRegion.hidden = isBuyback || isMarketEvents || isAltcoinRadar;
-  ui.historyWindowField.hidden = isBuyback || isMarketEvents || isAltcoinRadar;
-  ui.dataCutoff.hidden = isBuyback || isMarketEvents;
+  renderBtcIntelligence(payload.btc_intelligence);
+  ui.historyRegion.hidden = isBuyback || isMarketEvents || isAltcoinRadar || isBtcIntelligence;
+  ui.historyWindowField.hidden = isBuyback || isMarketEvents || isAltcoinRadar || isBtcIntelligence;
+  ui.dataCutoff.hidden = isBuyback || isMarketEvents || isBtcIntelligence;
   ui.quoteScroll.classList.toggle("buyback-table-scroll", isBuyback);
   ui.quoteScroll.classList.toggle("market-event-table-scroll", isMarketEvents);
   ui.quoteScroll.classList.toggle("radar-table-scroll", isAltcoinRadar);
@@ -653,18 +787,23 @@ function render(payload) {
           ? "USDⓈ-M 永续合约异动候选，可横向滚动"
           : "最新监控数据，可横向滚动",
   );
-  ui.quoteTableTitle.textContent = payload.buyback?.list_title
-    || payload.market_events?.list_title
-    || payload.monitor.table_title;
-  renderRunSummary(payload.run_summary);
-  renderTable(
-    payload.monitor.columns,
-    payload.rows,
-    payload.selected_series_key,
-    payload.current_issues,
-    payload.monitor.selected_filters,
-    payload.monitor.data_status,
-  );
+  renderRadarPriceFilter(payload.altcoin_price_position);
+  if (isAltcoinRadar) {
+    renderRadarTableView(payload);
+  } else {
+    ui.quoteTableTitle.textContent = payload.buyback?.list_title
+      || payload.market_events?.list_title
+      || payload.monitor.table_title;
+    renderRunSummary(payload.run_summary);
+    renderTable(
+      payload.monitor.columns,
+      payload.rows,
+      payload.selected_series_key,
+      payload.current_issues,
+      payload.monitor.selected_filters,
+      payload.monitor.data_status,
+    );
+  }
   renderHistory(
     payload.monitor.chart_title,
     payload.rows,
@@ -677,6 +816,236 @@ function render(payload) {
   renderIssues(payload.issues, payload.monitor);
   updateBackToTopVisibility();
   requestAnimationFrame(updateQuoteHorizontalScrollbar);
+}
+
+function btcNumber(value, maximumFractionDigits = 2) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "—";
+  return new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits,
+  }).format(numeric);
+}
+
+function btcSigned(value, suffix = "") {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "—";
+  const sign = numeric > 0 ? "+" : "";
+  return `${sign}${btcNumber(numeric, 2)}${suffix}`;
+}
+
+function btcMetric(label, value, detail = "") {
+  const group = document.createElement("div");
+  group.append(createElement("dt", "", label));
+  group.append(createElement("dd", "", value));
+  if (detail) group.append(createElement("small", "", detail));
+  return group;
+}
+
+function btcTableCell(row, text, className = "") {
+  row.append(createElement("td", className, text));
+}
+
+function renderBtcIntelligence(payload) {
+  const active = state.projectionKind === "btc_intelligence";
+  ui.btcIntelligence.hidden = !active;
+  if (!active) return;
+
+  const monthly = payload?.monthly || null;
+  const daily = payload?.daily || null;
+  const structure = payload?.structure || null;
+  const smartMoney = payload?.smart_money || null;
+  const monthlyLedger = payload?.monthly_ledger || null;
+  const ledger = payload?.ledger || null;
+  const regime = payload?.unified_regime || null;
+  const clocks = payload?.source_clocks || {};
+
+  ui.btcCurrentPrice.textContent = payload?.current_price
+    ? `$${btcNumber(payload.current_price, 2)}`
+    : "—";
+  const priceStateLabels = {
+    LIVE_SPOT_REFERENCE: "Binance Spot 即时参考 · 只用于距离显示",
+    CLOSED_4H_REFERENCE: "即时价不可用 · 使用最近闭合 4h 收盘",
+    UNAVAILABLE: "现货参考价不可用",
+  };
+  ui.btcPriceState.textContent = priceStateLabels[payload?.current_price_state]
+    || "等待现货参考价";
+  ui.btcRegime.textContent = regime?.label || "数据准备中";
+  ui.btcRegime.dataset.regime = regime?.code || "UNKNOWN";
+  ui.btcRegimeDetail.textContent = monthly && daily
+    ? `${monthly.official_target_label} · ${daily.state_label}`
+    : "月频与日频状态尚未同时可用";
+  ui.btcInterpretation.textContent = payload?.interpretation_limit
+    || "状态与研究目标不是买卖、仓位、杠杆、止损、止盈或跟单指令。";
+
+  ui.btcClockStrip.replaceChildren();
+  const sourceStateLabels = {
+    LIVE_SPOT_REFERENCE: "现货即时参考",
+    CLOSED_4H_REFERENCE: "最近 4 小时收盘",
+    FETCHED: "本轮已从公开源更新",
+    CACHE_CURRENT: "缓存已更新至截止点",
+    CACHE_CURRENT_AFTER_ERROR: "缓存已到截止点，本轮上游读取失败",
+    STALE: "来源落后于应有截止点",
+    FAILED: "来源当前不可用",
+    UNAVAILABLE: "当前不可用",
+    OBSERVED: "本轮已生成",
+  };
+  [
+    ["现货参考", payload?.current_price_at, payload?.current_price_state || "UNAVAILABLE"],
+    ["4h 闭合", clocks.four_hour_cutoff_at, clocks.four_hour_state || "UNAVAILABLE"],
+    ["日线闭合", clocks.daily_cutoff_at, clocks.daily_state || "UNAVAILABLE"],
+    ["快照生成", payload?.observed_at, "OBSERVED"],
+  ].forEach(([label, value, sourceState]) => {
+    const item = createElement("div", "btc-clock-item");
+    item.append(createElement("span", "", label));
+    item.append(createElement("strong", "", value ? formatTime(value) : "不可用"));
+    item.append(createElement("small", "", sourceStateLabels[sourceState] || "状态未识别"));
+    ui.btcClockStrip.append(item);
+  });
+
+  ui.btcMonthlyMetrics.replaceChildren();
+  if (monthly) {
+    ui.btcMonthlyTarget.textContent = monthly.official_target_label;
+    ui.btcMonthlyTarget.dataset.target = String(monthly.official_target);
+    ui.btcMonthlyFormed.textContent = `${monthly.formed_month} 完整月确认 · 本月内正式目标不变`;
+    ui.btcMonthlyMetrics.append(
+      btcMetric("月末确认边界", `$${btcNumber(monthly.current_boundary, 2)}`, `${monthly.current_month} 整月固定`),
+      btcMetric("现价距边界", btcSigned(monthly.distance_percent, "%"), `${btcSigned(monthly.distance_atr)} 日 ATR`),
+      btcMetric("日 ATR20", `$${btcNumber(monthly.daily_atr20, 2)}`, "20 日真实波幅简单均值"),
+      btcMetric("下次月末确认", formatTime(monthly.next_confirmation_at), "月首 00:01Z 仅为研究成交代理"),
+      btcMetric(
+        "前向月度记录",
+        monthlyLedger ? new Intl.NumberFormat("zh-CN").format(Number(monthlyLedger.signal_count || 0)) : "尚未初始化",
+        monthlyLedger ? `${monthlyLedger.execution_count || 0} 个执行代理已固定` : "只记录部署后及时冻结的月份",
+      ),
+      btcMetric(
+        "完整持有周期",
+        monthlyLedger ? new Intl.NumberFormat("zh-CN").format(Number(monthlyLedger.complete_long_cash_cycles || 0)) : "—",
+        "至少新增两个完整周期后才提升证据等级",
+      ),
+    );
+    ui.btcMonthlyNote.textContent = `${monthly.provisional_label}。这是月中预警，不是已经切换的正式目标。`;
+    ui.btcMonthlyNote.dataset.side = monthly.provisional_side;
+  } else {
+    ui.btcMonthlyTarget.textContent = "闭合日线历史暂不可用";
+    ui.btcMonthlyTarget.dataset.target = "UNKNOWN";
+    ui.btcMonthlyFormed.textContent = "不会用陈旧值或替代市场填充";
+    ui.btcMonthlyNote.textContent = "等待至少十个连续完整自然月。";
+  }
+
+  ui.btcDailyComponents.replaceChildren();
+  if (daily) {
+    ui.btcDailyAgreement.textContent = `${btcNumber(daily.agreement_percent, 0)}%`;
+    ui.btcDailyState.textContent = daily.state_label;
+    ui.btcDailyState.dataset.state = daily.state;
+    (daily.components || []).forEach((component) => {
+      const row = createElement("div", "btc-component-row");
+      const identity = createElement("div", "btc-component-identity");
+      identity.append(createElement("strong", "", `${component.window} 日`));
+      const badge = createElement(
+        "span",
+        component.active ? "btc-active-badge is-active" : "btc-active-badge",
+        component.active ? "激活" : "未激活",
+      );
+      identity.append(badge);
+      row.append(identity);
+      const boundary = createElement("div", "btc-component-boundary");
+      boundary.append(createElement("span", "", component.active ? "棘轮支撑" : "突破阻力"));
+      boundary.append(createElement("strong", "", `$${btcNumber(component.boundary, 2)}`));
+      boundary.append(createElement("small", "", `${btcSigned(component.distance_percent, "%")} 至边界`));
+      row.append(boundary);
+      ui.btcDailyComponents.append(row);
+    });
+    const transition = daily.latest_transition;
+    ui.btcDailyTransition.textContent = transition
+      ? `最近变化：${transition.window} 日组件 ${transition.from === "ACTIVE" ? "激活" : "未激活"} → ${transition.to === "ACTIVE" ? "激活" : "未激活"} · ${formatTime(transition.at)} · 触发边界 $${btcNumber(transition.trigger_boundary, 2)}`
+      : "当前可用历史内没有组件状态变化。";
+  } else {
+    ui.btcDailyAgreement.textContent = "—";
+    ui.btcDailyState.textContent = "闭合日线暂不可用";
+    ui.btcDailyTransition.textContent = "日频状态不会由盘中价格提前改变。";
+  }
+
+  ui.btcZoneBody.replaceChildren();
+  const roleLabels = { SUPPORT: "支撑", RESISTANCE: "阻力", TESTING: "测试中" };
+  const zones = structure?.zones || [];
+  zones.forEach((zone) => {
+    const row = document.createElement("tr");
+    const role = roleLabels[zone.role] || zone.role;
+    btcTableCell(row, `${role} · ${zone.lifecycle === "TESTING" ? "区间内" : "活跃"}`, `btc-zone-role is-${String(zone.role).toLowerCase()}`);
+    btcTableCell(row, `$${btcNumber(zone.lower, 2)} – $${btcNumber(zone.upper, 2)}`, "numeric");
+    btcTableCell(row, `${btcSigned(zone.distance_atr)} ATR`, "numeric");
+    btcTableCell(row, btcNumber(zone.strength, 2), "numeric");
+    btcTableCell(row, String(zone.anchor_count ?? "—"), "numeric");
+    btcTableCell(row, `${zone.age_bars ?? "—"} 根`, "numeric");
+    btcTableCell(row, formatTime(zone.formed_at));
+    btcTableCell(row, formatTime(zone.version_effective_at || zone.effective_at));
+    ui.btcZoneBody.append(row);
+  });
+  ui.btcZoneEmpty.hidden = zones.length > 0;
+  ui.btcStructureEnvironment.textContent = structure
+    ? `${structure.environment_label} · ADX ${btcNumber(structure.adx14, 1)}`
+    : "闭合 4h 结构暂不可用";
+  ui.btcStructureEnvironment.dataset.environment = structure?.environment || "UNKNOWN";
+  ui.btcStructureCutoff.textContent = structure?.source_cutoff_at
+    ? `截止 ${formatTime(structure.source_cutoff_at)} · ${structure.model_label}`
+    : "仅闭合 K 线产生正式结构";
+
+  ui.btcSmartBody.replaceChildren();
+  const smartRows = smartMoney?.rows || [];
+  smartRows.forEach((item) => {
+    const row = document.createElement("tr");
+    btcTableCell(row, item.time_range_label || item.time_range || "—");
+    btcTableCell(row, item.dominant_flow || "—");
+    btcTableCell(row, btcSigned(item.flow_imbalance_percent, "%"), "numeric");
+    btcTableCell(row, btcSigned(item.normalized_flow_percent, "%"), "numeric");
+    btcTableCell(row, btcSigned(item.whale_divergence_percent, "%"), "numeric");
+    btcTableCell(row, btcSigned(item.last_funding_rate_percent, "%"), "numeric");
+    btcTableCell(row, formatTime(item.latest_trade_at || item.observed_at));
+    ui.btcSmartBody.append(row);
+  });
+  ui.btcSmartEmpty.hidden = smartRows.length > 0;
+
+  ui.btcLedgerMetrics.replaceChildren();
+  if (ledger) {
+    ui.btcLedgerMetrics.append(
+      btcMetric("前向事件", new Intl.NumberFormat("zh-CN").format(Number(ledger.total_events || 0))),
+      btcMetric("待结算", new Intl.NumberFormat("zh-CN").format(Number(ledger.pending_events || 0))),
+      btcMetric("完整结果", new Intl.NumberFormat("zh-CN").format(Number(ledger.completed_events || 0))),
+      btcMetric("原始反应率", ledger.reaction_rate_percent == null ? "样本积累中" : `${btcNumber(ledger.reaction_rate_percent, 2)}%`, "未决保留在分母"),
+    );
+    const coverage = `${ledger.support_events || 0} 个支撑 / ${ledger.resistance_events || 0} 个阻力 · ${ledger.volatility_regimes?.length || 0} 种波动状态`;
+    const costResult = ledger.average_net_return_30bps_percent == null
+      ? "成本后结果等待完整样本"
+      : `30bp 后平均 ${btcSigned(ledger.average_net_return_30bps_percent, "%")} · 50bp 后平均 ${btcSigned(ledger.average_net_return_50bps_percent, "%")}`;
+    ui.btcLedgerStart.textContent = ledger.started_at
+      ? `前向账本始于 ${formatTime(ledger.started_at)} · ${coverage} · ${costResult} · 保留 ${ledger.retention_days} 天 / 最多 ${new Intl.NumberFormat("zh-CN").format(ledger.maximum_events)} 个事件。`
+      : "首次有效 4h 结构刷新后建立前向账本，不回填历史胜率。";
+  } else {
+    ui.btcLedgerMetrics.append(btcMetric("前向事件", "尚未初始化"));
+    ui.btcLedgerStart.textContent = "首次有效 4h 结构刷新后建立前向账本，不回填历史胜率。";
+  }
+
+  ui.btcEventBody.replaceChildren();
+  const eventStateLabels = {
+    PENDING: "待满 6 根",
+    REACTION: "反应",
+    BREAK: "突破",
+    UNRESOLVED: "六根内未决",
+  };
+  const events = ledger?.events || [];
+  events.forEach((event) => {
+    const signal = event.signal || {};
+    const row = document.createElement("tr");
+    btcTableCell(row, formatTime(event.event_at));
+    btcTableCell(row, roleLabels[signal.kind] || signal.kind || "—");
+    btcTableCell(row, `$${btcNumber(signal.zone_lower, 2)} – $${btcNumber(signal.zone_upper, 2)}`, "numeric");
+    btcTableCell(row, `$${btcNumber(signal.touch_close, 2)}`, "numeric");
+    btcTableCell(row, formatTime(signal.due_at));
+    btcTableCell(row, eventStateLabels[event.state] || event.state, `btc-event-state is-${String(event.state).toLowerCase()}`);
+    ui.btcEventBody.append(row);
+  });
+  ui.btcEventEmpty.hidden = events.length > 0;
 }
 
 const BUYBACK_SOURCE_SUMMARY_LABELS = {
@@ -1085,11 +1454,104 @@ function renderMarketEvents(eventPayload) {
   applyEventTabState();
 }
 
+function renderRadarPriceFilter(pricePayload) {
+  const choices = Array.isArray(pricePayload?.filter_choices)
+    ? pricePayload.filter_choices
+    : [];
+  const allowed = new Set(choices.map((choice) => choice.value));
+  if (!allowed.has(state.radarPriceState)) state.radarPriceState = "*";
+  const groupCounts = (pricePayload?.rows || []).reduce((counts, row) => {
+    const group = String(row.price_state_group || "NEUTRAL");
+    counts[group] = (counts[group] || 0) + 1;
+    return counts;
+  }, {});
+  ui.radarPriceState.replaceChildren();
+  choices.forEach((choice) => {
+    const option = document.createElement("option");
+    option.value = choice.value;
+    const count = choice.value === "*"
+      ? (pricePayload?.rows || []).length
+      : (groupCounts[choice.value] || 0);
+    option.textContent = `${choice.label}（${count}）`;
+    option.selected = choice.value === state.radarPriceState;
+    if (choice.description) option.title = choice.description;
+    ui.radarPriceState.append(option);
+  });
+  const selected = choices.find((choice) => choice.value === state.radarPriceState);
+  if (selected?.description) {
+    ui.radarPriceState.title = selected.description;
+    ui.radarPriceState.setAttribute("aria-description", selected.description);
+  } else {
+    ui.radarPriceState.removeAttribute("title");
+    ui.radarPriceState.removeAttribute("aria-description");
+  }
+  ui.radarPriceState.onchange = () => {
+    state.radarPriceState = ui.radarPriceState.value;
+    state.tablePage = 1;
+    renderRadarPriceFilter(state.viewPayload?.altcoin_price_position);
+    renderRadarTableView(state.viewPayload);
+    requestAnimationFrame(updateQuoteHorizontalScrollbar);
+  };
+}
+
+function renderRadarTableView(payload) {
+  if (!payload || payload.monitor?.projection_kind !== "altcoin_radar") return;
+  const showingPosition = state.radarTab === "POSITION";
+  if (!showingPosition) {
+    ui.quoteTableTitle.textContent = payload.monitor.table_title;
+    ui.quoteScroll.setAttribute(
+      "aria-label",
+      "USDⓈ-M 永续合约异动候选，可横向滚动",
+    );
+    ui.dataCutoff.hidden = false;
+    const cutoff = payload.monitor.data_run?.completed_at;
+    ui.dataCutoff.textContent = `${payload.monitor.data_status.cutoff_label}：${cutoff ? formatTime(cutoff) : "—"}`;
+    ui.dataCutoff.dataset.status = payload.monitor.data_status.tone;
+    renderRunSummary(payload.run_summary);
+    renderTable(
+      payload.monitor.columns,
+      payload.rows,
+      payload.selected_series_key,
+      payload.current_issues,
+      payload.monitor.selected_filters,
+      payload.monitor.data_status,
+    );
+    return;
+  }
+  const position = payload.altcoin_price_position || {};
+  const allRows = Array.isArray(position.rows) ? position.rows : [];
+  const rows = state.radarPriceState === "*"
+    ? allRows
+    : allRows.filter((row) => row.price_state_group === state.radarPriceState);
+  ui.quoteTableTitle.textContent = position.table_title || "日线价格位置";
+  ui.quoteScroll.setAttribute(
+    "aria-label",
+    "USDⓈ-M 永续合约日线价格位置，可横向滚动",
+  );
+  ui.dataCutoff.hidden = false;
+  ui.dataCutoff.textContent = position.price_cutoff_at
+    ? `当前价截至：${formatTime(position.price_cutoff_at)}`
+    : "当前价截至：—";
+  ui.dataCutoff.dataset.status = position.status === "CURRENT" ? "HEALTHY" : "STALE";
+  renderRunSummary(position.summary || []);
+  renderTable(
+    position.columns || [],
+    rows,
+    null,
+    [],
+    {},
+    { kind: position.status || "EMPTY" },
+  );
+  ui.quoteEmpty.textContent = position.empty_message
+    || "当前筛选没有匹配的价格状态。";
+}
+
 function applyRadarTabState() {
   const isAltcoinRadar = state.projectionKind === "altcoin_radar";
   ui.radarViewTabs.hidden = !isAltcoinRadar;
   ui.filters.hidden = false;
   if (!isAltcoinRadar) {
+    ui.radarPriceStateField.hidden = true;
     [ui.tableRegion, ui.historyRegion, ui.evaluationRegion].forEach((region) => {
       region.removeAttribute("role");
       region.removeAttribute("aria-labelledby");
@@ -1099,6 +1561,7 @@ function applyRadarTabState() {
 
   const tabs = {
     TABLE: ui.radarTableTab,
+    POSITION: ui.radarPositionTab,
     HISTORY: ui.radarHistoryTab,
     EVALUATION: ui.radarEvaluationTab,
   };
@@ -1109,21 +1572,36 @@ function applyRadarTabState() {
   });
 
   const showingTable = state.radarTab === "TABLE";
+  const showingPosition = state.radarTab === "POSITION";
   const showingHistory = state.radarTab === "HISTORY";
   const showingEvaluation = state.radarTab === "EVALUATION";
-  ui.tableRegion.hidden = !showingTable;
+  ui.tableRegion.hidden = !(showingTable || showingPosition);
   ui.historyRegion.hidden = !showingHistory;
   ui.evaluationRegion.hidden = !showingEvaluation;
   ui.filtersRegion.hidden = showingEvaluation;
-  ui.filters.hidden = !showingTable;
+  ui.filters.hidden = !(showingTable || showingPosition);
+  ui.filters.querySelectorAll(".dynamic-filter-field").forEach((field) => {
+    field.hidden = !showingTable;
+  });
+  ui.radarPriceStateField.hidden = !showingPosition;
   ui.historyWindowField.hidden = !showingHistory;
-  ui.monitorMethodNote.hidden = !showingTable || !ui.monitorMethodNote.textContent.trim();
+  const methodNote = showingPosition
+    ? String(state.viewPayload?.altcoin_price_position?.method_note || "")
+    : showingTable
+      ? String(state.viewPayload?.monitor?.method_note || "")
+      : "";
+  ui.monitorMethodNote.textContent = methodNote;
+  ui.monitorMethodNote.hidden = !methodNote;
 
   const panels = [
-    [ui.tableRegion, "radar-table-tab"],
     [ui.historyRegion, "radar-history-tab"],
     [ui.evaluationRegion, "radar-evaluation-tab"],
   ];
+  ui.tableRegion.setAttribute("role", "tabpanel");
+  ui.tableRegion.setAttribute(
+    "aria-labelledby",
+    showingPosition ? "radar-position-tab" : "radar-table-tab",
+  );
   panels.forEach(([region, labelledBy]) => {
     region.setAttribute("role", "tabpanel");
     region.setAttribute("aria-labelledby", labelledBy);
@@ -1137,8 +1615,10 @@ function applyRadarTabState() {
 function activateRadarTab(tab) {
   if (!Object.hasOwn(RADAR_TAB_LOCATION_VALUES, tab)) return;
   state.radarTab = tab;
+  state.tablePage = 1;
   syncMonitorLocation(state.monitorId);
   applyRadarTabState();
+  renderRadarTableView(state.viewPayload);
 }
 
 ui.eventUpcomingTab.addEventListener("click", () => {
@@ -1153,12 +1633,13 @@ ui.eventHistoryTab.addEventListener("click", () => {
 });
 
 ui.radarTableTab.addEventListener("click", () => activateRadarTab("TABLE"));
+ui.radarPositionTab.addEventListener("click", () => activateRadarTab("POSITION"));
 ui.radarHistoryTab.addEventListener("click", () => activateRadarTab("HISTORY"));
 ui.radarEvaluationTab.addEventListener("click", () => activateRadarTab("EVALUATION"));
 
 ui.radarViewTabs.addEventListener("keydown", (event) => {
   if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-  const order = ["TABLE", "HISTORY", "EVALUATION"];
+  const order = ["TABLE", "POSITION", "HISTORY", "EVALUATION"];
   const current = Math.max(0, order.indexOf(state.radarTab));
   const next = event.key === "Home"
     ? 0
@@ -1169,6 +1650,7 @@ ui.radarViewTabs.addEventListener("keydown", (event) => {
   activateRadarTab(order[next]);
   ({
     TABLE: ui.radarTableTab,
+    POSITION: ui.radarPositionTab,
     HISTORY: ui.radarHistoryTab,
     EVALUATION: ui.radarEvaluationTab,
   })[order[next]].focus();
@@ -1215,7 +1697,7 @@ function renderGlobal(payload) {
     : `近60秒请求 ${load.network_requests} 次`;
   ui.networkRequests.title = `${load.measured_monitor_count}/${load.enabled_count} 项启用监控已接入请求计数`;
   ui.collectionCadence.textContent = `计划 ${Number(load.planned_runs_per_minute).toFixed(1)} 轮/分`;
-  ui.collectionCadence.title = "按各启用监控的采集周期计算；一轮可能包含多个公开 HTTP 请求。";
+  ui.collectionCadence.title = "按各启用监控当前生效的前台或后台周期计算；一轮可能包含多个公开 HTTP 请求。";
   ui.lastRefresh.textContent = formatTime(load.latest_completed_at);
 }
 
@@ -1288,6 +1770,7 @@ function renderMonitorList(monitors) {
         buybackStockQuery: state.buybackStockQuery,
         eventQuery: state.eventQuery,
         radarTab: state.radarTab,
+        radarPriceState: state.radarPriceState,
         tableSort: state.tableSort,
         tablePage: state.tablePage,
         tableScrollLeft: ui.quoteScroll.scrollLeft,
@@ -1302,6 +1785,7 @@ function renderMonitorList(monitors) {
       state.buybackStockQuery = "";
       state.eventQuery = "";
       state.radarTab = "TABLE";
+      state.radarPriceState = "*";
       state.tableSort = null;
       state.tablePage = 1;
       ui.quoteScroll.scrollLeft = 0;
@@ -1312,6 +1796,7 @@ function renderMonitorList(monitors) {
         state.buybackStockQuery = previous.buybackStockQuery;
         state.eventQuery = previous.eventQuery;
         state.radarTab = previous.radarTab;
+        state.radarPriceState = previous.radarPriceState;
         state.tableSort = previous.tableSort;
         state.tablePage = previous.tablePage;
         ui.quoteScroll.scrollLeft = previous.tableScrollLeft;
@@ -1343,20 +1828,23 @@ function renderControl(monitor) {
   if (state.controlSubmitting) return;
   let showedManualResult = false;
   const isBuyback = monitor.projection_kind === "buyback";
+  const canManualRefresh = isBuyback || monitor.projection_kind === "btc_intelligence";
   const collecting = monitor.latest_run?.status === "RUNNING";
   const schedule = monitor.automatic_collection;
-  ui.monitorRefreshButton.hidden = !isBuyback;
+  ui.monitorRefreshButton.hidden = !canManualRefresh;
   ui.monitorRefreshButton.disabled = !monitor.enabled
     || collecting
     || state.manualRefreshSubmitting;
   ui.monitorRefreshButton.textContent = state.manualRefreshSubmitting
     ? "正在请求…"
-    : collecting && isBuyback
+    : collecting && canManualRefresh
       ? "正在刷新"
       : "手动刷新";
   ui.monitorRefreshButton.title = !monitor.enabled
     ? "请先开启监控"
-    : "无论当前是否处于交易时段，显式采集一次公开来源";
+    : isBuyback
+      ? "无论当前是否处于交易时段，显式采集一次公开来源"
+      : "显式刷新 BTC 公开市场情报";
   if (
     state.pendingManualRefresh?.monitorId === monitor.monitor_id
     && monitor.latest_run?.run_id > state.pendingManualRefresh.runAfter
@@ -1385,6 +1873,27 @@ function renderControl(monitor) {
     "aria-label",
     `${monitor.enabled ? "关闭" : "开启"}${monitor.display_name}`,
   );
+  const cadence = monitor.collection_cadence;
+  if (cadence?.adaptive) {
+    ui.monitorControlStatus.title = [
+      `后台 ${formatCadenceSeconds(cadence.background_interval_seconds)}`,
+      `页面可见 ${formatCadenceSeconds(cadence.foreground_interval_seconds)}`,
+    ].join("；");
+  } else {
+    ui.monitorControlStatus.title = "";
+  }
+  if (
+    cadence?.adaptive
+    && monitor.enabled
+    && !showedManualResult
+    && !state.pendingManualRefresh
+    && !state.manualRefreshSubmitting
+    && !state.pendingControl
+  ) {
+    ui.monitorControlStatus.textContent = cadence.foreground_active
+      ? `观察模式 · 每 ${formatCadenceSeconds(cadence.foreground_interval_seconds)}采集`
+      : `后台模式 · 每 ${formatCadenceSeconds(cadence.background_interval_seconds)}采集`;
+  }
   if (
     isBuyback
     && monitor.enabled
@@ -1967,9 +2476,19 @@ function tableSortValue(row, column) {
   return String(value);
 }
 
+function tableSortContext() {
+  return state.projectionKind === "altcoin_radar" && state.radarTab === "POSITION"
+    ? `${state.monitorId}:position`
+    : `${state.monitorId}:main`;
+}
+
 function sortTableRows(rows, columns) {
   const activeSort = state.tableSort;
-  if (!activeSort || activeSort.monitorId !== state.monitorId) return [...rows];
+  if (
+    !activeSort
+    || activeSort.monitorId !== state.monitorId
+    || activeSort.context !== tableSortContext()
+  ) return [...rows];
   const column = columns.find((item) => item.key === activeSort.columnKey);
   if (!column) return [...rows];
   return rows
@@ -1993,6 +2512,7 @@ function sortTableRows(rows, columns) {
 function nextSortDirection(columnKey) {
   if (
     state.tableSort?.monitorId === state.monitorId
+    && state.tableSort.context === tableSortContext()
     && state.tableSort.columnKey === columnKey
   ) {
     return state.tableSort.direction === "ascending" ? "descending" : "ascending";
@@ -2001,7 +2521,9 @@ function nextSortDirection(columnKey) {
 }
 
 function buybackTablePage(totalRows) {
-  if (!["buyback", "market_events"].includes(state.projectionKind)) {
+  const isRadarPosition = state.projectionKind === "altcoin_radar"
+    && state.radarTab === "POSITION";
+  if (!["buyback", "market_events"].includes(state.projectionKind) && !isRadarPosition) {
     return {
       enabled: false,
       page: 1,
@@ -2013,7 +2535,9 @@ function buybackTablePage(totalRows) {
   }
   const pageSize = state.projectionKind === "market_events"
     ? MARKET_EVENT_TABLE_PAGE_SIZE
-    : BUYBACK_TABLE_PAGE_SIZE;
+    : isRadarPosition
+      ? RADAR_POSITION_TABLE_PAGE_SIZE
+      : BUYBACK_TABLE_PAGE_SIZE;
   const pageCount = Math.max(1, Math.ceil(totalRows / pageSize));
   state.tablePage = Math.min(Math.max(Number(state.tablePage) || 1, 1), pageCount);
   const start = (state.tablePage - 1) * pageSize;
@@ -2078,7 +2602,10 @@ function updateQuoteHorizontalScrollbar() {
   const tableContinuesBelowViewport = rect.bottom > viewportHeight + 1;
   const tableHasEnteredViewport = rect.top < viewportHeight - 18;
   const usesPageLengthTable = state.projectionKind === "buyback"
-    || (state.projectionKind === "altcoin_radar" && state.radarTab === "TABLE");
+    || (
+      state.projectionKind === "altcoin_radar"
+      && ["TABLE", "POSITION"].includes(state.radarTab)
+    );
   const shouldShow = usesPageLengthTable
     && hasHorizontalOverflow
     && visibleWidth > 0
@@ -2103,7 +2630,10 @@ ui.quoteScroll.addEventListener("scroll", () => {
 
 ui.quoteScroll.addEventListener("wheel", (event) => {
   const usesPageLengthTable = state.projectionKind === "buyback"
-    || (state.projectionKind === "altcoin_radar" && state.radarTab === "TABLE");
+    || (
+      state.projectionKind === "altcoin_radar"
+      && ["TABLE", "POSITION"].includes(state.radarTab)
+    );
   if (!usesPageLengthTable) return;
   if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
   const documentHeight = document.documentElement.scrollHeight;
@@ -2129,7 +2659,7 @@ ui.quoteHorizontalScrollbar.addEventListener("scroll", () => {
 function marketDestination(row) {
   if (state.monitorId !== RADAR_MONITOR_ID) return null;
   const symbol = String(row.symbol || "").toUpperCase();
-  if (!/^[A-Z0-9]{1,24}USDT$/.test(symbol)) return null;
+  if (!/^[\p{L}\p{N}]{1,56}USDT$/u.test(symbol)) return null;
   return {
     url: `https://www.binance.com/zh-CN/futures/${encodeURIComponent(symbol)}`,
     label: "Binance USDⓈ-M 永续合约行情",
@@ -2171,6 +2701,7 @@ function renderTable(
     th.scope = "col";
     th.dataset.kind = column.kind;
     const active = state.tableSort?.monitorId === state.monitorId
+      && state.tableSort.context === tableSortContext()
       && state.tableSort.columnKey === column.key;
     const direction = active ? state.tableSort.direction : null;
     th.ariaSort = direction || "none";
@@ -2206,6 +2737,7 @@ function renderTable(
     button.addEventListener("click", () => {
       state.tableSort = {
         monitorId: state.monitorId,
+        context: tableSortContext(),
         columnKey: column.key,
         direction: nextSortDirection(column.key),
       };
@@ -2482,6 +3014,30 @@ function renderTable(
         scale.dataset.status = row.scale_status || "MISSING";
         scale.title = row.scale_reason || "";
         td.append(scale);
+      } else if (
+        state.projectionKind === "altcoin_radar"
+        && column.key === "price_state_label"
+      ) {
+        const badge = createElement(
+          "span",
+          "radar-price-state",
+          row.price_state_label || "区间中部",
+        );
+        badge.dataset.state = row.price_state || "MID_RANGE";
+        badge.title = row.state_reason || row.context_stage_reason || "";
+        td.append(badge);
+      } else if (
+        state.projectionKind === "altcoin_radar"
+        && column.key === "context_stage_label"
+      ) {
+        const badge = createElement(
+          "span",
+          "radar-context-stage",
+          row.context_stage_label || "等待位置确认",
+        );
+        badge.dataset.group = row.context_stage_group || "WATCHING";
+        badge.title = row.context_stage_reason || "";
+        td.append(badge);
       } else if (rendered.missing) {
         td.textContent = rendered.text;
         td.dataset.missing = "true";
@@ -2500,7 +3056,20 @@ function renderTable(
         externalIcon.setAttribute("aria-hidden", "true");
         td.append(externalIcon);
       } else {
-        td.textContent = rendered.text;
+        if (
+          state.projectionKind === "altcoin_radar"
+          && state.radarTab === "POSITION"
+          && column.kind === "percent"
+          && column.key.startsWith("return_")
+          && Number.isFinite(Number(row[column.key]))
+        ) {
+          const value = createElement("span", "radar-price-change", rendered.text);
+          const numeric = Number(row[column.key]);
+          value.dataset.direction = numeric > 0 ? "UP" : numeric < 0 ? "DOWN" : "FLAT";
+          td.append(value);
+        } else {
+          td.textContent = rendered.text;
+        }
         if (
           state.projectionKind === "buyback"
           && column.kind === "percent"
@@ -2961,6 +3530,13 @@ function evaluationPercent(value) {
   return `${numeric >= 0 ? "+" : ""}${numeric.toFixed(4)}%`;
 }
 
+function evaluationComparisonRate(value, sampleCount, minimumSamples) {
+  if (value === null || value === undefined) {
+    return `样本积累中（${sampleCount}/${minimumSamples}）`;
+  }
+  return `${Number(value).toFixed(1)}%`;
+}
+
 function appendEvaluationCell(row, text, { numeric = false } = {}) {
   const cell = createElement("td", numeric ? "evaluation-number" : "", text);
   row.append(cell);
@@ -2970,6 +3546,9 @@ function renderEvaluation(evaluation) {
   if (!evaluation) {
     ui.evaluationRegion.hidden = true;
     ui.evaluationOverview.replaceChildren();
+    ui.evaluationComparison.hidden = true;
+    ui.evaluationComparisonOverview.replaceChildren();
+    ui.evaluationComparisonBody.replaceChildren();
     ui.evaluationGroupBody.replaceChildren();
     ui.evaluationRecentBody.replaceChildren();
     return;
@@ -2994,6 +3573,97 @@ function renderEvaluation(evaluation) {
     group.append(createElement("dd", "", String(value)));
     ui.evaluationOverview.append(group);
   });
+
+  const comparison = evaluation.comparison;
+  ui.evaluationComparison.hidden = !comparison;
+  ui.evaluationComparisonOverview.replaceChildren();
+  ui.evaluationComparisonBody.replaceChildren();
+  if (comparison) {
+    const minimumSamples = Number(evaluation.minimum_group_samples);
+    const sampleCount = Number(comparison.sample_count);
+    const comparisonItems = [
+      ["同批完成", sampleCount],
+      [
+        "融合 / 原规则一致",
+        comparison.primary_agreement_rate_percent === null
+          ? `样本积累中（${sampleCount}/${minimumSamples}）`
+          : `${Number(comparison.primary_agreement_rate_percent).toFixed(1)}% / ${Number(comparison.baseline_agreement_rate_percent).toFixed(1)}%`,
+      ],
+      [
+        "融合 / 原规则相反",
+        comparison.primary_opposed_rate_percent === null
+          ? `样本积累中（${sampleCount}/${minimumSamples}）`
+          : `${Number(comparison.primary_opposed_rate_percent).toFixed(1)}% / ${Number(comparison.baseline_opposed_rate_percent).toFixed(1)}%`,
+      ],
+      [
+        "一致率变化",
+        comparison.agreement_change_percentage_points === null
+          ? "等待足够样本"
+          : `${Number(comparison.agreement_change_percentage_points) >= 0 ? "+" : ""}${Number(comparison.agreement_change_percentage_points).toFixed(1)} 个百分点`,
+      ],
+    ];
+    comparisonItems.forEach(([label, value]) => {
+      const group = document.createElement("div");
+      group.append(createElement("dt", "", label));
+      group.append(createElement("dd", "", String(value)));
+      ui.evaluationComparisonOverview.append(group);
+    });
+    ui.evaluationComparisonPeriod.textContent = comparison.first_cutoff_at
+      ? `同批比较从 ${formatTime(comparison.first_cutoff_at)} 开始，结果截至 ${formatTime(comparison.last_outcome_at)}。`
+      : "新规则启用后，将只比较同一币种、同一信号截止和同一期限的实际结果。";
+    comparison.groups.forEach((group) => {
+      const row = document.createElement("tr");
+      row.className = "evaluation-row";
+      appendEvaluationCell(row, group.stage_label);
+      appendEvaluationCell(row, evaluationHorizonLabel(group.horizon_minutes));
+      appendEvaluationCell(row, String(group.sample_count), { numeric: true });
+      appendEvaluationCell(
+        row,
+        evaluationComparisonRate(
+          group.primary_agreement_rate_percent,
+          group.sample_count,
+          minimumSamples,
+        ),
+        { numeric: group.primary_agreement_rate_percent !== null },
+      );
+      appendEvaluationCell(
+        row,
+        evaluationComparisonRate(
+          group.baseline_agreement_rate_percent,
+          group.sample_count,
+          minimumSamples,
+        ),
+        { numeric: group.baseline_agreement_rate_percent !== null },
+      );
+      appendEvaluationCell(
+        row,
+        group.agreement_change_percentage_points === null
+          ? "—"
+          : `${Number(group.agreement_change_percentage_points) >= 0 ? "+" : ""}${Number(group.agreement_change_percentage_points).toFixed(1)} 个百分点`,
+        { numeric: group.agreement_change_percentage_points !== null },
+      );
+      appendEvaluationCell(
+        row,
+        evaluationComparisonRate(
+          group.primary_opposed_rate_percent,
+          group.sample_count,
+          minimumSamples,
+        ),
+        { numeric: group.primary_opposed_rate_percent !== null },
+      );
+      appendEvaluationCell(
+        row,
+        evaluationComparisonRate(
+          group.baseline_opposed_rate_percent,
+          group.sample_count,
+          minimumSamples,
+        ),
+        { numeric: group.baseline_opposed_rate_percent !== null },
+      );
+      ui.evaluationComparisonBody.append(row);
+    });
+    ui.evaluationComparisonEmpty.hidden = comparison.groups.length > 0;
+  }
 
   ui.evaluationGroupBody.replaceChildren();
   evaluation.groups.forEach((group) => {
@@ -3441,6 +4111,8 @@ ui.diagnosticsDialog.addEventListener("click", (event) => {
 });
 
 document.addEventListener("visibilitychange", () => {
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = null;
   if (document.visibilityState === "visible") loadView();
 });
 

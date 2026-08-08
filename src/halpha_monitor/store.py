@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -15,18 +16,25 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from halpha_monitor.contracts import (
+    BtcMonthlyResearchRevision,
+    BtcStructureEventRevision,
     BuybackEvidenceDocument,
     CollectionBatch,
     ForwardEvaluationCase,
+    ProjectionSnapshot,
 )
 
 
 RunStatus = Literal["RUNNING", "SUCCESS", "PARTIAL", "FAILED"]
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
+MAX_PROJECTION_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_BUYBACK_DOCUMENT_BYTES = 20 * 1024 * 1024
 DEFAULT_BUYBACK_RETENTION_DAYS = 1095
 DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MARKET_EVENT_RETENTION_DAYS = 1095
+DEFAULT_BTC_STRUCTURE_RETENTION_DAYS = 1825
+DEFAULT_BTC_STRUCTURE_MAX_EVENTS = 20_000
+DEFAULT_BTC_MONTHLY_MAX_SIGNALS = 240
 BUYBACK_DOCUMENT_SUFFIXES = frozenset({".pdf", ".xls", ".xlsx", ".json", ".html"})
 BUYBACK_REVIEW_EVENT_TYPES = frozenset(
     {
@@ -108,6 +116,16 @@ class StoredArtifact:
     response_sha256: str
     record_count: int | None
     response_body: str
+
+
+@dataclass(frozen=True)
+class StoredProjectionSnapshot:
+    monitor_id: str
+    snapshot_key: str
+    run_id: int
+    observed_at: datetime
+    cutoff_at: datetime
+    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -234,6 +252,54 @@ class StoredMarketEventRevision:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class StoredBtcStructureHistory:
+    monitor_id: str
+    started_at: datetime
+    processed_through_at: datetime
+    algorithm_version: str
+    last_run_id: int
+
+
+@dataclass(frozen=True)
+class StoredBtcStructureEventRevision:
+    revision_id: int
+    revision_no: int
+    monitor_id: str
+    event_key: str
+    event_at: datetime
+    observed_at: datetime
+    state: str
+    payload_sha256: str
+    payload: dict[str, Any]
+    source_run_id: int
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class StoredBtcMonthlyResearchHistory:
+    monitor_id: str
+    started_at: datetime
+    processed_through_at: datetime
+    algorithm_version: str
+    last_run_id: int
+
+
+@dataclass(frozen=True)
+class StoredBtcMonthlyResearchRevision:
+    revision_id: int
+    revision_no: int
+    monitor_id: str
+    signal_key: str
+    signal_at: datetime
+    observed_at: datetime
+    state: str
+    payload_sha256: str
+    payload: dict[str, Any]
+    source_run_id: int
+    created_at: datetime
+
+
 class SQLiteMonitorStore:
     """One SQLite database with WAL and short, atomic write transactions."""
 
@@ -244,6 +310,8 @@ class SQLiteMonitorStore:
         buyback_retention_days: int = DEFAULT_BUYBACK_RETENTION_DAYS,
         buyback_evidence_max_bytes: int = DEFAULT_BUYBACK_EVIDENCE_MAX_BYTES,
         market_event_retention_days: int = DEFAULT_MARKET_EVENT_RETENTION_DAYS,
+        btc_structure_retention_days: int = DEFAULT_BTC_STRUCTURE_RETENTION_DAYS,
+        btc_structure_max_events: int = DEFAULT_BTC_STRUCTURE_MAX_EVENTS,
     ) -> None:
         if buyback_retention_days < 1:
             raise ValueError("buyback_retention_days must be positive")
@@ -251,10 +319,16 @@ class SQLiteMonitorStore:
             raise ValueError("buyback_evidence_max_bytes must be positive")
         if market_event_retention_days < 1:
             raise ValueError("market_event_retention_days must be positive")
+        if btc_structure_retention_days < 1:
+            raise ValueError("btc_structure_retention_days must be positive")
+        if btc_structure_max_events < 1:
+            raise ValueError("btc_structure_max_events must be positive")
         self.path = path.resolve()
         self.buyback_retention_days = buyback_retention_days
         self.buyback_evidence_max_bytes = buyback_evidence_max_bytes
         self.market_event_retention_days = market_event_retention_days
+        self.btc_structure_retention_days = btc_structure_retention_days
+        self.btc_structure_max_events = btc_structure_max_events
         self.buyback_evidence_root = self.path.parent / "evidence" / "buyback"
 
     @contextmanager
@@ -354,6 +428,20 @@ class SQLiteMonitorStore:
                     ON monitor_artifact (
                         monitor_id, artifact_key, response_completed_at DESC
                     );
+
+                CREATE TABLE IF NOT EXISTS monitor_projection_snapshot (
+                    monitor_id TEXT NOT NULL,
+                    snapshot_key TEXT NOT NULL,
+                    run_id INTEGER NOT NULL
+                        REFERENCES monitor_run(run_id) ON DELETE CASCADE,
+                    observed_at TEXT NOT NULL,
+                    cutoff_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (monitor_id, snapshot_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS monitor_projection_snapshot_run_idx
+                    ON monitor_projection_snapshot (run_id);
 
                 CREATE TABLE IF NOT EXISTS monitor_configuration (
                     monitor_id TEXT PRIMARY KEY,
@@ -553,6 +641,80 @@ class SQLiteMonitorStore:
                     ON market_event_revision (
                         monitor_id, scheduled_at DESC, revision_id DESC
                     );
+
+                CREATE TABLE IF NOT EXISTS btc_structure_history_state (
+                    monitor_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    processed_through_at TEXT NOT NULL,
+                    algorithm_version TEXT NOT NULL,
+                    last_run_id INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS btc_structure_event_revision (
+                    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    monitor_id TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    revision_no INTEGER NOT NULL CHECK (revision_no > 0),
+                    event_at TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('PENDING', 'REACTION', 'BREAK', 'UNRESOLVED')
+                    ),
+                    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+                    payload_json TEXT NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (monitor_id, event_key, revision_no),
+                    UNIQUE (monitor_id, event_key, payload_sha256)
+                );
+
+                CREATE INDEX IF NOT EXISTS btc_structure_event_latest_idx
+                    ON btc_structure_event_revision (
+                        monitor_id, event_key, revision_no DESC
+                    );
+                CREATE INDEX IF NOT EXISTS btc_structure_event_time_idx
+                    ON btc_structure_event_revision (
+                        monitor_id, event_at DESC, revision_id DESC
+                    );
+                CREATE INDEX IF NOT EXISTS btc_structure_event_state_idx
+                    ON btc_structure_event_revision (
+                        monitor_id, state, event_at DESC
+                    );
+
+                CREATE TABLE IF NOT EXISTS btc_monthly_research_history_state (
+                    monitor_id TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    processed_through_at TEXT NOT NULL,
+                    algorithm_version TEXT NOT NULL,
+                    last_run_id INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS btc_monthly_research_revision (
+                    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    monitor_id TEXT NOT NULL,
+                    signal_key TEXT NOT NULL,
+                    revision_no INTEGER NOT NULL CHECK (revision_no > 0),
+                    signal_at TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('SIGNAL_FROZEN', 'EXECUTION_CAPTURED')
+                    ),
+                    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+                    payload_json TEXT NOT NULL,
+                    source_run_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (monitor_id, signal_key, revision_no),
+                    UNIQUE (monitor_id, signal_key, payload_sha256)
+                );
+
+                CREATE INDEX IF NOT EXISTS btc_monthly_research_latest_idx
+                    ON btc_monthly_research_revision (
+                        monitor_id, signal_key, revision_no DESC
+                    );
+                CREATE INDEX IF NOT EXISTS btc_monthly_research_time_idx
+                    ON btc_monthly_research_revision (
+                        monitor_id, signal_at DESC, revision_id DESC
+                    );
                 """
             )
             interrupted = connection.execute(
@@ -727,12 +889,7 @@ class SQLiteMonitorStore:
                 if existing[0].body != document.body:
                     raise RuntimeError("BUYBACK_DOCUMENT_HASH_COLLISION")
                 continue
-            relative = (
-                Path("evidence")
-                / "buyback"
-                / digest[:2]
-                / f"{digest}{suffix}"
-            )
+            relative = Path("evidence") / "buyback" / digest[:2] / f"{digest}{suffix}"
             prepared[digest] = (document, relative.as_posix())
 
         if not prepared:
@@ -876,8 +1033,13 @@ class SQLiteMonitorStore:
         )
         has_current_result = bool(
             batch.samples
+            or batch.projection_snapshots
             or batch.buyback_source_observations
             or batch.market_event_revisions
+            or batch.btc_structure_history is not None
+            or batch.btc_structure_event_revisions
+            or batch.btc_monthly_research_history is not None
+            or batch.btc_monthly_research_revisions
         )
         status: RunStatus = (
             "FAILED"
@@ -982,8 +1144,18 @@ class SQLiteMonitorStore:
                         ),
                     ),
                 )
+            for snapshot in batch.projection_snapshots:
+                self._upsert_projection_snapshot(
+                    connection,
+                    run_id=run_id,
+                    monitor_id=monitor_id,
+                    snapshot=snapshot,
+                )
             for observation in batch.buyback_source_observations:
-                if observation.record_count is not None and observation.record_count < 0:
+                if (
+                    observation.record_count is not None
+                    and observation.record_count < 0
+                ):
                     raise RuntimeError("BUYBACK_SOURCE_RECORD_COUNT_INVALID")
                 connection.execute(
                     """
@@ -1043,7 +1215,9 @@ class SQLiteMonitorStore:
                     sort_keys=True,
                     separators=(",", ":"),
                 )
-                payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+                payload_sha256 = hashlib.sha256(
+                    payload_json.encode("utf-8")
+                ).hexdigest()
                 duplicate = connection.execute(
                     """
                     SELECT 1
@@ -1098,8 +1272,7 @@ class SQLiteMonitorStore:
                     )
             if batch.market_event_revisions:
                 history_started = min(
-                    revision.observed_at
-                    for revision in batch.market_event_revisions
+                    revision.observed_at for revision in batch.market_event_revisions
                 )
                 connection.execute(
                     """
@@ -1192,6 +1365,218 @@ class SQLiteMonitorStore:
                             run_id,
                             completed_text,
                         ),
+                    )
+            if batch.btc_structure_history is not None:
+                history = batch.btc_structure_history
+                if (
+                    not history.algorithm_version
+                    or len(history.algorithm_version) > 128
+                ):
+                    raise RuntimeError("BTC_STRUCTURE_HISTORY_INVALID")
+                connection.execute(
+                    """
+                    INSERT INTO btc_structure_history_state (
+                        monitor_id, started_at, processed_through_at,
+                        algorithm_version, last_run_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(monitor_id) DO NOTHING
+                    """,
+                    (
+                        monitor_id,
+                        iso_utc(history.started_at),
+                        iso_utc(history.processed_through_at),
+                        history.algorithm_version,
+                        run_id,
+                    ),
+                )
+                stored_history = connection.execute(
+                    """
+                    SELECT started_at, processed_through_at, algorithm_version
+                    FROM btc_structure_history_state
+                    WHERE monitor_id = ?
+                    """,
+                    (monitor_id,),
+                ).fetchone()
+                if stored_history is None:
+                    raise RuntimeError("BTC_STRUCTURE_HISTORY_MISSING")
+                if (
+                    str(stored_history["algorithm_version"])
+                    != history.algorithm_version
+                ):
+                    if history.started_at < parse_utc(
+                        str(stored_history["processed_through_at"])
+                    ):
+                        raise RuntimeError("BTC_STRUCTURE_VERSION_START_INVALID")
+                    connection.execute(
+                        """
+                        UPDATE btc_structure_history_state
+                        SET started_at = ?, processed_through_at = ?,
+                            algorithm_version = ?, last_run_id = ?
+                        WHERE monitor_id = ?
+                        """,
+                        (
+                            iso_utc(history.started_at),
+                            iso_utc(history.processed_through_at),
+                            history.algorithm_version,
+                            run_id,
+                            monitor_id,
+                        ),
+                    )
+                    stored_history = connection.execute(
+                        """
+                        SELECT started_at, processed_through_at, algorithm_version
+                        FROM btc_structure_history_state
+                        WHERE monitor_id = ?
+                        """,
+                        (monitor_id,),
+                    ).fetchone()
+                    if stored_history is None:
+                        raise RuntimeError("BTC_STRUCTURE_HISTORY_MISSING")
+                stored_processed = parse_utc(
+                    str(stored_history["processed_through_at"])
+                )
+                if history.processed_through_at > stored_processed:
+                    connection.execute(
+                        """
+                        UPDATE btc_structure_history_state
+                        SET processed_through_at = ?, last_run_id = ?
+                        WHERE monitor_id = ?
+                        """,
+                        (
+                            iso_utc(history.processed_through_at),
+                            run_id,
+                            monitor_id,
+                        ),
+                    )
+            if batch.btc_structure_event_revisions:
+                history_row = connection.execute(
+                    """
+                    SELECT started_at, algorithm_version
+                    FROM btc_structure_history_state
+                    WHERE monitor_id = ?
+                    """,
+                    (monitor_id,),
+                ).fetchone()
+                if history_row is None:
+                    raise RuntimeError("BTC_STRUCTURE_HISTORY_MISSING")
+                history_started_at = parse_utc(str(history_row["started_at"]))
+                history_algorithm_version = str(history_row["algorithm_version"])
+                for revision in batch.btc_structure_event_revisions:
+                    self._insert_btc_structure_revision(
+                        connection,
+                        run_id=run_id,
+                        monitor_id=monitor_id,
+                        history_started_at=history_started_at,
+                        history_algorithm_version=history_algorithm_version,
+                        revision=revision,
+                        created_at=completed_text,
+                    )
+            if batch.btc_monthly_research_history is not None:
+                history = batch.btc_monthly_research_history
+                if (
+                    not history.algorithm_version
+                    or len(history.algorithm_version) > 128
+                ):
+                    raise RuntimeError("BTC_MONTHLY_HISTORY_INVALID")
+                connection.execute(
+                    """
+                    INSERT INTO btc_monthly_research_history_state (
+                        monitor_id, started_at, processed_through_at,
+                        algorithm_version, last_run_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(monitor_id) DO NOTHING
+                    """,
+                    (
+                        monitor_id,
+                        iso_utc(history.started_at),
+                        iso_utc(history.processed_through_at),
+                        history.algorithm_version,
+                        run_id,
+                    ),
+                )
+                stored_monthly_history = connection.execute(
+                    """
+                    SELECT started_at, processed_through_at, algorithm_version
+                    FROM btc_monthly_research_history_state
+                    WHERE monitor_id = ?
+                    """,
+                    (monitor_id,),
+                ).fetchone()
+                if stored_monthly_history is None:
+                    raise RuntimeError("BTC_MONTHLY_HISTORY_MISSING")
+                if (
+                    str(stored_monthly_history["algorithm_version"])
+                    != history.algorithm_version
+                ):
+                    if history.started_at < parse_utc(
+                        str(stored_monthly_history["processed_through_at"])
+                    ):
+                        raise RuntimeError("BTC_MONTHLY_VERSION_START_INVALID")
+                    connection.execute(
+                        """
+                        UPDATE btc_monthly_research_history_state
+                        SET started_at = ?, processed_through_at = ?,
+                            algorithm_version = ?, last_run_id = ?
+                        WHERE monitor_id = ?
+                        """,
+                        (
+                            iso_utc(history.started_at),
+                            iso_utc(history.processed_through_at),
+                            history.algorithm_version,
+                            run_id,
+                            monitor_id,
+                        ),
+                    )
+                    stored_monthly_history = connection.execute(
+                        """
+                        SELECT started_at, processed_through_at, algorithm_version
+                        FROM btc_monthly_research_history_state
+                        WHERE monitor_id = ?
+                        """,
+                        (monitor_id,),
+                    ).fetchone()
+                    if stored_monthly_history is None:
+                        raise RuntimeError("BTC_MONTHLY_HISTORY_MISSING")
+                stored_monthly_processed = parse_utc(
+                    str(stored_monthly_history["processed_through_at"])
+                )
+                if history.processed_through_at > stored_monthly_processed:
+                    connection.execute(
+                        """
+                        UPDATE btc_monthly_research_history_state
+                        SET processed_through_at = ?, last_run_id = ?
+                        WHERE monitor_id = ?
+                        """,
+                        (
+                            iso_utc(history.processed_through_at),
+                            run_id,
+                            monitor_id,
+                        ),
+                    )
+            if batch.btc_monthly_research_revisions:
+                monthly_history_row = connection.execute(
+                    """
+                    SELECT started_at, algorithm_version
+                    FROM btc_monthly_research_history_state
+                    WHERE monitor_id = ?
+                    """,
+                    (monitor_id,),
+                ).fetchone()
+                if monthly_history_row is None:
+                    raise RuntimeError("BTC_MONTHLY_HISTORY_MISSING")
+                monthly_started_at = parse_utc(str(monthly_history_row["started_at"]))
+                monthly_algorithm_version = str(
+                    monthly_history_row["algorithm_version"]
+                )
+                for revision in batch.btc_monthly_research_revisions:
+                    self._insert_btc_monthly_research_revision(
+                        connection,
+                        run_id=run_id,
+                        monitor_id=monitor_id,
+                        history_started_at=monthly_started_at,
+                        history_algorithm_version=monthly_algorithm_version,
+                        revision=revision,
+                        created_at=completed_text,
                     )
             for case in batch.evaluation_cases:
                 connection.execute(
@@ -1294,6 +1679,238 @@ class SQLiteMonitorStore:
                 (completed_text, status, len(batch.samples), error_code, run_id),
             )
         return status
+
+    @staticmethod
+    def _upsert_projection_snapshot(
+        connection: sqlite3.Connection,
+        *,
+        run_id: int,
+        monitor_id: str,
+        snapshot: ProjectionSnapshot,
+    ) -> None:
+        if (
+            not snapshot.snapshot_key
+            or len(snapshot.snapshot_key) > 96
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
+                for character in snapshot.snapshot_key
+            )
+        ):
+            raise RuntimeError("MONITOR_PROJECTION_SNAPSHOT_KEY_INVALID")
+        observed_at = iso_utc(snapshot.observed_at)
+        cutoff_at = iso_utc(snapshot.cutoff_at)
+        if snapshot.cutoff_at > snapshot.observed_at + timedelta(minutes=2):
+            raise RuntimeError("MONITOR_PROJECTION_SNAPSHOT_CUTOFF_INVALID")
+        payload_json = json.dumps(
+            snapshot.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(payload_json.encode("utf-8")) > MAX_PROJECTION_SNAPSHOT_BYTES:
+            raise RuntimeError("MONITOR_PROJECTION_SNAPSHOT_TOO_LARGE")
+        connection.execute(
+            """
+            INSERT INTO monitor_projection_snapshot (
+                monitor_id, snapshot_key, run_id,
+                observed_at, cutoff_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(monitor_id, snapshot_key) DO UPDATE SET
+                run_id = excluded.run_id,
+                observed_at = excluded.observed_at,
+                cutoff_at = excluded.cutoff_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                monitor_id,
+                snapshot.snapshot_key,
+                run_id,
+                observed_at,
+                cutoff_at,
+                payload_json,
+            ),
+        )
+
+    @staticmethod
+    def _insert_btc_structure_revision(
+        connection: sqlite3.Connection,
+        *,
+        run_id: int,
+        monitor_id: str,
+        history_started_at: datetime,
+        history_algorithm_version: str,
+        revision: BtcStructureEventRevision,
+        created_at: str,
+    ) -> None:
+        if not revision.event_key or len(revision.event_key) > 256:
+            raise RuntimeError("BTC_STRUCTURE_EVENT_KEY_INVALID")
+        if revision.event_at < history_started_at:
+            raise RuntimeError("BTC_STRUCTURE_EVENT_PREDATES_LEDGER")
+        if revision.observed_at < revision.event_at:
+            raise RuntimeError("BTC_STRUCTURE_EVENT_OBSERVED_BEFORE_EVENT")
+        payload_version = revision.payload.get("algorithm_version")
+        if payload_version is None or str(payload_version) == "":
+            raise RuntimeError("BTC_STRUCTURE_EVENT_VERSION_MISSING")
+        if str(payload_version) != history_algorithm_version:
+            raise RuntimeError("BTC_STRUCTURE_EVENT_VERSION_CHANGED")
+        payload_json = json.dumps(
+            revision.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        duplicate = connection.execute(
+            """
+            SELECT 1
+            FROM btc_structure_event_revision
+            WHERE monitor_id = ? AND event_key = ? AND payload_sha256 = ?
+            """,
+            (monitor_id, revision.event_key, payload_sha256),
+        ).fetchone()
+        if duplicate is not None:
+            return
+        latest = connection.execute(
+            """
+            SELECT revision_no, state, event_at, payload_json
+            FROM btc_structure_event_revision
+            WHERE monitor_id = ? AND event_key = ?
+            ORDER BY revision_no DESC
+            LIMIT 1
+            """,
+            (monitor_id, revision.event_key),
+        ).fetchone()
+        if latest is None:
+            if revision.state != "PENDING":
+                raise RuntimeError("BTC_STRUCTURE_EVENT_NOT_FROZEN")
+            revision_no = 1
+        else:
+            if str(latest["state"]) != "PENDING" or revision.state == "PENDING":
+                raise RuntimeError("BTC_STRUCTURE_EVENT_TRANSITION_INVALID")
+            if parse_utc(str(latest["event_at"])) != revision.event_at:
+                raise RuntimeError("BTC_STRUCTURE_EVENT_TIME_CHANGED")
+            frozen_payload = json.loads(str(latest["payload_json"]))
+            frozen_signal = frozen_payload.get("signal")
+            if revision.payload.get("signal") != frozen_signal:
+                raise RuntimeError("BTC_STRUCTURE_EVENT_SIGNAL_CHANGED")
+            revision_no = int(latest["revision_no"]) + 1
+        connection.execute(
+            """
+            INSERT INTO btc_structure_event_revision (
+                monitor_id, event_key, revision_no, event_at, observed_at,
+                state, payload_sha256, payload_json, source_run_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                monitor_id,
+                revision.event_key,
+                revision_no,
+                iso_utc(revision.event_at),
+                iso_utc(revision.observed_at),
+                revision.state,
+                payload_sha256,
+                payload_json,
+                run_id,
+                created_at,
+            ),
+        )
+
+    @staticmethod
+    def _insert_btc_monthly_research_revision(
+        connection: sqlite3.Connection,
+        *,
+        run_id: int,
+        monitor_id: str,
+        history_started_at: datetime,
+        history_algorithm_version: str,
+        revision: BtcMonthlyResearchRevision,
+        created_at: str,
+    ) -> None:
+        if not revision.signal_key or len(revision.signal_key) > 256:
+            raise RuntimeError("BTC_MONTHLY_SIGNAL_KEY_INVALID")
+        if revision.signal_at < history_started_at:
+            raise RuntimeError("BTC_MONTHLY_SIGNAL_PREDATES_LEDGER")
+        if revision.observed_at < revision.signal_at:
+            raise RuntimeError("BTC_MONTHLY_SIGNAL_OBSERVED_BEFORE_CLOSE")
+        payload_version = revision.payload.get("algorithm_version")
+        if str(payload_version or "") != history_algorithm_version:
+            raise RuntimeError("BTC_MONTHLY_SIGNAL_VERSION_CHANGED")
+        signal = revision.payload.get("signal")
+        if not isinstance(signal, dict):
+            raise RuntimeError("BTC_MONTHLY_SIGNAL_INVALID")
+        try:
+            execution_eligible_at = parse_utc(str(signal["execution_eligible_at"]))
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError("BTC_MONTHLY_EXECUTION_TIME_INVALID") from None
+        payload_json = json.dumps(
+            revision.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        duplicate = connection.execute(
+            """
+            SELECT 1
+            FROM btc_monthly_research_revision
+            WHERE monitor_id = ? AND signal_key = ? AND payload_sha256 = ?
+            """,
+            (monitor_id, revision.signal_key, payload_sha256),
+        ).fetchone()
+        if duplicate is not None:
+            return
+        latest = connection.execute(
+            """
+            SELECT revision_no, state, signal_at, payload_json
+            FROM btc_monthly_research_revision
+            WHERE monitor_id = ? AND signal_key = ?
+            ORDER BY revision_no DESC
+            LIMIT 1
+            """,
+            (monitor_id, revision.signal_key),
+        ).fetchone()
+        if latest is None:
+            if revision.state != "SIGNAL_FROZEN":
+                raise RuntimeError("BTC_MONTHLY_SIGNAL_NOT_FROZEN")
+            if revision.observed_at >= execution_eligible_at:
+                raise RuntimeError("BTC_MONTHLY_SIGNAL_FROZEN_TOO_LATE")
+            revision_no = 1
+        else:
+            if (
+                str(latest["state"]) != "SIGNAL_FROZEN"
+                or revision.state != "EXECUTION_CAPTURED"
+            ):
+                raise RuntimeError("BTC_MONTHLY_SIGNAL_TRANSITION_INVALID")
+            if parse_utc(str(latest["signal_at"])) != revision.signal_at:
+                raise RuntimeError("BTC_MONTHLY_SIGNAL_TIME_CHANGED")
+            frozen_payload = json.loads(str(latest["payload_json"]))
+            if revision.payload.get("signal") != frozen_payload.get("signal"):
+                raise RuntimeError("BTC_MONTHLY_SIGNAL_CHANGED")
+            if revision.observed_at < execution_eligible_at:
+                raise RuntimeError("BTC_MONTHLY_EXECUTION_OBSERVED_TOO_EARLY")
+            if not isinstance(revision.payload.get("execution"), dict):
+                raise RuntimeError("BTC_MONTHLY_EXECUTION_INVALID")
+            revision_no = int(latest["revision_no"]) + 1
+        connection.execute(
+            """
+            INSERT INTO btc_monthly_research_revision (
+                monitor_id, signal_key, revision_no, signal_at, observed_at,
+                state, payload_sha256, payload_json, source_run_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                monitor_id,
+                revision.signal_key,
+                revision_no,
+                iso_utc(revision.signal_at),
+                iso_utc(revision.observed_at),
+                revision.state,
+                payload_sha256,
+                payload_json,
+                run_id,
+                created_at,
+            ),
+        )
 
     def fail_run(
         self,
@@ -1487,9 +2104,7 @@ class SQLiteMonitorStore:
                 horizon_minutes=int(row["horizon_minutes"]),
                 due_at=parse_utc(str(row["due_at"])),
                 entry_price_text=str(row["entry_price_text"]),
-                benchmark_entry_price_text=str(
-                    row["benchmark_entry_price_text"]
-                ),
+                benchmark_entry_price_text=str(row["benchmark_entry_price_text"]),
                 source=str(row["source"]),
             )
             for row in rows
@@ -1613,6 +2228,103 @@ class SQLiteMonitorStore:
             ],
         }
 
+    def forward_evaluation_comparison(
+        self,
+        monitor_id: str,
+        *,
+        primary_source: str,
+        baseline_source: str,
+    ) -> dict[str, Any]:
+        """Compare completed predictions on the exact same entity and horizon."""
+
+        join = """
+            FROM monitor_forward_evaluation AS primary_evaluation
+            JOIN monitor_forward_evaluation AS baseline_evaluation
+              ON baseline_evaluation.monitor_id = primary_evaluation.monitor_id
+             AND baseline_evaluation.entity_key = primary_evaluation.entity_key
+             AND baseline_evaluation.source_cutoff_at =
+                 primary_evaluation.source_cutoff_at
+             AND baseline_evaluation.horizon_minutes =
+                 primary_evaluation.horizon_minutes
+            WHERE primary_evaluation.monitor_id = ?
+              AND primary_evaluation.source = ?
+              AND baseline_evaluation.source = ?
+              AND primary_evaluation.status = 'COMPLETE'
+              AND baseline_evaluation.status = 'COMPLETE'
+        """
+        parameters = (monitor_id, primary_source, baseline_source)
+        with self._connect() as connection:
+            totals = connection.execute(
+                f"""
+                SELECT COUNT(*) AS sample_count,
+                       SUM(CASE WHEN primary_evaluation.verdict = 'ALIGNED'
+                           THEN 1 ELSE 0 END) AS primary_aligned_count,
+                       SUM(CASE WHEN primary_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS primary_opposed_count,
+                       SUM(CASE WHEN baseline_evaluation.verdict = 'ALIGNED'
+                           THEN 1 ELSE 0 END) AS baseline_aligned_count,
+                       SUM(CASE WHEN baseline_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS baseline_opposed_count,
+                       MIN(primary_evaluation.source_cutoff_at) AS first_cutoff_at,
+                       MAX(primary_evaluation.outcome_cutoff_at) AS last_outcome_at
+                {join}
+                """,
+                parameters,
+            ).fetchone()
+            groups = connection.execute(
+                f"""
+                SELECT primary_evaluation.stage AS stage,
+                       primary_evaluation.stage_label AS stage_label,
+                       primary_evaluation.horizon_minutes AS horizon_minutes,
+                       COUNT(*) AS sample_count,
+                       SUM(CASE WHEN primary_evaluation.verdict = 'ALIGNED'
+                           THEN 1 ELSE 0 END) AS primary_aligned_count,
+                       SUM(CASE WHEN primary_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS primary_opposed_count,
+                       SUM(CASE WHEN baseline_evaluation.verdict = 'ALIGNED'
+                           THEN 1 ELSE 0 END) AS baseline_aligned_count,
+                       SUM(CASE WHEN baseline_evaluation.verdict = 'OPPOSED'
+                           THEN 1 ELSE 0 END) AS baseline_opposed_count
+                {join}
+                GROUP BY primary_evaluation.stage,
+                         primary_evaluation.stage_label,
+                         primary_evaluation.horizon_minutes
+                ORDER BY primary_evaluation.stage_label,
+                         primary_evaluation.horizon_minutes
+                """,
+                parameters,
+            ).fetchall()
+
+        count_keys = (
+            "sample_count",
+            "primary_aligned_count",
+            "primary_opposed_count",
+            "baseline_aligned_count",
+            "baseline_opposed_count",
+        )
+        return {
+            **{key: int(totals[key] or 0) for key in count_keys},
+            "first_cutoff_at": (
+                parse_utc(str(totals["first_cutoff_at"]))
+                if totals["first_cutoff_at"] is not None
+                else None
+            ),
+            "last_outcome_at": (
+                parse_utc(str(totals["last_outcome_at"]))
+                if totals["last_outcome_at"] is not None
+                else None
+            ),
+            "groups": [
+                {
+                    "stage": str(row["stage"]),
+                    "stage_label": str(row["stage_label"]),
+                    "horizon_minutes": int(row["horizon_minutes"]),
+                    **{key: int(row[key] or 0) for key in count_keys},
+                }
+                for row in groups
+            ],
+        }
+
     def history(
         self,
         monitor_id: str,
@@ -1693,9 +2405,7 @@ class SQLiteMonitorStore:
                 artifact_key=str(row["artifact_key"]),
                 source=str(row["source"]),
                 request_started_at=parse_utc(str(row["request_started_at"])),
-                response_completed_at=parse_utc(
-                    str(row["response_completed_at"])
-                ),
+                response_completed_at=parse_utc(str(row["response_completed_at"])),
                 http_status=int(row["http_status"]),
                 business_code=(
                     str(row["business_code"])
@@ -1712,6 +2422,35 @@ class SQLiteMonitorStore:
                 response_body=str(row["response_body"]),
             )
             for row in rows
+        )
+
+    def projection_snapshot(
+        self,
+        monitor_id: str,
+        snapshot_key: str,
+    ) -> StoredProjectionSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT monitor_id, snapshot_key, run_id,
+                       observed_at, cutoff_at, payload_json
+                FROM monitor_projection_snapshot
+                WHERE monitor_id = ? AND snapshot_key = ?
+                """,
+                (monitor_id, snapshot_key),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("MONITOR_PROJECTION_SNAPSHOT_PAYLOAD_INVALID")
+        return StoredProjectionSnapshot(
+            monitor_id=str(row["monitor_id"]),
+            snapshot_key=str(row["snapshot_key"]),
+            run_id=int(row["run_id"]),
+            observed_at=parse_utc(str(row["observed_at"])),
+            cutoff_at=parse_utc(str(row["cutoff_at"])),
+            payload=payload,
         )
 
     def buyback_source_states(
@@ -1991,7 +2730,9 @@ class SQLiteMonitorStore:
             and corrected_event_type not in BUYBACK_REVIEW_EVENT_TYPES
         ):
             raise ValueError("BUYBACK_EVENT_TYPE_INVALID")
-        normalized_program_key = program_key.strip() if program_key is not None else None
+        normalized_program_key = (
+            program_key.strip() if program_key is not None else None
+        )
         if normalized_program_key == "":
             normalized_program_key = None
         if normalized_program_key is not None and len(normalized_program_key) > 120:
@@ -2010,7 +2751,9 @@ class SQLiteMonitorStore:
                 """,
                 (monitor_id, entity_key),
             ).fetchone()
-            current_revision = int(current[0]) if current and current[0] is not None else None
+            current_revision = (
+                int(current[0]) if current and current[0] is not None else None
+            )
             if current_revision is None:
                 raise KeyError("BUYBACK_ENTITY_NOT_FOUND")
             if current_revision != base_revision_no:
@@ -2060,6 +2803,9 @@ class SQLiteMonitorStore:
         market_event_cutoff = iso_utc(
             observed_now - timedelta(days=self.market_event_retention_days)
         )
+        btc_structure_cutoff = iso_utc(
+            observed_now - timedelta(days=self.btc_structure_retention_days)
+        )
         removed_evidence_paths: list[str] = []
         with self._connect() as connection:
             cursor = connection.execute(
@@ -2105,6 +2851,53 @@ class SQLiteMonitorStore:
                 )
                 """,
                 (market_event_cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM btc_structure_event_revision
+                WHERE (monitor_id, event_key) IN (
+                    SELECT monitor_id, event_key
+                    FROM btc_structure_event_revision
+                    GROUP BY monitor_id, event_key
+                    HAVING MAX(event_at) < ?
+                )
+                """,
+                (btc_structure_cutoff,),
+            )
+            connection.execute(
+                """
+                DELETE FROM btc_structure_event_revision
+                WHERE (monitor_id, event_key) IN (
+                    SELECT monitor_id, event_key
+                    FROM (
+                        SELECT monitor_id, event_key, MAX(event_at) AS latest_at
+                        FROM btc_structure_event_revision
+                        GROUP BY monitor_id, event_key
+                        ORDER BY latest_at DESC, monitor_id, event_key
+                        LIMIT -1 OFFSET ?
+                    )
+                )
+                """,
+                (self.btc_structure_max_events,),
+            )
+            connection.execute(
+                """
+                DELETE FROM btc_monthly_research_revision
+                WHERE (monitor_id, signal_key) IN (
+                    SELECT monitor_id, signal_key
+                    FROM (
+                        SELECT monitor_id, signal_key,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY monitor_id
+                                   ORDER BY MAX(signal_at) DESC, signal_key DESC
+                               ) AS signal_rank
+                        FROM btc_monthly_research_revision
+                        GROUP BY monitor_id, signal_key
+                    )
+                    WHERE signal_rank > ?
+                )
+                """,
+                (DEFAULT_BTC_MONTHLY_MAX_SIGNALS,),
             )
             removable = connection.execute(
                 """
@@ -2221,6 +3014,440 @@ class SQLiteMonitorStore:
             ).fetchone()
         return parse_utc(str(row["started_at"])) if row is not None else None
 
+    def btc_structure_history(
+        self,
+        monitor_id: str,
+    ) -> StoredBtcStructureHistory | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT monitor_id, started_at, processed_through_at,
+                       algorithm_version, last_run_id
+                FROM btc_structure_history_state
+                WHERE monitor_id = ?
+                """,
+                (monitor_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredBtcStructureHistory(
+            monitor_id=str(row["monitor_id"]),
+            started_at=parse_utc(str(row["started_at"])),
+            processed_through_at=parse_utc(str(row["processed_through_at"])),
+            algorithm_version=str(row["algorithm_version"]),
+            last_run_id=int(row["last_run_id"]),
+        )
+
+    def latest_btc_structure_event_revisions(
+        self,
+        monitor_id: str,
+        *,
+        limit: int = 100,
+        algorithm_version: str | None = None,
+    ) -> tuple[StoredBtcStructureEventRevision, ...]:
+        if not 1 <= limit <= self.btc_structure_max_events:
+            raise ValueError("limit outside BTC structure event bound")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision_id, revision_no, monitor_id, event_key,
+                       event_at, observed_at, state, payload_sha256,
+                       payload_json, source_run_id, created_at
+                FROM btc_structure_event_revision AS revision
+                WHERE revision.monitor_id = ?
+                  AND revision.revision_no = (
+                      SELECT MAX(candidate.revision_no)
+                      FROM btc_structure_event_revision AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.event_key = revision.event_key
+                  )
+                ORDER BY event_at DESC, revision_id DESC
+                LIMIT ?
+                """,
+                (
+                    monitor_id,
+                    self.btc_structure_max_events if algorithm_version else limit,
+                ),
+            ).fetchall()
+        revisions = tuple(self._btc_structure_revision_from_row(row) for row in rows)
+        if algorithm_version is not None:
+            revisions = tuple(
+                revision
+                for revision in revisions
+                if str(revision.payload.get("algorithm_version")) == algorithm_version
+            )[:limit]
+        return revisions
+
+    def pending_btc_structure_event_revisions(
+        self,
+        monitor_id: str,
+        *,
+        limit: int = 1000,
+        algorithm_version: str | None = None,
+    ) -> tuple[StoredBtcStructureEventRevision, ...]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("limit outside pending BTC structure event bound")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision_id, revision_no, monitor_id, event_key,
+                       event_at, observed_at, state, payload_sha256,
+                       payload_json, source_run_id, created_at
+                FROM btc_structure_event_revision AS revision
+                WHERE revision.monitor_id = ? AND revision.state = 'PENDING'
+                  AND revision.revision_no = (
+                      SELECT MAX(candidate.revision_no)
+                      FROM btc_structure_event_revision AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.event_key = revision.event_key
+                  )
+                ORDER BY event_at, revision_id
+                LIMIT ?
+                """,
+                (monitor_id, 5000 if algorithm_version else limit),
+            ).fetchall()
+        revisions = tuple(self._btc_structure_revision_from_row(row) for row in rows)
+        if algorithm_version is not None:
+            revisions = tuple(
+                revision
+                for revision in revisions
+                if str(revision.payload.get("algorithm_version")) == algorithm_version
+            )[:limit]
+        return revisions
+
+    def btc_structure_event_summary(
+        self,
+        monitor_id: str,
+        *,
+        algorithm_version: str | None = None,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision.state, revision.event_at, revision.payload_json
+                FROM btc_structure_event_revision AS revision
+                WHERE revision.monitor_id = ?
+                  AND revision.revision_no = (
+                      SELECT MAX(candidate.revision_no)
+                      FROM btc_structure_event_revision AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.event_key = revision.event_key
+                  )
+                ORDER BY revision.event_at, revision.revision_id
+                """,
+                (monitor_id,),
+            ).fetchall()
+        records: list[tuple[str, datetime, dict[str, Any]]] = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if (
+                algorithm_version is not None
+                and str(payload.get("algorithm_version")) != algorithm_version
+            ):
+                continue
+            records.append(
+                (
+                    str(row["state"]),
+                    parse_utc(str(row["event_at"])),
+                    payload,
+                )
+            )
+        values = {
+            "total_events": len(records),
+            "pending_events": sum(state == "PENDING" for state, _, _ in records),
+            "reaction_events": sum(state == "REACTION" for state, _, _ in records),
+            "break_events": sum(state == "BREAK" for state, _, _ in records),
+            "unresolved_events": sum(state == "UNRESOLVED" for state, _, _ in records),
+        }
+        completed = (
+            values["reaction_events"]
+            + values["break_events"]
+            + values["unresolved_events"]
+        )
+        completed_payloads = [
+            payload for state, _, payload in records if state != "PENDING"
+        ]
+        support_events = 0
+        resistance_events = 0
+        probability_scored_events = 0
+        volatility_regimes: set[str] = set()
+        net_30: list[float] = []
+        net_50: list[float] = []
+        for payload in completed_payloads:
+            signal = payload.get("signal")
+            outcome = payload.get("outcome")
+            if not isinstance(signal, dict) or not isinstance(outcome, dict):
+                continue
+            kind = str(signal.get("kind", ""))
+            support_events += kind == "SUPPORT"
+            resistance_events += kind == "RESISTANCE"
+            probability_scored_events += signal.get("p_reaction") is not None
+            features = signal.get("features")
+            if isinstance(features, dict) and features.get("volatility_regime"):
+                volatility_regimes.add(str(features["volatility_regime"]))
+            for key, target in (
+                ("net_return_30bps_percent", net_30),
+                ("net_return_50bps_percent", net_50),
+            ):
+                try:
+                    value = float(outcome[key])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value):
+                    target.append(value)
+        sample_gate_passed = (
+            completed >= 500
+            and support_events >= 150
+            and resistance_events >= 150
+            and len(volatility_regimes) >= 2
+        )
+        return {
+            **values,
+            "completed_events": completed,
+            "reaction_rate_percent": (
+                round(values["reaction_events"] / completed * 100.0, 2)
+                if completed
+                else None
+            ),
+            "support_events": support_events,
+            "resistance_events": resistance_events,
+            "volatility_regimes": sorted(volatility_regimes),
+            "probability_scored_events": probability_scored_events,
+            "probability_validation_status": (
+                "READY"
+                if probability_scored_events == completed and completed
+                else "NOT_STARTED"
+            ),
+            "average_net_return_30bps_percent": (
+                round(sum(net_30) / len(net_30), 6) if net_30 else None
+            ),
+            "average_net_return_50bps_percent": (
+                round(sum(net_50) / len(net_50), 6) if net_50 else None
+            ),
+            "sample_gate_passed": sample_gate_passed,
+            "promotion_evaluable": sample_gate_passed
+            and probability_scored_events == completed,
+            "first_event_at": iso_utc(records[0][1]) if records else None,
+            "last_event_at": iso_utc(records[-1][1]) if records else None,
+        }
+
+    def btc_monthly_research_history(
+        self,
+        monitor_id: str,
+    ) -> StoredBtcMonthlyResearchHistory | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT monitor_id, started_at, processed_through_at,
+                       algorithm_version, last_run_id
+                FROM btc_monthly_research_history_state
+                WHERE monitor_id = ?
+                """,
+                (monitor_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return StoredBtcMonthlyResearchHistory(
+            monitor_id=str(row["monitor_id"]),
+            started_at=parse_utc(str(row["started_at"])),
+            processed_through_at=parse_utc(str(row["processed_through_at"])),
+            algorithm_version=str(row["algorithm_version"]),
+            last_run_id=int(row["last_run_id"]),
+        )
+
+    def latest_btc_monthly_research_revisions(
+        self,
+        monitor_id: str,
+        *,
+        limit: int = DEFAULT_BTC_MONTHLY_MAX_SIGNALS,
+        algorithm_version: str | None = None,
+    ) -> tuple[StoredBtcMonthlyResearchRevision, ...]:
+        if not 1 <= limit <= DEFAULT_BTC_MONTHLY_MAX_SIGNALS:
+            raise ValueError("limit outside BTC monthly research bound")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT revision_id, revision_no, monitor_id, signal_key,
+                       signal_at, observed_at, state, payload_sha256,
+                       payload_json, source_run_id, created_at
+                FROM btc_monthly_research_revision AS revision
+                WHERE revision.monitor_id = ?
+                  AND revision.revision_no = (
+                      SELECT MAX(candidate.revision_no)
+                      FROM btc_monthly_research_revision AS candidate
+                      WHERE candidate.monitor_id = revision.monitor_id
+                        AND candidate.signal_key = revision.signal_key
+                  )
+                ORDER BY signal_at DESC, revision_id DESC
+                LIMIT ?
+                """,
+                (monitor_id, DEFAULT_BTC_MONTHLY_MAX_SIGNALS),
+            ).fetchall()
+        revisions = tuple(
+            self._btc_monthly_research_revision_from_row(row) for row in rows
+        )
+        if algorithm_version is not None:
+            revisions = tuple(
+                revision
+                for revision in revisions
+                if str(revision.payload.get("algorithm_version")) == algorithm_version
+            )
+        return revisions[:limit]
+
+    def pending_btc_monthly_research_revisions(
+        self,
+        monitor_id: str,
+        *,
+        algorithm_version: str,
+    ) -> tuple[StoredBtcMonthlyResearchRevision, ...]:
+        revisions = self.latest_btc_monthly_research_revisions(
+            monitor_id,
+            algorithm_version=algorithm_version,
+        )
+        return tuple(
+            revision
+            for revision in reversed(revisions)
+            if revision.state == "SIGNAL_FROZEN"
+        )
+
+    def btc_monthly_research_summary(
+        self,
+        monitor_id: str,
+        *,
+        algorithm_version: str,
+    ) -> dict[str, Any]:
+        revisions = tuple(
+            reversed(
+                self.latest_btc_monthly_research_revisions(
+                    monitor_id,
+                    algorithm_version=algorithm_version,
+                )
+            )
+        )
+        executed: list[tuple[datetime, int, float]] = []
+        for revision in revisions:
+            signal = revision.payload.get("signal")
+            if not isinstance(signal, dict):
+                continue
+            try:
+                target = int(signal["official_target"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            execution = revision.payload.get("execution")
+            if revision.state != "EXECUTION_CAPTURED" or not isinstance(
+                execution, dict
+            ):
+                continue
+            try:
+                execution_at = parse_utc(str(execution["execution_at"]))
+                execution_price = float(execution["price"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(execution_price) and execution_price > 0:
+                executed.append((execution_at, target, execution_price))
+        executed_targets = [target for _, target, _ in executed]
+        target_switches = sum(
+            current != prior
+            for prior, current in zip(
+                executed_targets,
+                executed_targets[1:],
+                strict=False,
+            )
+        )
+        complete_cycles = 0
+        cash_seen = False
+        cycle_open = False
+        for target in executed_targets:
+            if target == 0:
+                if cycle_open:
+                    complete_cycles += 1
+                    cycle_open = False
+                cash_seen = True
+            elif target == 1 and cash_seen and not cycle_open:
+                cycle_open = True
+        base_growth: float | None = None
+        stress_growth: float | None = None
+        buy_hold_growth: float | None = None
+        checkpoint_max_drawdown: float | None = None
+        worst_complete_cycle: float | None = None
+        if len(executed) >= 2:
+            base_growth = 1.0
+            stress_growth = 1.0
+            base_points = [base_growth]
+            for index in range(1, len(executed)):
+                _, prior_target, prior_price = executed[index - 1]
+                _, current_target, current_price = executed[index]
+                if prior_target == 1:
+                    interval_growth = current_price / prior_price
+                    base_growth *= interval_growth
+                    stress_growth *= interval_growth
+                if current_target != prior_target:
+                    base_growth *= 1.0 - 15 / 10_000.0
+                    stress_growth *= 1.0 - 30 / 10_000.0
+                base_points.append(base_growth)
+            buy_hold_growth = executed[-1][2] / executed[0][2]
+            peak = base_points[0]
+            drawdowns: list[float] = []
+            for point in base_points:
+                peak = max(peak, point)
+                drawdowns.append(point / peak - 1.0)
+            checkpoint_max_drawdown = min(drawdowns)
+            cycle_returns: list[float] = []
+            cash_seen = False
+            cycle_start: float | None = None
+            for index, target in enumerate(executed_targets):
+                if target == 0:
+                    if cycle_start is not None:
+                        cycle_returns.append(base_points[index] / cycle_start - 1.0)
+                        cycle_start = None
+                    cash_seen = True
+                elif cash_seen and cycle_start is None:
+                    cycle_start = base_points[index]
+            if cycle_returns:
+                worst_complete_cycle = min(cycle_returns)
+        return {
+            "signal_count": len(revisions),
+            "execution_count": len(executed),
+            "pending_execution_count": sum(
+                revision.state == "SIGNAL_FROZEN" for revision in revisions
+            ),
+            "completed_months": max(0, len(executed) - 1),
+            "target_switches": target_switches,
+            "complete_long_cash_cycles": complete_cycles,
+            "base_cost_bps": 15,
+            "stress_cost_bps": 30,
+            "base_net_growth": round(base_growth, 8)
+            if base_growth is not None
+            else None,
+            "stress_net_growth": round(stress_growth, 8)
+            if stress_growth is not None
+            else None,
+            "buy_hold_growth": round(buy_hold_growth, 8)
+            if buy_hold_growth is not None
+            else None,
+            "base_relative_to_buy_hold_percent": (
+                round((base_growth / buy_hold_growth - 1.0) * 100.0, 6)
+                if base_growth is not None
+                and buy_hold_growth is not None
+                and buy_hold_growth > 0
+                else None
+            ),
+            "checkpoint_max_drawdown_percent": (
+                round(checkpoint_max_drawdown * 100.0, 6)
+                if checkpoint_max_drawdown is not None
+                else None
+            ),
+            "worst_complete_cycle_percent": (
+                round(worst_complete_cycle * 100.0, 6)
+                if worst_complete_cycle is not None
+                else None
+            ),
+            "performance_measurement_frequency": "MONTHLY_EXECUTION_CHECKPOINTS",
+            "cost_model_status": "FIXED_RESEARCH_PROXY_ONLY",
+            "performance_starts_at": iso_utc(executed[0][0]) if executed else None,
+            "performance_ends_at": iso_utc(executed[-1][0]) if executed else None,
+        }
+
     def latest_market_event_revisions(
         self,
         monitor_id: str,
@@ -2328,9 +3555,7 @@ class SQLiteMonitorStore:
                 else None
             ),
             forward_return_percent=optional_float("forward_return_percent"),
-            benchmark_return_percent=optional_float(
-                "benchmark_return_percent"
-            ),
+            benchmark_return_percent=optional_float("benchmark_return_percent"),
             relative_return_percent=optional_float("relative_return_percent"),
             maximum_favorable_excursion_percent=optional_float(
                 "maximum_favorable_excursion_percent"
@@ -2340,9 +3565,7 @@ class SQLiteMonitorStore:
             ),
             verdict=(str(row["verdict"]) if row["verdict"] is not None else None),
             reason_code=(
-                str(row["reason_code"])
-                if row["reason_code"] is not None
-                else None
+                str(row["reason_code"]) if row["reason_code"] is not None else None
             ),
         )
 
@@ -2379,6 +3602,48 @@ class SQLiteMonitorStore:
         )
 
     @staticmethod
+    def _btc_structure_revision_from_row(
+        row: sqlite3.Row,
+    ) -> StoredBtcStructureEventRevision:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("BTC_STRUCTURE_EVENT_PAYLOAD_INVALID")
+        return StoredBtcStructureEventRevision(
+            revision_id=int(row["revision_id"]),
+            revision_no=int(row["revision_no"]),
+            monitor_id=str(row["monitor_id"]),
+            event_key=str(row["event_key"]),
+            event_at=parse_utc(str(row["event_at"])),
+            observed_at=parse_utc(str(row["observed_at"])),
+            state=str(row["state"]),
+            payload_sha256=str(row["payload_sha256"]),
+            payload=payload,
+            source_run_id=int(row["source_run_id"]),
+            created_at=parse_utc(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _btc_monthly_research_revision_from_row(
+        row: sqlite3.Row,
+    ) -> StoredBtcMonthlyResearchRevision:
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("BTC_MONTHLY_RESEARCH_PAYLOAD_INVALID")
+        return StoredBtcMonthlyResearchRevision(
+            revision_id=int(row["revision_id"]),
+            revision_no=int(row["revision_no"]),
+            monitor_id=str(row["monitor_id"]),
+            signal_key=str(row["signal_key"]),
+            signal_at=parse_utc(str(row["signal_at"])),
+            observed_at=parse_utc(str(row["observed_at"])),
+            state=str(row["state"]),
+            payload_sha256=str(row["payload_sha256"]),
+            payload=payload,
+            source_run_id=int(row["source_run_id"]),
+            created_at=parse_utc(str(row["created_at"])),
+        )
+
+    @staticmethod
     def _buyback_review_from_row(row: sqlite3.Row) -> StoredBuybackReview:
         return StoredBuybackReview(
             review_id=int(row["review_id"]),
@@ -2392,9 +3657,7 @@ class SQLiteMonitorStore:
                 else None
             ),
             program_key=(
-                str(row["program_key"])
-                if row["program_key"] is not None
-                else None
+                str(row["program_key"]) if row["program_key"] is not None else None
             ),
             program_status=(
                 str(row["program_status"])
@@ -2473,14 +3736,10 @@ class SQLiteMonitorStore:
             ),
             next_due_at=parse_utc(str(row["next_due_at"])),
             record_count=(
-                int(row["record_count"])
-                if row["record_count"] is not None
-                else None
+                int(row["record_count"]) if row["record_count"] is not None else None
             ),
             detail_code=(
-                str(row["detail_code"])
-                if row["detail_code"] is not None
-                else None
+                str(row["detail_code"]) if row["detail_code"] is not None else None
             ),
             payload=payload,
             last_run_id=int(row["last_run_id"]),
